@@ -219,100 +219,240 @@ def tune(
     gpu = get_gpu_info()
     gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
 
+    # Build job list: (model, phase) pairs for progress tracking
+    import time as _time
+    jobs: list[tuple[ModelInfo, str]] = []  # (model, "probe" | profile_name)
     for m in models_to_tune:
-        console.print(f"\n[bold]{'═' * 50}[/bold]")
-        console.print(f"[bold]  {m.full_name}[/bold]")
-        console.print(f"[bold]{'═' * 50}[/bold]\n")
-
-        # Phase 1: Probe
-        lim_path = limits_path(m.provider, m.model_name)
-        existing = read_limits(lim_path)
-
-        if existing and not reprobe:
-            console.print("[dim]Limits already probed (use --reprobe to redo)[/dim]\n")
-            limits_data = existing
-        elif no_probe and existing:
-            limits_data = existing
-        elif no_probe:
-            console.print("[red]No probe data and --no-probe set.[/red]")
-            raise typer.Exit(1)
-        else:
-            console.print("[bold]Phase 1: Probing limits...[/bold]\n")
-            if dry_run:
-                console.print("[dim]DRY RUN: would probe context/concurrency limits[/dim]\n")
-                limits_data = {"limits": {}, "gpu_memory_utilization": gpu_mem_util}
-            else:
-                limits_data = probe_model(
-                    model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
-                )
-                write_limits(lim_path, limits_data)
-                console.print("[green]Limits saved[/green]\n")
-
-        # Phase 2: Benchmark
+        lim_path_check = limits_path(m.provider, m.model_name)
+        existing_check = read_limits(lim_path_check)
+        if not existing_check or reprobe:
+            if not no_probe:
+                jobs.append((m, "probe"))
         for prof in profiles_to_run:
-            console.print(f"[bold]Phase 2: {prof} benchmark[/bold]\n")
+            jobs.append((m, prof))
 
-            timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M")
-            exp_name = f"{prof}-{timestamp}"
-            exp_dir = BENCHMARKS_DIR / m.model_name / exp_name
-            exp_dir.mkdir(parents=True, exist_ok=True)
+    total_jobs = len(jobs)
+    completed_jobs = 0
+    start_time = _time.monotonic()
+    passed = 0
+    failed = 0
 
-            serve_p, bench_p, subcommand = generate_sweep_params(
-                profile=prof, limits=limits_data, output_dir=exp_dir,
-            )
+    def _eta() -> str:
+        if completed_jobs == 0:
+            return "estimating..."
+        elapsed = _time.monotonic() - start_time
+        avg = elapsed / completed_jobs
+        remaining = avg * (total_jobs - completed_jobs)
+        if remaining < 60:
+            return f"{remaining:.0f}s"
+        elif remaining < 3600:
+            return f"{remaining / 60:.0f}m"
+        else:
+            h = int(remaining // 3600)
+            m = int((remaining % 3600) // 60)
+            return f"{h}h{m}m"
 
-            base_serve = f"{VLLM_BIN} serve {m.path} --dtype bfloat16 --trust-remote-code"
-            qf = get_quant_flag(m.quant_method)
-            if qf:
-                base_serve += f" {qf}"
+    def _elapsed() -> str:
+        e = _time.monotonic() - start_time
+        if e < 60:
+            return f"{e:.0f}s"
+        elif e < 3600:
+            return f"{e / 60:.0f}m"
+        else:
+            h = int(e // 3600)
+            m = int((e % 3600) // 60)
+            return f"{h}h{m}m"
 
-            sweep_cmd = [
-                str(VLLM_BIN), "bench", "sweep", subcommand,
-                "--serve-cmd", base_serve,
-                "--bench-cmd", f"{VLLM_BIN} bench serve --dataset-name random",
-                "--serve-params", str(serve_p),
-                "--bench-params", str(bench_p),
-                "--num-runs", "3",
-                "--server-ready-timeout", "600",
-                "--output-dir", str(BENCHMARKS_DIR / m.model_name),
-                "--experiment-name", exp_name,
-            ]
+    def _status_line(label: str) -> str:
+        return f"[{completed_jobs}/{total_jobs}]  {label}  |  elapsed {_elapsed()}  |  ETA {_eta()}"
+
+    if total_jobs == 0:
+        console.print("[dim]Nothing to do.[/dim]")
+        return
+
+    console.print(f"\n[bold]Jobs: {total_jobs}[/bold]  ({len(models_to_tune)} models × {len(profiles_to_run) or 0} profiles + probes)\n")
+
+    current_model_limits: dict[str, dict] = {}  # model_path -> limits_data
+
+    for m, job_type in jobs:
+        model_key = str(m.path)
+
+        if job_type == "probe":
+            console.print(f"[bold cyan]{_status_line(f'{m.model_name} → probe')}[/bold cyan]")
 
             if dry_run:
-                console.print(f"[dim]DRY RUN: {' '.join(sweep_cmd)}[/dim]\n")
+                console.print("  [dim]DRY RUN: would probe context/concurrency limits[/dim]\n")
+                current_model_limits[model_key] = {"limits": {}, "gpu_memory_utilization": gpu_mem_util}
+            else:
+                from rich.live import Live
+                from rich.text import Text
+
+                probe_status = Text("  Starting probe...", style="dim")
+
+                def _on_probe_step(ctx, kv_dtype, phase, result):
+                    ctx_k = f"{ctx // 1024}k"
+                    if phase == "context" and result is None:
+                        probe_status.truncate(0)
+                        probe_status.append(f"  Testing {ctx_k} kv={kv_dtype}...", style="dim")
+                    elif phase == "context" and result is True:
+                        probe_status.truncate(0)
+                        probe_status.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
+                        probe_status.append("✓ fits", style="green")
+                    elif phase == "context" and result is False:
+                        probe_status.truncate(0)
+                        probe_status.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
+                        probe_status.append("✗ OOM", style="red")
+                    elif phase == "concurrency" and result is None:
+                        probe_status.truncate(0)
+                        probe_status.append(f"  {ctx_k} kv={kv_dtype} → testing concurrency...", style="dim")
+                    elif phase == "concurrency":
+                        probe_status.truncate(0)
+                        probe_status.append(f"  {ctx_k} kv={kv_dtype} → ", style="dim")
+                        probe_status.append(f"{result} slots", style="bold green" if result else "red")
+
+                with Live(probe_status, console=console, refresh_per_second=2) as live:
+                    limits_data = probe_model(
+                        model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
+                        on_step=lambda *a: (_on_probe_step(*a), live.refresh()),
+                    )
+
+                lim_path_w = limits_path(m.provider, m.model_name)
+                write_limits(lim_path_w, limits_data)
+                current_model_limits[model_key] = limits_data
+                console.print("  [green]✓ Limits saved[/green]\n")
+
+            completed_jobs += 1
+            passed += 1
+            continue
+
+        # Benchmark job — need limits data
+        if model_key not in current_model_limits:
+            lim_path_r = limits_path(m.provider, m.model_name)
+            existing_lim = read_limits(lim_path_r)
+            if existing_lim:
+                current_model_limits[model_key] = existing_lim
+            else:
+                console.print(f"  [red]No probe data for {m.model_name}, skipping {job_type}[/red]\n")
+                completed_jobs += 1
+                failed += 1
                 continue
 
-            for attempt in range(3):
-                console.print(f"Running sweep (attempt {attempt + 1}/3)...")
-                cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
-                result = subprocess.run(cmd)
-                if result.returncode == 0:
-                    break
-                if attempt < 2:
-                    console.print("[yellow]Retrying with --resume...[/yellow]")
+        limits_data = current_model_limits[model_key]
+        prof = job_type
 
-            try:
-                winner, top3 = pick_winner(exp_dir, profile=prof)
-                config_data = {
-                    "model": str(m.path),
-                    "host": "0.0.0.0",
-                    "port": 8888,
-                    "dtype": "bfloat16",
-                    "trust-remote-code": True,
-                    "gpu-memory-utilization": gpu_mem_util,
-                }
-                for key in ["kv_cache_dtype", "enable_prefix_caching", "max_model_len", "max_num_seqs", "max_num_batched_tokens"]:
-                    val = winner["params"].get(key)
-                    if val is not None:
-                        config_data[key.replace("_", "-")] = val
+        console.print(f"[bold cyan]{_status_line(f'{m.model_name} → {prof}')}[/bold cyan]")
 
-                cfg_path = profile_path(m.provider, m.model_name, prof)
-                write_profile_yaml(cfg_path, config_data, comment=f"vx tune — {prof} profile\nBenchmark: {exp_dir}")
-                console.print(f"[green]Config written: {cfg_path}[/green]\n")
-            except SystemExit:
-                console.print(f"[yellow]No results for {prof} profile.[/yellow]\n")
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M")
+        exp_name = f"{prof}-{timestamp}"
+        exp_dir = BENCHMARKS_DIR / m.model_name / exp_name
+        exp_dir.mkdir(parents=True, exist_ok=True)
 
-    console.print("[bold green]Done.[/bold green]")
+        serve_p, bench_p, subcommand = generate_sweep_params(
+            profile=prof, limits=limits_data, output_dir=exp_dir,
+        )
+
+        base_serve = f"{VLLM_BIN} serve {m.path} --dtype bfloat16 --trust-remote-code"
+        qf = get_quant_flag(m.quant_method)
+        if qf:
+            base_serve += f" {qf}"
+
+        sweep_cmd = [
+            str(VLLM_BIN), "bench", "sweep", subcommand,
+            "--serve-cmd", base_serve,
+            "--bench-cmd", f"{VLLM_BIN} bench serve --dataset-name random",
+            "--serve-params", str(serve_p),
+            "--bench-params", str(bench_p),
+            "--num-runs", "3",
+            "--server-ready-timeout", "600",
+            "--output-dir", str(BENCHMARKS_DIR / m.model_name),
+            "--experiment-name", exp_name,
+        ]
+
+        if dry_run:
+            console.print(f"  [dim]DRY RUN: {' '.join(sweep_cmd)}[/dim]\n")
+            completed_jobs += 1
+            passed += 1
+            continue
+
+        # Count expected combos from param files
+        import json as _json
+        serve_count = len(_json.loads(serve_p.read_text()))
+        bench_count = len(_json.loads(bench_p.read_text()))
+        total_combos = serve_count * bench_count
+        num_runs = 3
+
+        sweep_ok = False
+        for attempt in range(3):
+            console.print(f"  Sweep attempt {attempt + 1}/3  ({total_combos} combos × {num_runs} runs)")
+            cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
+
+            # Run sweep in background, poll result files for progress
+            import threading
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total} results"),
+                TextColumn("({task.fields[last]})"),
+                console=console,
+            ) as progress:
+                task_id = progress.add_task(
+                    f"  {prof}", total=total_combos * num_runs, last="starting..."
+                )
+
+                def _poll_results():
+                    while proc.poll() is None:
+                        # Count run=*.json files in the experiment dir
+                        result_files = list(exp_dir.glob("**/run=*.json"))
+                        count = len(result_files)
+                        last_file = result_files[-1].parent.name if result_files else "waiting"
+                        progress.update(task_id, completed=count, last=last_file)
+                        _time.sleep(3)
+                    # Final count
+                    result_files = list(exp_dir.glob("**/run=*.json"))
+                    progress.update(task_id, completed=len(result_files), last="done")
+
+                poller = threading.Thread(target=_poll_results, daemon=True)
+                poller.start()
+                proc.wait()
+                poller.join(timeout=5)
+
+            if proc.returncode == 0:
+                sweep_ok = True
+                break
+            if attempt < 2:
+                console.print("  [yellow]Retrying with --resume...[/yellow]")
+
+        try:
+            winner, top3 = pick_winner(exp_dir, profile=prof)
+            config_data = {
+                "model": str(m.path),
+                "host": "0.0.0.0",
+                "port": 8888,
+                "dtype": "bfloat16",
+                "trust-remote-code": True,
+                "gpu-memory-utilization": gpu_mem_util,
+            }
+            for key in ["kv_cache_dtype", "enable_prefix_caching", "max_model_len", "max_num_seqs", "max_num_batched_tokens"]:
+                val = winner["params"].get(key)
+                if val is not None:
+                    config_data[key.replace("_", "-")] = val
+
+            cfg_path = profile_path(m.provider, m.model_name, prof)
+            write_profile_yaml(cfg_path, config_data, comment=f"vx tune — {prof} profile\nBenchmark: {exp_dir}")
+            console.print(f"  [green]✓ {prof} config written[/green]\n")
+            passed += 1
+        except SystemExit:
+            console.print(f"  [yellow]✗ No results for {prof}[/yellow]\n")
+            failed += 1
+
+        completed_jobs += 1
+
+    console.print(f"[bold green]Done.[/bold green]  {passed} passed, {failed} failed, {_elapsed()} elapsed")
 
 
 @app.command()

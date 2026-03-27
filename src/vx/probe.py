@@ -1,4 +1,5 @@
 """Probe context and concurrency limits for a model."""
+from __future__ import annotations
 
 import subprocess
 import time
@@ -86,7 +87,13 @@ def probe_concurrency_limit(
 
 def probe_model(
     *, model_info: ModelInfo, gpu_mem_util: float, vram_total_gb: float,
+    on_step: callable | None = None,
 ) -> dict:
+    """Full probe. on_step(ctx, kv_dtype, phase, result) is called for live updates.
+
+    phase: "context" (testing if ctx starts) or "concurrency" (binary search slots)
+    result: True/False for context, int|None for concurrency
+    """
     max_pos = model_info.max_position_embeddings
     steps = [s for s in CONTEXT_STEPS if s <= max_pos]
 
@@ -101,7 +108,12 @@ def probe_model(
 
             if hit_ceiling:
                 limits[key][kv_dtype] = None
+                if on_step:
+                    on_step(ctx, kv_dtype, "context", False)
                 continue
+
+            if on_step:
+                on_step(ctx, kv_dtype, "context", None)  # in progress
 
             if not probe_context_limit(
                 model_info=model_info, context_len=ctx,
@@ -109,12 +121,21 @@ def probe_model(
             ):
                 limits[key][kv_dtype] = None
                 hit_ceiling = True
+                if on_step:
+                    on_step(ctx, kv_dtype, "context", False)
                 continue
 
-            limits[key][kv_dtype] = probe_concurrency_limit(
+            if on_step:
+                on_step(ctx, kv_dtype, "context", True)
+                on_step(ctx, kv_dtype, "concurrency", None)  # in progress
+
+            max_seqs = probe_concurrency_limit(
                 model_info=model_info, context_len=ctx,
                 kv_dtype=kv_dtype, gpu_mem_util=gpu_mem_util,
             )
+            limits[key][kv_dtype] = max_seqs
+            if on_step:
+                on_step(ctx, kv_dtype, "concurrency", max_seqs)
 
     return {
         "model_path": str(model_info.path),

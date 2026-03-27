@@ -33,6 +33,7 @@ def test_tune_dry_run_shows_commands(mocker, fake_model_dir):
 
 
 def test_tune_dry_run_with_existing_limits(mocker, fake_model_dir, fake_limits):
+    """When limits exist, probe is skipped — only benchmark job runs."""
     from vx.models import detect_model
     m = detect_model(fake_model_dir)
 
@@ -48,8 +49,9 @@ def test_tune_dry_run_with_existing_limits(mocker, fake_model_dir, fake_limits):
 
     result = runner.invoke(app, ["tune", "TestModel", "interactive", "--dry-run"])
     assert result.exit_code == 0
-    assert "already probed" in result.output
     assert "DRY RUN" in result.output
+    # No probe job when limits already exist
+    assert "probe" not in result.output.lower() or "→ probe" not in result.output
 
 
 def test_tune_dry_run_all_profiles(mocker, fake_model_dir, fake_limits):
