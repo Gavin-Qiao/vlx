@@ -37,11 +37,17 @@ def _try_start_vllm(
     if qf:
         cmd.extend(qf.split())
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + _HEALTH_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
+                # Log stderr for debugging
+                if proc.stderr:
+                    err = proc.stderr.read().decode(errors="replace")[-500:]
+                    if err.strip():
+                        import logging
+                        logging.debug("vLLM probe failed: %s", err.strip())
                 return False
             try:
                 import requests

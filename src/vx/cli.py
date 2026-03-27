@@ -360,7 +360,22 @@ def tune(
                 failed += 1
                 continue
 
+        # Check if model has any working configs at all
         limits_data = current_model_limits[model_key]
+        has_any = any(
+            v is not None
+            for entry in limits_data.get("limits", {}).values()
+            for v in entry.values()
+        )
+        if not has_any:
+            console.print(
+                f"[yellow]  [{completed_jobs}/{total_jobs}] {m.model_name} → {job_type}  |  elapsed {_elapsed()}[/yellow]"
+            )
+            console.print("  [red]✗ Skipped — model has no working configs (all OOM during probe)[/red]\n")
+            completed_jobs += 1
+            failed += 1
+            continue
+
         prof = job_type
         current_job_label = f"{m.model_name} → {prof}"
 

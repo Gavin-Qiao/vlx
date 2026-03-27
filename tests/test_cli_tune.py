@@ -11,15 +11,14 @@ def test_tune_no_model_found(mocker):
     assert "No models found" in result.output
 
 
-def test_tune_dry_run_shows_commands(mocker, fake_model_dir):
+def test_tune_dry_run_shows_commands(mocker, fake_model_dir, fake_limits):
     from vx.models import detect_model
     m = detect_model(fake_model_dir)
 
     mocker.patch("vx.cli.scan_models", return_value=[m])
     mocker.patch("vx.cli.fuzzy_match", return_value=[m])
-    mocker.patch("vx.cli.read_limits", return_value=None)
+    mocker.patch("vx.cli.read_limits", return_value=fake_limits)
 
-    # Mock GPU
     mocker.patch("vx.gpu.get_gpu_info", return_value=type("GPU", (), {
         "name": "Test GPU", "vram_total_gb": 48.0, "cuda": "13.1",
         "vram_total_mb": 49152, "vram_used_mb": 0, "vram_free_mb": 49152,
