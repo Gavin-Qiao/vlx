@@ -340,9 +340,18 @@ def tune(
                     )
 
                 lim_path_w = limits_path(m.provider, m.model_name)
-                write_limits(lim_path_w, limits_data)
-                current_model_limits[model_key] = limits_data
-                console.print(f"  [green]✓ Limits saved[/green] ({_elapsed()} elapsed)\n")
+                has_working = any(
+                    v is not None
+                    for entry in limits_data.get("limits", {}).values()
+                    for v in entry.values()
+                )
+                if has_working:
+                    write_limits(lim_path_w, limits_data)
+                    current_model_limits[model_key] = limits_data
+                    console.print(f"  [green]✓ Limits saved[/green] ({_elapsed()} elapsed)\n")
+                else:
+                    current_model_limits[model_key] = limits_data
+                    console.print(f"  [yellow]⚠ No working configs found — limits not cached[/yellow] ({_elapsed()} elapsed)\n")
 
             completed_jobs += 1
             passed += 1
