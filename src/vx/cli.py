@@ -236,31 +236,32 @@ def tune(
     passed = 0
     failed = 0
 
+    def _fmt_duration(seconds: float) -> str:
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        elif s < 3600:
+            return f"{s // 60}m {s % 60}s"
+        elif s < 86400:
+            h = s // 3600
+            m = (s % 3600) // 60
+            return f"{h}h {m}m {s % 60}s"
+        else:
+            d = s // 86400
+            h = (s % 86400) // 3600
+            m = (s % 3600) // 60
+            return f"{d}d {h}h {m}m"
+
     def _eta() -> str:
         if completed_jobs == 0:
             return "estimating..."
         elapsed = _time.monotonic() - start_time
         avg = elapsed / completed_jobs
         remaining = avg * (total_jobs - completed_jobs)
-        if remaining < 60:
-            return f"{remaining:.0f}s"
-        elif remaining < 3600:
-            return f"{remaining / 60:.0f}m"
-        else:
-            h = int(remaining // 3600)
-            m = int((remaining % 3600) // 60)
-            return f"{h}h{m}m"
+        return _fmt_duration(remaining)
 
     def _elapsed() -> str:
-        e = _time.monotonic() - start_time
-        if e < 60:
-            return f"{e:.0f}s"
-        elif e < 3600:
-            return f"{e / 60:.0f}m"
-        else:
-            h = int(e // 3600)
-            m = int((e % 3600) // 60)
-            return f"{h}h{m}m"
+        return _fmt_duration(_time.monotonic() - start_time)
 
     def _status_line(label: str) -> str:
         return f"[{completed_jobs}/{total_jobs}]  {label}  |  elapsed {_elapsed()}  |  ETA {_eta()}"
