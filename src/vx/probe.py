@@ -65,6 +65,8 @@ def _try_start_vllm(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+        # Wait for GPU memory to fully release before next probe
+        time.sleep(5)
 
 
 def probe_context_limit(
@@ -120,29 +122,23 @@ def probe_model(
                 continue
 
             if on_step:
-                on_step(ctx, kv_dtype, "context", None)  # in progress
+                on_step(ctx, kv_dtype, "concurrency", None)
 
-            if not probe_context_limit(
-                model_info=model_info, context_len=ctx,
-                kv_dtype=kv_dtype, gpu_mem_util=gpu_mem_util,
-            ):
-                limits[key][kv_dtype] = None
-                hit_ceiling = True
-                if on_step:
-                    on_step(ctx, kv_dtype, "context", False)
-                continue
-
-            if on_step:
-                on_step(ctx, kv_dtype, "context", True)
-                on_step(ctx, kv_dtype, "concurrency", None)  # in progress
-
+            # Single pass: concurrency probe starts at max_num_seqs=1,
+            # so it doubles as the context viability check.
             max_seqs = probe_concurrency_limit(
                 model_info=model_info, context_len=ctx,
                 kv_dtype=kv_dtype, gpu_mem_util=gpu_mem_util,
             )
             limits[key][kv_dtype] = max_seqs
-            if on_step:
-                on_step(ctx, kv_dtype, "concurrency", max_seqs)
+
+            if max_seqs is None:
+                hit_ceiling = True
+                if on_step:
+                    on_step(ctx, kv_dtype, "context", False)
+            else:
+                if on_step:
+                    on_step(ctx, kv_dtype, "concurrency", max_seqs)
 
     return {
         "model_path": str(model_info.path),
