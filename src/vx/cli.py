@@ -177,6 +177,8 @@ def tune(
     # Resolve which models to tune
     if all_models:
         models_to_tune = scan_models(MODELS_DIR)
+        if not profile:
+            profile = "all"
     elif model:
         m = _resolve_model(model)
         models_to_tune = [m]
@@ -187,8 +189,13 @@ def tune(
             raise typer.Exit(1)
         for i, m in enumerate(all_m):
             console.print(f"  {i + 1}) {m.full_name}")
-        idx = typer.prompt("Which model?", type=int) - 1
-        models_to_tune = [all_m[idx]]
+        console.print(f"  all) All models")
+        choice = typer.prompt("Which model?")
+        if choice.strip().lower() == "all":
+            models_to_tune = all_m
+        else:
+            idx = int(choice) - 1
+            models_to_tune = [all_m[idx]]
 
     # Resolve which profiles to run
     if not profile:
