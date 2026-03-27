@@ -304,34 +304,35 @@ def tune(
                 console.print("  [dim]DRY RUN: would probe[/dim]\n")
                 current_model_limits[model_key] = {"limits": {}, "gpu_memory_utilization": gpu_mem_util}
             else:
-                probe_status = Text("  Starting probe...", style="dim")
+                probe_detail = Text("  Starting probe...", style="dim")
 
-                def _make_render():
-                    """Build a renderable combining header + probe detail."""
-                    from rich.console import Group
-                    return Group(_render_header(), probe_status)
+                class _ProbeDisplay:
+                    """Renderable that recomputes header (with live elapsed) on every refresh."""
+                    def __rich_console__(self, console_obj: object, options: object):  # type: ignore[override]
+                        from rich.console import Group
+                        yield from Group(_render_header(), probe_detail).__rich_console__(console_obj, options)  # type: ignore[arg-type]
 
                 def _on_probe_step(ctx: int, kv_dtype: str, phase: str, result: object) -> None:
                     ctx_k = f"{ctx // 1024}k"
-                    probe_status.truncate(0)
+                    probe_detail.truncate(0)
                     if phase == "context" and result is None:
-                        probe_status.append(f"  Testing {ctx_k} kv={kv_dtype}...", style="dim")
+                        probe_detail.append(f"  Testing {ctx_k} kv={kv_dtype}...", style="dim")
                     elif phase == "context" and result is True:
-                        probe_status.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
-                        probe_status.append("✓ fits", style="green")
+                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
+                        probe_detail.append("✓ fits", style="green")
                     elif phase == "context" and result is False:
-                        probe_status.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
-                        probe_status.append("✗ OOM", style="red")
+                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
+                        probe_detail.append("✗ OOM", style="red")
                     elif phase == "concurrency" and result is None:
-                        probe_status.append(f"  {ctx_k} kv={kv_dtype} → testing concurrency...", style="dim")
+                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} → testing concurrency...", style="dim")
                     elif phase == "concurrency":
-                        probe_status.append(f"  {ctx_k} kv={kv_dtype} → ", style="dim")
-                        probe_status.append(f"{result} slots", style="bold green" if result else "red")
+                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} → ", style="dim")
+                        probe_detail.append(f"{result} slots", style="bold green" if result else "red")
 
-                with Live(_make_render(), console=console, refresh_per_second=1) as live:
+                with Live(_ProbeDisplay(), console=console, refresh_per_second=1) as live:
                     def _refresh_live(*a: object) -> None:
                         _on_probe_step(*a)  # type: ignore[arg-type]
-                        live.update(_make_render())
+                        live.refresh()
 
                     limits_data = probe_model(
                         model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
@@ -406,11 +407,16 @@ def tune(
             cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
+            from rich.progress import TimeElapsedColumn, TimeRemainingColumn
+
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                TextColumn("ETA"),
+                TimeRemainingColumn(),
                 TextColumn("[dim]{task.fields[detail]}[/dim]"),
                 console=console,
                 refresh_per_second=1,
@@ -418,19 +424,18 @@ def tune(
                 header_task = progress.add_task(
                     f"[{completed_jobs}/{total_jobs}] {m.model_name} → {prof}",
                     total=total_results,
-                    detail=f"elapsed {_elapsed()} | ETA {_eta()}",
+                    detail="starting...",
                 )
 
                 def _poll_results(tid: object = header_task) -> None:
                     while proc.poll() is None:
                         result_files = list(exp_dir.glob("**/run=*.json"))
                         count = len(result_files)
-                        last = result_files[-1].parent.name if result_files else "starting..."
+                        last = result_files[-1].parent.name if result_files else "waiting..."
                         progress.update(
                             tid,  # type: ignore[arg-type]
                             completed=count,
-                            description=f"[{completed_jobs}/{total_jobs}] {m.model_name} → {prof}",
-                            detail=f"elapsed {_elapsed()} | ETA {_eta()} | {last}",
+                            detail=last,
                         )
                         _time.sleep(3)
                     result_files = list(exp_dir.glob("**/run=*.json"))
