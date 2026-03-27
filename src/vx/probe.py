@@ -81,16 +81,31 @@ def probe_context_limit(
 def probe_concurrency_limit(
     *, model_info: ModelInfo, context_len: int, kv_dtype: str, gpu_mem_util: float,
 ) -> int | None:
-    best = None
-    for seqs in CONCURRENCY_STEPS:
+    """Binary search for max max-num-seqs that doesn't OOM."""
+    # First check if even 1 slot works
+    if not _try_start_vllm(
+        model_info=model_info, context_len=context_len,
+        kv_dtype=kv_dtype, gpu_mem_util=gpu_mem_util, max_num_seqs=1,
+    ):
+        return None
+
+    # Binary search through CONCURRENCY_STEPS
+    lo, hi = 0, len(CONCURRENCY_STEPS) - 1
+    best = CONCURRENCY_STEPS[0]  # 1 is known to work
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        seqs = CONCURRENCY_STEPS[mid]
         ok = _try_start_vllm(
             model_info=model_info, context_len=context_len,
             kv_dtype=kv_dtype, gpu_mem_util=gpu_mem_util, max_num_seqs=seqs,
         )
         if ok:
             best = seqs
+            lo = mid + 1
         else:
-            break
+            hi = mid - 1
+
     return best
 
 
