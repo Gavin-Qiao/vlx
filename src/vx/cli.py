@@ -213,6 +213,9 @@ def tune(
 
     profiles_to_run = list(PROFILES.keys()) if profile == "all" else ([] if profile == "skip" else [profile])
 
+    # Clear the interactive menu noise — from here on it's just progress
+    console.clear()
+
     gpu = get_gpu_info()
     gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
 
@@ -267,56 +270,78 @@ def tune(
         console.print("[dim]Nothing to do.[/dim]")
         return
 
-    console.print(f"\n[bold]Jobs: {total_jobs}[/bold]  ({len(models_to_tune)} models × {len(profiles_to_run) or 0} profiles + probes)\n")
+    from rich.live import Live
+    from rich.text import Text
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    import json as _json
+    import threading
 
-    current_model_limits: dict[str, dict] = {}  # model_path -> limits_data
+    current_model_limits: dict[str, dict] = {}
+    current_job_label = ""
+    Text("")
+
+    def _render_header() -> Text:
+        header = Text()
+        header.append(f"[{completed_jobs}/{total_jobs}]", style="bold")
+        header.append(f"  {current_job_label}", style="cyan")
+        header.append(f"  |  elapsed {_elapsed()}  |  ETA {_eta()}", style="dim")
+        return header
+
+    if total_jobs == 0:
+        console.print("[dim]Nothing to do.[/dim]")
+        return
+
+    console.print(f"\n[bold]Jobs: {total_jobs}[/bold]  ({len(models_to_tune)} models)\n")
 
     for m, job_type in jobs:
         model_key = str(m.path)
 
         if job_type == "probe":
-            console.print(f"[bold cyan]{_status_line(f'{m.model_name} → probe')}[/bold cyan]")
+            current_job_label = f"{m.model_name} → probe"
 
             if dry_run:
-                console.print("  [dim]DRY RUN: would probe context/concurrency limits[/dim]\n")
+                console.print(f"[bold cyan]{_render_header()}[/bold cyan]")
+                console.print("  [dim]DRY RUN: would probe[/dim]\n")
                 current_model_limits[model_key] = {"limits": {}, "gpu_memory_utilization": gpu_mem_util}
             else:
-                from rich.live import Live
-                from rich.text import Text
-
                 probe_status = Text("  Starting probe...", style="dim")
 
-                def _on_probe_step(ctx, kv_dtype, phase, result):
+                def _make_render():
+                    """Build a renderable combining header + probe detail."""
+                    from rich.console import Group
+                    return Group(_render_header(), probe_status)
+
+                def _on_probe_step(ctx: int, kv_dtype: str, phase: str, result: object) -> None:
                     ctx_k = f"{ctx // 1024}k"
+                    probe_status.truncate(0)
                     if phase == "context" and result is None:
-                        probe_status.truncate(0)
                         probe_status.append(f"  Testing {ctx_k} kv={kv_dtype}...", style="dim")
                     elif phase == "context" and result is True:
-                        probe_status.truncate(0)
                         probe_status.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
                         probe_status.append("✓ fits", style="green")
                     elif phase == "context" and result is False:
-                        probe_status.truncate(0)
                         probe_status.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
                         probe_status.append("✗ OOM", style="red")
                     elif phase == "concurrency" and result is None:
-                        probe_status.truncate(0)
                         probe_status.append(f"  {ctx_k} kv={kv_dtype} → testing concurrency...", style="dim")
                     elif phase == "concurrency":
-                        probe_status.truncate(0)
                         probe_status.append(f"  {ctx_k} kv={kv_dtype} → ", style="dim")
                         probe_status.append(f"{result} slots", style="bold green" if result else "red")
 
-                with Live(probe_status, console=console, refresh_per_second=2) as live:
+                with Live(_make_render(), console=console, refresh_per_second=1) as live:
+                    def _refresh_live(*a: object) -> None:
+                        _on_probe_step(*a)  # type: ignore[arg-type]
+                        live.update(_make_render())
+
                     limits_data = probe_model(
                         model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
-                        on_step=lambda *a: (_on_probe_step(*a), live.refresh()),  # type: ignore[func-returns-value]
+                        on_step=_refresh_live,
                     )
 
                 lim_path_w = limits_path(m.provider, m.model_name)
                 write_limits(lim_path_w, limits_data)
                 current_model_limits[model_key] = limits_data
-                console.print("  [green]✓ Limits saved[/green]\n")
+                console.print(f"  [green]✓ Limits saved[/green] ({_elapsed()} elapsed)\n")
 
             completed_jobs += 1
             passed += 1
@@ -336,8 +361,7 @@ def tune(
 
         limits_data = current_model_limits[model_key]
         prof = job_type
-
-        console.print(f"[bold cyan]{_status_line(f'{m.model_name} → {prof}')}[/bold cyan]")
+        current_job_label = f"{m.model_name} → {prof}"
 
         timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M")
         exp_name = f"{prof}-{timestamp}"
@@ -366,51 +390,51 @@ def tune(
         ]
 
         if dry_run:
+            console.print(f"[bold cyan]{_render_header()}[/bold cyan]")
             console.print(f"  [dim]DRY RUN: {' '.join(sweep_cmd)}[/dim]\n")
             completed_jobs += 1
             passed += 1
             continue
 
-        # Count expected combos from param files
-        import json as _json
         serve_count = len(_json.loads(serve_p.read_text()))
         bench_count = len(_json.loads(bench_p.read_text()))
         total_combos = serve_count * bench_count
         num_runs = 3
+        total_results = total_combos * num_runs
 
         for attempt in range(3):
-            console.print(f"  Sweep attempt {attempt + 1}/3  ({total_combos} combos × {num_runs} runs)")
             cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
-
-            # Run sweep in background, poll result files for progress
-            import threading
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
-                TextColumn("{task.completed}/{task.total} results"),
-                TextColumn("({task.fields[last]})"),
+                TextColumn("{task.completed}/{task.total}"),
+                TextColumn("[dim]{task.fields[detail]}[/dim]"),
                 console=console,
+                refresh_per_second=1,
             ) as progress:
-                task_id = progress.add_task(
-                    f"  {prof}", total=total_combos * num_runs, last="starting..."
+                header_task = progress.add_task(
+                    f"[{completed_jobs}/{total_jobs}] {m.model_name} → {prof}",
+                    total=total_results,
+                    detail=f"elapsed {_elapsed()} | ETA {_eta()}",
                 )
 
-                def _poll_results():
+                def _poll_results(tid: object = header_task) -> None:
                     while proc.poll() is None:
-                        # Count run=*.json files in the experiment dir
                         result_files = list(exp_dir.glob("**/run=*.json"))
                         count = len(result_files)
-                        last_file = result_files[-1].parent.name if result_files else "waiting"
-                        progress.update(task_id, completed=count, last=last_file)
+                        last = result_files[-1].parent.name if result_files else "starting..."
+                        progress.update(
+                            tid,  # type: ignore[arg-type]
+                            completed=count,
+                            description=f"[{completed_jobs}/{total_jobs}] {m.model_name} → {prof}",
+                            detail=f"elapsed {_elapsed()} | ETA {_eta()} | {last}",
+                        )
                         _time.sleep(3)
-                    # Final count
                     result_files = list(exp_dir.glob("**/run=*.json"))
-                    progress.update(task_id, completed=len(result_files), last="done")
+                    progress.update(tid, completed=len(result_files), detail="done")  # type: ignore[arg-type]
 
                 poller = threading.Thread(target=_poll_results, daemon=True)
                 poller.start()
