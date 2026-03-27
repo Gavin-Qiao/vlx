@@ -37,12 +37,12 @@ def _try_start_vllm(
     if qf:
         cmd.extend(qf.split())
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    import os as _os
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, preexec_fn=_os.setsid)
     try:
         deadline = time.monotonic() + _HEALTH_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                # Log stderr for debugging
                 if proc.stderr:
                     err = proc.stderr.read().decode(errors="replace")[-500:]
                     if err.strip():
@@ -59,14 +59,30 @@ def _try_start_vllm(
             time.sleep(2)
         return False
     finally:
-        proc.terminate()
+        # Kill the entire process group (catches EngineCore child processes)
+        import os
+        import signal
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
             proc.kill()
             proc.wait()
-        # Wait for GPU memory to fully release before next probe
-        time.sleep(5)
+
+        # Wait until port is actually free before next probe
+        import socket
+        for _ in range(30):  # up to 15s
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(("127.0.0.1", _PROBE_PORT)) != 0:
+                    break
+            time.sleep(0.5)
 
 
 def probe_context_limit(
