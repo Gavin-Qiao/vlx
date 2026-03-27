@@ -1,0 +1,27 @@
+[project]
+name = "vx"
+version = "0.1.0"
+description = "vLLM model manager — download, probe, tune, serve, compare"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.15",
+    "rich>=14",
+    "huggingface-hub>=0.30",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-mock>=3"]
+
+[project.scripts]
+vx = "vx.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
