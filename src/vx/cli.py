@@ -166,7 +166,146 @@ def tune(
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
 ):
     """Probe limits + benchmark a model."""
-    console.print("[dim]Tune not yet implemented.[/dim]")
+    import subprocess
+    from datetime import datetime
+    from vx.gpu import get_gpu_info, compute_gpu_memory_utilization
+    from vx.config import BENCHMARKS_DIR, VLLM_BIN, write_limits, write_profile_yaml
+    from vx.probe import probe_model
+    from vx.tune import generate_sweep_params, pick_winner, PROFILES
+    from vx.models import quant_flag as get_quant_flag
+
+    # Resolve which models to tune
+    if all_models:
+        models_to_tune = scan_models(MODELS_DIR)
+    elif model:
+        m = _resolve_model(model)
+        models_to_tune = [m]
+    else:
+        all_m = scan_models(MODELS_DIR)
+        if not all_m:
+            console.print("[red]No models found.[/red]")
+            raise typer.Exit(1)
+        for i, m in enumerate(all_m):
+            console.print(f"  {i + 1}) {m.full_name}")
+        idx = typer.prompt("Which model?", type=int) - 1
+        models_to_tune = [all_m[idx]]
+
+    # Resolve which profiles to run
+    if not profile:
+        choices = list(PROFILES.keys()) + ["all", "skip"]
+        labels = {
+            "interactive": "Interactive (chat, coding, RAG)",
+            "batch": "Batch processing",
+            "agentic": "Agentic workflows",
+            "creative": "Creative writing",
+            "all": "All profiles",
+            "skip": "Skip benchmarks (probe only)",
+        }
+        console.print("\n[bold]What's this model for?[/bold]")
+        for i, c in enumerate(choices):
+            console.print(f"  {i + 1}) {labels.get(c, c)}")
+        idx = typer.prompt("Choice", type=int) - 1
+        profile = choices[idx]
+
+    profiles_to_run = list(PROFILES.keys()) if profile == "all" else ([] if profile == "skip" else [profile])
+
+    gpu = get_gpu_info()
+    gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+
+    for m in models_to_tune:
+        console.print(f"\n[bold]{'═' * 50}[/bold]")
+        console.print(f"[bold]  {m.full_name}[/bold]")
+        console.print(f"[bold]{'═' * 50}[/bold]\n")
+
+        # Phase 1: Probe
+        lim_path = limits_path(m.provider, m.model_name)
+        existing = read_limits(lim_path)
+
+        if existing and not reprobe:
+            console.print("[dim]Limits already probed (use --reprobe to redo)[/dim]\n")
+            limits_data = existing
+        elif no_probe and existing:
+            limits_data = existing
+        elif no_probe:
+            console.print("[red]No probe data and --no-probe set.[/red]")
+            raise typer.Exit(1)
+        else:
+            console.print("[bold]Phase 1: Probing limits...[/bold]\n")
+            if dry_run:
+                console.print("[dim]DRY RUN: would probe context/concurrency limits[/dim]\n")
+                limits_data = {"limits": {}, "gpu_memory_utilization": gpu_mem_util}
+            else:
+                limits_data = probe_model(
+                    model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
+                )
+                write_limits(lim_path, limits_data)
+                console.print("[green]Limits saved[/green]\n")
+
+        # Phase 2: Benchmark
+        for prof in profiles_to_run:
+            console.print(f"[bold]Phase 2: {prof} benchmark[/bold]\n")
+
+            timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M")
+            exp_name = f"{prof}-{timestamp}"
+            exp_dir = BENCHMARKS_DIR / m.model_name / exp_name
+            exp_dir.mkdir(parents=True, exist_ok=True)
+
+            serve_p, bench_p, subcommand = generate_sweep_params(
+                profile=prof, limits=limits_data, output_dir=exp_dir,
+            )
+
+            base_serve = f"{VLLM_BIN} serve {m.path} --dtype bfloat16 --trust-remote-code"
+            qf = get_quant_flag(m.quant_method)
+            if qf:
+                base_serve += f" {qf}"
+
+            sweep_cmd = [
+                str(VLLM_BIN), "bench", "sweep", subcommand,
+                "--serve-cmd", base_serve,
+                "--bench-cmd", f"{VLLM_BIN} bench serve --dataset-name random",
+                "--serve-params", str(serve_p),
+                "--bench-params", str(bench_p),
+                "--num-runs", "3",
+                "--server-ready-timeout", "600",
+                "--output-dir", str(BENCHMARKS_DIR / m.model_name),
+                "--experiment-name", exp_name,
+            ]
+
+            if dry_run:
+                console.print(f"[dim]DRY RUN: {' '.join(sweep_cmd)}[/dim]\n")
+                continue
+
+            for attempt in range(3):
+                console.print(f"Running sweep (attempt {attempt + 1}/3)...")
+                cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
+                result = subprocess.run(cmd)
+                if result.returncode == 0:
+                    break
+                if attempt < 2:
+                    console.print("[yellow]Retrying with --resume...[/yellow]")
+
+            try:
+                winner, top3 = pick_winner(exp_dir, profile=prof)
+                config_data = {
+                    "model": str(m.path),
+                    "host": "0.0.0.0",
+                    "port": 8888,
+                    "dtype": "bfloat16",
+                    "trust-remote-code": True,
+                    "gpu-memory-utilization": gpu_mem_util,
+                }
+                for key in ["kv_cache_dtype", "enable_prefix_caching", "max_model_len", "max_num_seqs", "max_num_batched_tokens"]:
+                    val = winner["params"].get(key)
+                    if val is not None:
+                        config_data[key.replace("_", "-")] = val
+
+                cfg_path = profile_path(m.provider, m.model_name, prof)
+                write_profile_yaml(cfg_path, config_data, comment=f"vx tune — {prof} profile\nBenchmark: {exp_dir}")
+                console.print(f"[green]Config written: {cfg_path}[/green]\n")
+            except SystemExit:
+                console.print(f"[yellow]No results for {prof} profile.[/yellow]\n")
+
+    console.print("[bold green]Done.[/bold green]")
 
 
 @app.command()
