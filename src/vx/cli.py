@@ -186,12 +186,11 @@ def tune(
             raise typer.Exit(1)
         for i, m in enumerate(all_m):
             console.print(f"  {i + 1}) {m.full_name}")
-        console.print("  all) All models")
-        choice = typer.prompt("Which model?")
-        if choice.strip().lower() == "all":
+        console.print(f"  {len(all_m) + 1}) All models")
+        idx = typer.prompt("Which model?", type=int) - 1
+        if idx == len(all_m):
             models_to_tune = all_m
         else:
-            idx = int(choice) - 1
             models_to_tune = [all_m[idx]]
 
     # Resolve which profiles to run
