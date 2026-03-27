@@ -1,5 +1,6 @@
 """Probe context and concurrency limits for a model."""
 from __future__ import annotations
+from typing import Callable
 
 import subprocess
 import time
@@ -87,7 +88,7 @@ def probe_concurrency_limit(
 
 def probe_model(
     *, model_info: ModelInfo, gpu_mem_util: float, vram_total_gb: float,
-    on_step: callable | None = None,
+    on_step: Callable | None = None,
 ) -> dict:
     """Full probe. on_step(ctx, kv_dtype, phase, result) is called for live updates.
 

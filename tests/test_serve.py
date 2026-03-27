@@ -1,4 +1,3 @@
-import pytest
 from vx.serve import start_vllm, stop_vllm, is_vllm_running
 
 

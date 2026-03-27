@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-mock>=3"]
+dev = ["pytest>=8", "pytest-mock>=3", "ruff>=0.15", "mypy>=1.15", "types-PyYAML>=6", "types-requests>=2.33"]
 
 [project.scripts]
 vx = "vx.cli:app"

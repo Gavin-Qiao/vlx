@@ -191,5 +191,5 @@ def pick_winner(experiment_dir: Path, profile: str) -> tuple[dict, list[dict]]:
         print(f"ERROR: No valid results in {experiment_dir}", file=sys.stderr)
         sys.exit(1)
 
-    scored.sort(key=lambda x: x[metric], reverse=maximize)
+    scored.sort(key=lambda x: float(str(x[metric])), reverse=maximize)
     return scored[0], scored[:3]

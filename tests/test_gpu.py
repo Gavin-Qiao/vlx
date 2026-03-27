@@ -1,4 +1,4 @@
-from vx.gpu import GpuInfo, get_gpu_info, compute_gpu_memory_utilization
+from vx.gpu import get_gpu_info, compute_gpu_memory_utilization
 
 
 def test_parse_gpu_info(mocker):

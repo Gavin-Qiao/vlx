@@ -3,7 +3,6 @@ from vx.config import (
     MODELS_DIR,
     CONFIGS_DIR,
     BENCHMARKS_DIR,
-    VLLM_BIN,
     limits_path,
     profile_path,
     active_yaml_path,

@@ -1,8 +1,6 @@
 import pytest
-from pathlib import Path
 
 from vx.models import (
-    ModelInfo,
     detect_model,
     scan_models,
     fuzzy_match,

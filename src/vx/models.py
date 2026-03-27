@@ -74,7 +74,7 @@ def detect_model(model_dir: Path) -> ModelInfo:
 
 
 def scan_models(models_root: Path) -> list[ModelInfo]:
-    models = []
+    models: list[ModelInfo] = []
     if not models_root.exists():
         return models
     for provider_dir in sorted(models_root.iterdir()):

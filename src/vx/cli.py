@@ -1,6 +1,5 @@
 """vx — vLLM model manager CLI."""
 
-from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -9,11 +8,9 @@ from rich.panel import Panel
 
 from vx.config import (
     MODELS_DIR,
-    CONFIGS_DIR,
     limits_path,
     profile_path,
     read_limits,
-    read_profile_yaml,
 )
 from vx.models import scan_models, fuzzy_match, ModelInfo
 
@@ -189,7 +186,7 @@ def tune(
             raise typer.Exit(1)
         for i, m in enumerate(all_m):
             console.print(f"  {i + 1}) {m.full_name}")
-        console.print(f"  all) All models")
+        console.print("  all) All models")
         choice = typer.prompt("Which model?")
         if choice.strip().lower() == "all":
             models_to_tune = all_m
@@ -313,7 +310,7 @@ def tune(
                 with Live(probe_status, console=console, refresh_per_second=2) as live:
                     limits_data = probe_model(
                         model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
-                        on_step=lambda *a: (_on_probe_step(*a), live.refresh()),
+                        on_step=lambda *a: (_on_probe_step(*a), live.refresh()),  # type: ignore[func-returns-value]
                     )
 
                 lim_path_w = limits_path(m.provider, m.model_name)
@@ -381,7 +378,6 @@ def tune(
         total_combos = serve_count * bench_count
         num_runs = 3
 
-        sweep_ok = False
         for attempt in range(3):
             console.print(f"  Sweep attempt {attempt + 1}/3  ({total_combos} combos × {num_runs} runs)")
             cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
@@ -390,7 +386,7 @@ def tune(
             import threading
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
+            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
             with Progress(
                 SpinnerColumn(),
@@ -422,7 +418,6 @@ def tune(
                 poller.join(timeout=5)
 
             if proc.returncode == 0:
-                sweep_ok = True
                 break
             if attempt < 2:
                 console.print("  [yellow]Retrying with --resume...[/yellow]")
