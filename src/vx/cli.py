@@ -79,15 +79,29 @@ def dashboard(ctx: typer.Context):
         f"  [bold]Models[/bold]    {len(models)} downloaded, {probed} probed",
         f"  [bold]Serving[/bold]   {serving_line}",
         "",
-        "  [bold]Commands[/bold]",
-        "    models                    List models with limits & profiles",
-        "    start [model] [profile]   Start serving  (interactive picker if no args)",
-        "    stop                      Stop the vLLM service",
-        "    status                    Show what's currently serving",
-        "    tune [model] [profile]    Probe limits + benchmark",
-        "    compare                   Find the best model for a workload",
     ]
-    console.print(Panel("\n".join(lines), title="[bold cyan]vx[/bold cyan]", border_style="cyan"))
+
+    from rich.table import Table as _Tbl
+    from rich.text import Text as _Txt
+    cmd_tbl = _Tbl(show_header=False, box=None, padding=(0, 1), pad_edge=False)
+    cmd_tbl.add_column(min_width=26)
+    cmd_tbl.add_column(style="dim")
+    for cmd, desc in [
+        ("start [model] [profile]", "Start serving (interactive picker if no args)"),
+        ("stop", "Stop the vLLM service"),
+        ("status", "Show what's currently serving"),
+        ("models", "List models with limits & profiles"),
+        ("tune [model] [profile]", "Probe limits + benchmark"),
+        ("doctor", "Check system readiness"),
+    ]:
+        cmd_tbl.add_row(_Txt(cmd, style="bold cyan"), desc)
+
+    from rich.console import Group
+    body = Group(
+        "\n".join(lines) + "\n  [bold]Commands[/bold]",
+        cmd_tbl,
+    )
+    console.print(Panel(body, title="[bold cyan]vx[/bold cyan]", border_style="cyan"))
 
 
 @app.command()
@@ -615,14 +629,30 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
 
     start_vllm(cfg_path)
 
-    for _ in range(30):
+    from urllib.request import urlopen
+    port = cfg.get("port", 8888)
+    health_url = f"http://localhost:{port}/health"
+
+    console.print(f"  [dim]Waiting for {health_url} ...[/dim]")
+    for i in range(150):  # 300s max
         time.sleep(2)
-        if is_vllm_running():
-            console.print("\n[bold green]vLLM is running[/bold green] at http://localhost:8888/v1")
-            console.print(f"  Config: {cfg_path}")
-            console.print("  Logs:   sudo journalctl -u vllm -f\n")
-            return
-    console.print("[red]Service failed to start.[/red] Check: sudo journalctl -u vllm --no-pager -n 50")
+        # Check health endpoint directly — the only reliable signal
+        try:
+            resp = urlopen(health_url, timeout=2)
+            if resp.status == 200:
+                console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
+                console.print(f"  Config: {cfg_path}")
+                console.print("  Logs:   sudo journalctl -u vllm -f\n")
+                return
+        except Exception:
+            pass
+        # Detect crash-loop early — if systemd gave up, no point waiting
+        if i > 5 and not is_vllm_running():
+            console.print("[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u vllm --no-pager -n 50")
+            raise typer.Exit(1)
+        if i > 0 and i % 15 == 0:
+            console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
+    console.print("[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u vllm --no-pager -n 50")
     raise typer.Exit(1)
 
 
@@ -688,8 +718,19 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
     except ValueError:
         chosen_seqs = max_seqs
 
+    # 4. Batched tokens (for throughput tuning)
+    console.print("\n  [bold]4. Max batched tokens[/bold] (tokens processed per scheduler step)")
+    console.print("     Higher = more throughput, uses more memory per step")
+    console.print("     1) auto  — let vLLM decide (good for chat)")
+    console.print("     2) 2048  — balanced")
+    console.print("     3) 4096  — high throughput")
+    console.print("     4) 8192  — maximum throughput (batch processing)")
+    bt_map = {"1": None, "2": 2048, "3": 4096, "4": 8192}
+    bt_choice = typer.prompt("\n  Batched tokens", default="1")
+    chosen_bt = bt_map.get(bt_choice)
+
     # Build config — prefix caching always on (free when unused, wins on repeated prompts)
-    cfg = {
+    cfg: dict = {
         "model": str(m.path),
         "host": "0.0.0.0",
         "port": 8888,
@@ -701,6 +742,8 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
         "kv-cache-dtype": chosen_kv,
         "enable-prefix-caching": True,
     }
+    if chosen_bt is not None:
+        cfg["max-num-batched-tokens"] = chosen_bt
 
     qf = m.quant_method
     if qf and qf not in ("none", "compressed-tensors"):
@@ -711,10 +754,11 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
 
     # Summary
     console.print("\n  [bold]Summary[/bold]")
-    console.print(f"    Context:    {chosen_ctx // 1024}k")
-    console.print(f"    KV dtype:   {chosen_kv}")
-    console.print(f"    Slots:      {chosen_seqs}")
-    console.print("    Prefix:     always on")
+    console.print(f"    Context:        {chosen_ctx // 1024}k")
+    console.print(f"    KV dtype:       {chosen_kv}")
+    console.print(f"    Slots:          {chosen_seqs}")
+    console.print(f"    Batched tokens: {chosen_bt or 'auto'}")
+    console.print("    Prefix:         always on")
 
     confirm = typer.prompt("\n  Start? [Y/n]", default="Y")
     if confirm.strip().lower() == "n":
@@ -832,7 +876,7 @@ def status():
 
     # Detect profile from config filename
     profile_name = "unknown"
-    for p in PROFILE_NAMES:
+    for p in PROFILE_NAMES + ["custom"]:
         if f".{p}.yaml" in target.name:
             profile_name = p
             break
@@ -882,6 +926,191 @@ def status():
         console.print(f"    Batched tokens:    {bt}")
     console.print(f"    GPU memory:        {gpu_str}")
     console.print(f"\n  [dim]{target}[/dim]\n")
+
+
+@app.command()
+def doctor():
+    """Check system readiness for vLLM serving."""
+    import subprocess
+    import socket
+    from pathlib import Path
+
+    from vx.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
+    from vx.serve import is_vllm_running
+
+    ok_count = 0
+    fail_count = 0
+
+    def _ok(msg: str) -> None:
+        nonlocal ok_count
+        console.print(f"  [green]OK[/green]    {msg}")
+        ok_count += 1
+
+    def _fail(msg: str, fix: str = "") -> None:
+        nonlocal fail_count
+        console.print(f"  [red]FAIL[/red]  {msg}")
+        if fix:
+            console.print(f"          Fix: {fix}")
+        fail_count += 1
+
+    def _warn(msg: str, fix: str = "") -> None:
+        console.print(f"  [yellow]WARN[/yellow]  {msg}")
+        if fix:
+            console.print(f"          Fix: {fix}")
+
+    console.print("\n[bold]vx doctor[/bold]\n")
+
+    # -- Environment --
+    console.print("  [bold]Environment[/bold]")
+
+    # nvcc
+    try:
+        r = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5,
+                           env={"PATH": "/usr/local/cuda/bin:/usr/bin:/bin"})
+        if r.returncode == 0:
+            ver = [ln for ln in r.stdout.splitlines() if "release" in ln]
+            _ok(f"nvcc {ver[0].split('release')[-1].strip().rstrip(',') if ver else 'found'}")
+        else:
+            _fail("nvcc not working", "Install CUDA toolkit or check /usr/local/cuda/bin/nvcc")
+    except Exception:
+        _fail("nvcc not found", "Install CUDA toolkit")
+
+    # vLLM
+    try:
+        r = subprocess.run([str(VLLM_BIN), "--version"], capture_output=True, text=True, timeout=10)
+        _ok(f"vLLM {r.stdout.strip()}")
+    except Exception:
+        _fail(f"vLLM not found at {VLLM_BIN}")
+
+    # GPU
+    try:
+        from vx.gpu import get_gpu_info
+        gpu = get_gpu_info()
+        mem_used = 0
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], timeout=5)
+            mem_used = int(out.decode().strip().split("\n")[0])
+        except Exception:
+            pass
+        _ok(f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, {mem_used} MiB used)")
+    except Exception:
+        _fail("GPU not accessible", "Check nvidia-smi")
+
+    # Service user
+    try:
+        r = subprocess.run(["id", "vllm"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            _ok("Service user 'vllm' exists")
+        else:
+            _fail("Service user 'vllm' not found")
+    except Exception:
+        _fail("Cannot check service user")
+
+    # systemd unit
+    svc_path = Path("/etc/systemd/system/vllm.service")
+    if svc_path.exists():
+        svc_content = svc_path.read_text()
+        if "ProtectSystem=strict" in svc_content:
+            _fail("systemd unit has ProtectSystem=strict",
+                  "Remove it — breaks nvcc JIT compilation")
+        elif "TimeoutStartSec" not in svc_content:
+            _warn("No TimeoutStartSec in service — default 90s may be too short for JIT",
+                  "Add TimeoutStartSec=600")
+        else:
+            _ok("systemd unit configured correctly")
+    else:
+        _fail("No systemd unit at /etc/systemd/system/vllm.service")
+
+    # .env
+    env_path = VLLM_ROOT / "configs" / ".env"
+    if env_path.exists():
+        try:
+            env_content = env_path.read_text()
+            missing = [v for v in ["CUDA_HOME", "TMPDIR", "VLLM_RPC_BASE_PATH"] if v not in env_content]
+            if missing:
+                _warn(f".env missing: {', '.join(missing)}")
+            else:
+                _ok(".env has required variables")
+        except PermissionError:
+            _ok(".env exists (not readable — OK, contains secrets)")
+    else:
+        _fail(f"No .env at {env_path}")
+
+    # -- Caches --
+    console.print("\n  [bold]Caches[/bold]")
+
+    cache_checks = [
+        (VLLM_ROOT / ".cache" / "flashinfer", "FlashInfer JIT"),
+        (VLLM_ROOT / ".cache" / "vllm" / "torch_compile_cache", "torch.compile"),
+    ]
+    for cdir, label in cache_checks:
+        if cdir.exists() and any(cdir.rglob("*.so")):
+            size_mb = sum(f.stat().st_size for f in cdir.rglob("*") if f.is_file()) / (1024 * 1024)
+            _ok(f"{label} cache ({size_mb:.0f} MB)")
+        elif cdir.exists():
+            _warn(f"{label} cache exists but no compiled .so files — first start will be slow")
+        else:
+            _warn(f"{label} cache missing — first start will JIT compile (2-10 min)")
+
+    # TMPDIR
+    tmp_dir = VLLM_ROOT / "tmp"
+    if tmp_dir.exists() and tmp_dir.is_dir():
+        _ok(f"TMPDIR at {tmp_dir}")
+        # Count stale sockets
+        sockets = list(tmp_dir.glob("*"))
+        stale = [s for s in sockets if s.is_socket()]
+        if len(stale) > 10:
+            _warn(f"{len(stale)} stale sockets in {tmp_dir}", "vx cache clean")
+    else:
+        _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
+
+    # -- Config --
+    console.print("\n  [bold]Config[/bold]")
+
+    active = active_yaml_path()
+    if active.exists() and active.is_symlink():
+        target = active.resolve()
+        if target.exists():
+            cfg = read_profile_yaml(active) or {}
+            model_path = cfg.get("model", "")
+            if model_path and Path(model_path).exists():
+                _ok(f"active.yaml -> {target.name}")
+            else:
+                _fail(f"Model path in config does not exist: {model_path}")
+        else:
+            _fail(f"active.yaml points to missing file: {target}")
+    elif active.exists():
+        _ok("active.yaml exists (not a symlink)")
+    else:
+        _warn("No active.yaml — run vx start to configure")
+
+    # Port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        port_in_use = s.connect_ex(("127.0.0.1", 8888)) == 0
+    if is_vllm_running():
+        _ok("vLLM serving on port 8888")
+    elif port_in_use:
+        _fail("Port 8888 in use but vLLM not running — something else is bound")
+    else:
+        _ok("Port 8888 available")
+
+    # Log size
+    log_file = LOGS_DIR / "vllm.log"
+    if log_file.exists():
+        size_mb = log_file.stat().st_size / (1024 * 1024)
+        if size_mb > 100:
+            _warn(f"vllm.log is {size_mb:.0f} MB", "Consider truncating or adding log rotation")
+        else:
+            _ok(f"vllm.log ({size_mb:.0f} MB)")
+
+    # Models
+    all_models = scan_models(MODELS_DIR)
+    probed = sum(1 for m in all_models if read_limits(limits_path(m.provider, m.model_name)))
+    _ok(f"{len(all_models)} models downloaded, {probed} probed")
+
+    console.print(f"\n  [bold]{'All clear' if fail_count == 0 else f'{fail_count} issue(s) found'}[/bold]  "
+                  f"({ok_count} ok, {fail_count} fail)\n")
 
 
 @app.command()
