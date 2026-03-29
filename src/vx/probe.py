@@ -2,18 +2,114 @@
 from __future__ import annotations
 from typing import Callable
 
+import logging
 import subprocess
 import time
 from datetime import datetime, timezone
 
-from vx.config import VLLM_BIN
+from vx.config import LOGS_DIR, VLLM_BIN
 from vx.models import ModelInfo, quant_flag
+
+_log = logging.getLogger("vx.probe")
 
 CONTEXT_STEPS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 CONCURRENCY_STEPS = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
 _PROBE_PORT = 18188
 _HEALTH_TIMEOUT = 300
+_CLEANUP_TIMEOUT = 30  # seconds to wait for GPU memory release
+
+
+def setup_probe_logging() -> str:
+    """Set up file logging for probe runs. Call once before probe_model."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOGS_DIR / f"probe-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S",
+    ))
+    _log.addHandler(handler)
+    _log.setLevel(logging.DEBUG)
+    _log.info("Probe log started: %s", log_file)
+    return str(log_file)
+
+
+def _gpu_memory_used_mib() -> int:
+    """Return current GPU memory usage in MiB via nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            timeout=5,
+        )
+        return int(out.decode().strip().split("\n")[0])
+    except Exception:
+        return 0
+
+
+def _kill_probe_processes(proc: subprocess.Popen[bytes]) -> None:
+    """Kill vLLM process group and wait for GPU memory release."""
+    import os
+    import signal
+    import socket
+
+    pgid: int | None = None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+    # SIGTERM the process group
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Wait for parent to exit
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # SIGKILL the entire group if anything survived
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Snapshot GPU memory right after kill — wait until it drops back
+    # (EngineCore may take seconds to release VRAM even after SIGKILL)
+    baseline = _gpu_memory_used_mib()
+    _log.debug("cleanup: baseline gpu=%dMiB, waiting for release...", baseline)
+    waited = 0.0
+    for _ in range(_CLEANUP_TIMEOUT * 2):  # poll every 0.5s
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            port_free = s.connect_ex(("127.0.0.1", _PROBE_PORT)) != 0
+        mem_now = _gpu_memory_used_mib()
+        mem_released = mem_now < 100 or mem_now < baseline - 100
+        if port_free and mem_released:
+            _log.debug("cleanup: done in %.1fs gpu=%dMiB port_free=%s", waited, mem_now, port_free)
+            break
+        time.sleep(0.5)
+        waited += 0.5
+    else:
+        mem_now = _gpu_memory_used_mib()
+        _log.warning("cleanup: TIMEOUT after %.1fs gpu=%dMiB — memory may not be released!", waited, mem_now)
+
+
+def _read_stderr_file(path: str) -> str:
+    """Read stderr temp file, return content as string."""
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
 
 
 def _try_start_vllm(
@@ -37,52 +133,66 @@ def _try_start_vllm(
     if qf:
         cmd.extend(qf.split())
 
+    gpu_before = _gpu_memory_used_mib()
+    _log.info(
+        "START ctx=%d kv=%s seqs=%d gpu_before=%dMiB | %s",
+        context_len, kv_dtype, max_num_seqs, gpu_before, " ".join(cmd),
+    )
+
     import os as _os
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, preexec_fn=_os.setsid)
+    import tempfile
+    stderr_file = tempfile.NamedTemporaryFile(prefix="vx-probe-", suffix=".stderr", delete=False)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=stderr_file,
+        preexec_fn=_os.setsid,
+    )
+    t0 = time.monotonic()
     try:
-        deadline = time.monotonic() + _HEALTH_TIMEOUT
+        deadline = t0 + _HEALTH_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                if proc.stderr:
-                    err = proc.stderr.read().decode(errors="replace")[-500:]
-                    if err.strip():
-                        import logging
-                        logging.debug("vLLM probe failed: %s", err.strip())
+                elapsed = time.monotonic() - t0
+                stderr_text = _read_stderr_file(stderr_file.name)
+                gpu_after = _gpu_memory_used_mib()
+                _log.warning(
+                    "EXITED rc=%d after %.1fs gpu_after=%dMiB ctx=%d kv=%s seqs=%d\n"
+                    "--- stderr (last 2000 chars) ---\n%s\n--- end stderr ---",
+                    proc.returncode, elapsed, gpu_after,
+                    context_len, kv_dtype, max_num_seqs,
+                    stderr_text[-2000:],
+                )
                 return False
             try:
-                import requests
-                resp = requests.get(f"http://127.0.0.1:{_PROBE_PORT}/health", timeout=2)
-                if resp.status_code == 200:
+                from urllib.request import urlopen
+                resp = urlopen(f"http://127.0.0.1:{_PROBE_PORT}/health", timeout=2)
+                if resp.status == 200:
+                    elapsed = time.monotonic() - t0
+                    gpu_after = _gpu_memory_used_mib()
+                    _log.info(
+                        "HEALTHY after %.1fs gpu_after=%dMiB ctx=%d kv=%s seqs=%d",
+                        elapsed, gpu_after, context_len, kv_dtype, max_num_seqs,
+                    )
                     return True
             except Exception:
                 pass
             time.sleep(2)
+        elapsed = time.monotonic() - t0
+        stderr_text = _read_stderr_file(stderr_file.name)
+        _log.warning(
+            "TIMEOUT after %.1fs ctx=%d kv=%s seqs=%d\n"
+            "--- stderr (last 2000 chars) ---\n%s\n--- end stderr ---",
+            elapsed, context_len, kv_dtype, max_num_seqs,
+            stderr_text[-2000:],
+        )
         return False
     finally:
-        # Kill the entire process group (catches EngineCore child processes)
-        import os
-        import signal
+        _kill_probe_processes(proc)
+        gpu_final = _gpu_memory_used_mib()
+        _log.info("CLEANUP done gpu_final=%dMiB", gpu_final)
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            _os.unlink(stderr_file.name)
+        except OSError:
             pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            proc.kill()
-            proc.wait()
-
-        # Wait until port is actually free before next probe
-        import socket
-        for _ in range(30):  # up to 15s
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                if s.connect_ex(("127.0.0.1", _PROBE_PORT)) != 0:
-                    break
-            time.sleep(0.5)
 
 
 def probe_context_limit(
@@ -134,6 +244,13 @@ def probe_model(
     phase: "context" (testing if ctx starts) or "concurrency" (binary search slots)
     result: True/False for context, int|None for concurrency
     """
+    setup_probe_logging()
+    _log.info(
+        "probe_model start: %s size=%.1fGB quant=%s max_pos=%d gpu_util=%.3f vram=%.1fGB",
+        model_info.path, model_info.model_size_gb, model_info.quant_method,
+        model_info.max_position_embeddings, gpu_mem_util, vram_total_gb,
+    )
+
     max_pos = model_info.max_position_embeddings
     steps = [s for s in CONTEXT_STEPS if s <= max_pos]
 
@@ -183,3 +300,64 @@ def probe_model(
         "max_position_embeddings": model_info.max_position_embeddings,
         "limits": limits,
     }
+
+
+def preheat_jit(
+    *, model_info: ModelInfo, gpu_mem_util: float, kv_dtype: str = "auto",
+) -> bool:
+    """Start vLLM as the service user to build flashinfer JIT cache.
+
+    Returns True if the server reached healthy state.
+    """
+    import os
+    import tempfile
+
+    cmd = [
+        "sudo", "-u", "vllm",
+        "env",
+        "PATH=/opt/vllm/venv/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+        "CUDA_HOME=/usr/local/cuda",
+        "HF_HOME=/opt/vllm/models/.hf_cache",
+        str(VLLM_BIN), "serve", str(model_info.path),
+        "--dtype", "bfloat16", "--trust-remote-code",
+        "--host", "127.0.0.1", "--port", str(_PROBE_PORT),
+        "--max-model-len", "4096",
+        "--gpu-memory-utilization", str(gpu_mem_util),
+        "--kv-cache-dtype", kv_dtype,
+        "--max-num-seqs", "1",
+    ]
+    qf = quant_flag(model_info.quant_method)
+    if qf:
+        cmd.extend(qf.split())
+
+    _log.info("PREHEAT JIT kv=%s | %s", kv_dtype, " ".join(cmd))
+
+    stderr_file = tempfile.NamedTemporaryFile(prefix="vx-preheat-", suffix=".stderr", delete=False)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_file, preexec_fn=os.setsid)
+    t0 = time.monotonic()
+    healthy = False
+    try:
+        # JIT compilation can take 2-3 minutes on first run
+        deadline = t0 + 600
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                _log.warning("PREHEAT exited rc=%d after %.0fs", proc.returncode, time.monotonic() - t0)
+                break
+            try:
+                from urllib.request import urlopen
+                resp = urlopen(f"http://127.0.0.1:{_PROBE_PORT}/health", timeout=2)
+                if resp.status == 200:
+                    _log.info("PREHEAT healthy after %.0fs", time.monotonic() - t0)
+                    healthy = True
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+    finally:
+        _kill_probe_processes(proc)
+        try:
+            os.unlink(stderr_file.name)
+        except OSError:
+            pass
+
+    return healthy
