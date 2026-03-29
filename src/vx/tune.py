@@ -47,6 +47,20 @@ def _working_kv_dtypes(limits: dict, context_len: int) -> list[str]:
     return [k for k, v in entry.items() if v is not None]
 
 
+def _representative_contexts(limits: dict) -> list[int]:
+    """Pick min, mid, max contexts — skip levels with identical probe results."""
+    all_ctxs = sorted(
+        int(c) for c, d in limits.get("limits", {}).items()
+        if any(v is not None for v in d.values())
+    )
+    if len(all_ctxs) <= 3:
+        return all_ctxs
+    # Always include lowest and highest; pick a midpoint
+    mid = all_ctxs[len(all_ctxs) // 2]
+    result = [all_ctxs[0], mid, all_ctxs[-1]]
+    return sorted(set(result))
+
+
 def generate_sweep_params(
     *, profile: str, limits: dict, output_dir: Path,
 ) -> tuple[Path, Path, str]:
@@ -58,25 +72,23 @@ def generate_sweep_params(
     bench: dict[str, dict] = {}
 
     if profile == "interactive":
-        for ctx_str, dtypes in limits.get("limits", {}).items():
-            ctx = int(ctx_str)
-            for kv, slots in dtypes.items():
-                if slots is None:
-                    continue
+        for ctx in _representative_contexts(limits):
+            for kv in _working_kv_dtypes(limits, ctx):
+                slots = limits.get("limits", {}).get(str(ctx), {}).get(kv, 1)
                 serve[f"ctx{ctx // 1024}k-kv_{kv}"] = {
                     "max_model_len": ctx,
+                    "max_num_seqs": slots,
                     "kv_cache_dtype": kv,
                     "enable_prefix_caching": True,
                     "gpu_memory_utilization": gpu_mem_util,
                 }
-        for il in [256, 512, 2048]:
-            for ol in [128, 256]:
-                bench[f"in{il}-out{ol}"] = {
-                    "random_input_len": il,
-                    "random_output_len": ol,
-                    "max_concurrency": 1,
-                    "num_prompts": 20,
-                }
+        for il, ol in [(256, 128), (512, 256), (2048, 256)]:
+            bench[f"in{il}-out{ol}"] = {
+                "random_input_len": il,
+                "random_output_len": ol,
+                "max_concurrency": 1,
+                "num_prompts": 20,
+            }
 
     elif profile == "batch":
         max_seqs_values = [8, 16, 32, 64]
@@ -103,14 +115,18 @@ def generate_sweep_params(
     elif profile == "agentic":
         max_ctx = _max_proven_context(limits) or 4096
         for kv in _working_kv_dtypes(limits, max_ctx):
+            slots = limits.get("limits", {}).get(str(max_ctx), {}).get(kv, 1)
             serve[f"kv_{kv}"] = {
                 "max_model_len": max_ctx,
+                "max_num_seqs": slots,
                 "kv_cache_dtype": kv,
                 "enable_prefix_caching": True,
                 "gpu_memory_utilization": gpu_mem_util,
             }
+        # Use realistic large-context input sizes (not % of max)
+        agentic_input = min(max_ctx - 1024, 32768)
         bench["agentic"] = {
-            "random_input_len": int(max_ctx * 0.75),
+            "random_input_len": agentic_input,
             "random_output_len": 512,
             "max_concurrency": 1,
             "num_prompts": 10,
@@ -119,14 +135,14 @@ def generate_sweep_params(
     elif profile == "creative":
         max_ctx = _max_proven_context(limits) or 4096
         for kv in _working_kv_dtypes(limits, max_ctx):
-            for seqs in [1, 2, 4, 8]:
+            for seqs in [1, 4]:
                 serve[f"kv_{kv}-seqs{seqs}"] = {
                     "max_model_len": max_ctx,
                     "kv_cache_dtype": kv,
                     "max_num_seqs": seqs,
                     "gpu_memory_utilization": gpu_mem_util,
                 }
-        for ol in [1024, 2048, 4096]:
+        for ol in [1024, 4096]:
             bench[f"out{ol}"] = {
                 "random_input_len": 256,
                 "random_output_len": ol,
