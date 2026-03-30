@@ -10,9 +10,23 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-LOG_PATH = Path("/opt/vllm/logs/vx-fan.log")
-PID_PATH = Path("/opt/vllm/run/vx-fan.pid")
-STATE_PATH = Path("/opt/vllm/run/vx-fan.json")
+from vx.config import cfg
+
+LOG_PATH: Path  # resolved lazily
+PID_PATH: Path
+STATE_PATH: Path
+_paths_resolved = False
+
+
+def _resolve_paths() -> None:
+    global LOG_PATH, PID_PATH, STATE_PATH, _paths_resolved
+    if _paths_resolved:
+        return
+    c = cfg()
+    LOG_PATH = c.logs_dir / "vx-fan.log"
+    PID_PATH = c.run_dir / "vx-fan.pid"
+    STATE_PATH = c.run_dir / "vx-fan.json"
+    _paths_resolved = True
 
 MIN_FAN = 30
 TEMP_LOW = 35
@@ -27,6 +41,7 @@ _log = logging.getLogger("vx.fan")
 
 def read_state() -> dict | None:
     """Read the running daemon's config. Returns None if not running."""
+    _resolve_paths()
     if not STATE_PATH.exists():
         return None
     import json
@@ -133,6 +148,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
     """Main fan curve loop. Blocks until SIGTERM."""
     import json
 
+    _resolve_paths()
     _setup_logging()
 
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)

@@ -98,21 +98,28 @@ class TestComputeFanSpeed:
 
 
 class TestReadState:
+    def _patch_paths(self, mocker, tmp_path):
+        import vx.fan
+        vx.fan._paths_resolved = False
+        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+            logs_dir=tmp_path, run_dir=tmp_path,
+        ))
+
     def test_missing_file(self, tmp_path, mocker):
-        mocker.patch("vx.fan.STATE_PATH", tmp_path / "nonexistent.json")
+        self._patch_paths(mocker, tmp_path)
         assert read_state() is None
 
     def test_valid_json(self, tmp_path, mocker):
-        f = tmp_path / "state.json"
+        self._patch_paths(mocker, tmp_path)
+        f = tmp_path / "vx-fan.json"
         f.write_text('{"quiet_start": 22, "quiet_end": 6, "quiet_max": 50}')
-        mocker.patch("vx.fan.STATE_PATH", f)
         state = read_state()
         assert state == {"quiet_start": 22, "quiet_end": 6, "quiet_max": 50}
 
     def test_corrupted_json(self, tmp_path, mocker):
-        f = tmp_path / "state.json"
+        self._patch_paths(mocker, tmp_path)
+        f = tmp_path / "vx-fan.json"
         f.write_text("not json{{{")
-        mocker.patch("vx.fan.STATE_PATH", f)
         assert read_state() is None
 
 
@@ -123,3 +130,44 @@ class TestConstants:
     def test_max_failures_is_reasonable(self):
         # 30 failures × 5s interval = 2.5 min before exit
         assert 20 <= MAX_CONSECUTIVE_FAILURES <= 60
+
+
+class TestResolvePaths:
+    """Test the lazy path resolution that cli.py depends on."""
+
+    def test_resolve_sets_paths(self, tmp_path, mocker):
+        import vx.fan
+        vx.fan._paths_resolved = False
+        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+            logs_dir=tmp_path / "logs",
+            run_dir=tmp_path / "run",
+        ))
+        vx.fan._resolve_paths()
+        assert vx.fan.PID_PATH == tmp_path / "run" / "vx-fan.pid"
+        assert vx.fan.STATE_PATH == tmp_path / "run" / "vx-fan.json"
+        assert vx.fan.LOG_PATH == tmp_path / "logs" / "vx-fan.log"
+
+    def test_resolve_is_idempotent(self, tmp_path, mocker):
+        import vx.fan
+        vx.fan._paths_resolved = False
+        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+            logs_dir=tmp_path, run_dir=tmp_path,
+        ))
+        vx.fan._resolve_paths()
+        first = vx.fan.PID_PATH
+        vx.fan._resolve_paths()  # should not re-resolve
+        assert vx.fan.PID_PATH is first
+
+    def test_cli_import_pattern_works(self, tmp_path, mocker):
+        """Reproduces the exact import pattern from cli.py that broke."""
+        import vx.fan as _fan
+        _fan._paths_resolved = False
+        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+            logs_dir=tmp_path, run_dir=tmp_path,
+        ))
+        _fan._resolve_paths()
+        PID_PATH = _fan.PID_PATH
+        STATE_PATH = _fan.STATE_PATH
+        from pathlib import Path
+        assert isinstance(PID_PATH, Path)
+        assert isinstance(STATE_PATH, Path)

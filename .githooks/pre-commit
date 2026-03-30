@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "=== ruff ==="
+uv run ruff check src/ tests/
+
+echo "=== mypy ==="
+uv run mypy src/vx/ --ignore-missing-imports
+
+echo "=== pytest ==="
+uv run pytest tests/ -q --tb=short
+
+echo "=== all checks passed ==="

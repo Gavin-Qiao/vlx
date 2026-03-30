@@ -70,7 +70,8 @@ def dashboard(ctx: typer.Context):
             cfg = read_profile_yaml(active)
             model_path = cfg.get("model", "?") if cfg else "?"
             model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
-            serving_line = f"[green]{model_name}[/green] at :8888"
+            port = cfg.get("port", 8888) if cfg else 8888
+            serving_line = f"[green]{model_name}[/green] at :{port}"
         else:
             serving_line = "[green]active[/green]"
 
@@ -642,17 +643,23 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
             if resp.status == 200:
                 console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
                 console.print(f"  Config: {cfg_path}")
-                console.print("  Logs:   sudo journalctl -u vllm -f\n")
+                from vx.config import cfg as _cfg
+                svc = _cfg().service_name
+                console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
                 return
         except Exception:
             pass
         # Detect crash-loop early — if systemd gave up, no point waiting
         if i > 5 and not is_vllm_running():
-            console.print("[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u vllm --no-pager -n 50")
+            from vx.config import cfg as _cfg
+            svc = _cfg().service_name
+            console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
             raise typer.Exit(1)
         if i > 0 and i % 15 == 0:
             console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-    console.print("[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u vllm --no-pager -n 50")
+    from vx.config import cfg as _cfg
+    svc = _cfg().service_name
+    console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
     raise typer.Exit(1)
 
 
@@ -853,11 +860,16 @@ def fan(
     """GPU fan control — auto curve, fixed speed, or off."""
     from pathlib import Path
 
-    from vx.fan import PID_PATH, STATE_PATH, read_state
+    import vx.fan as _fan
+    from vx.fan import read_state
     from vx.gpu import set_fan_speed, get_fan_speed
     import os
     import signal as sig
     import time
+
+    _fan._resolve_paths()
+    PID_PATH = _fan.PID_PATH
+    STATE_PATH = _fan.STATE_PATH
 
     def _daemon_pid() -> int | None:
         if not PID_PATH.exists():
@@ -1105,6 +1117,50 @@ def status():
 
 
 @app.command()
+def init():
+    """Auto-discover vLLM installation and write config."""
+    from vx.config import (
+        CONFIG_FILE, save_config,
+        _discover_vllm_root, _discover_cuda_home, _discover_service, _discover_port,
+        _build_config, reset_config,
+    )
+
+    console.print("\n[bold]Discovering vLLM installation...[/bold]\n")
+
+    root = _discover_vllm_root()
+    cuda = _discover_cuda_home()
+    svc_name, svc_user = _discover_service()
+
+    if root:
+        console.print(f"  vLLM root:     [green]{root}[/green]")
+    else:
+        console.print("  vLLM root:     [yellow]not found[/yellow] — using /opt/vllm")
+        root_input = typer.prompt("  vLLM root path", default="/opt/vllm")
+        from pathlib import Path as _Path
+        root = _Path(root_input)
+
+    port = _discover_port(root)
+    models_count = len(list((root / "models").glob("*/*"))) if (root / "models").exists() else 0
+
+    console.print(f"  Models dir:    {root / 'models'} ({models_count} models)")
+    console.print(f"  CUDA:          [green]{cuda}[/green]")
+    console.print(f"  Service:       {svc_name} (user: {svc_user})")
+    console.print(f"  Port:          {port}")
+
+    if CONFIG_FILE.exists():
+        console.print(f"\n  [yellow]Config exists:[/yellow] {CONFIG_FILE}")
+        if not typer.confirm("  Overwrite?", default=False):
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    config = _build_config(root, cuda, svc_name, svc_user, port)
+    path = save_config(config)
+    reset_config()
+
+    console.print(f"\n[green]Config written to {path}[/green]\n")
+
+
+@app.command()
 def doctor():
     """Check system readiness for vLLM serving."""
     import subprocess
@@ -1174,17 +1230,19 @@ def doctor():
         _fail("GPU not accessible", "Check nvidia-smi")
 
     # Service user
+    from vx.config import cfg as _cfg
+    _c = _cfg()
     try:
-        r = subprocess.run(["id", "vllm"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["id", _c.service_user], capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
-            _ok("Service user 'vllm' exists")
+            _ok(f"Service user '{_c.service_user}' exists")
         else:
-            _fail("Service user 'vllm' not found")
+            _fail(f"Service user '{_c.service_user}' not found")
     except Exception:
         _fail("Cannot check service user")
 
     # systemd unit
-    svc_path = Path("/etc/systemd/system/vllm.service")
+    svc_path = Path(f"/etc/systemd/system/{_c.service_name}.service")
     if svc_path.exists():
         svc_content = svc_path.read_text()
         if "ProtectSystem=strict" in svc_content:
@@ -1196,7 +1254,7 @@ def doctor():
         else:
             _ok("systemd unit configured correctly")
     else:
-        _fail("No systemd unit at /etc/systemd/system/vllm.service")
+        _fail(f"No systemd unit at {svc_path}")
 
     # .env
     env_path = VLLM_ROOT / "configs" / ".env"
@@ -1262,14 +1320,15 @@ def doctor():
         _warn("No active.yaml — run vx start to configure")
 
     # Port
+    _port = _c.port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        port_in_use = s.connect_ex(("127.0.0.1", 8888)) == 0
+        port_in_use = s.connect_ex(("127.0.0.1", _port)) == 0
     if is_vllm_running():
-        _ok("vLLM serving on port 8888")
+        _ok(f"vLLM serving on port {_port}")
     elif port_in_use:
-        _fail("Port 8888 in use but vLLM not running — something else is bound")
+        _fail(f"Port {_port} in use but vLLM not running — something else is bound")
     else:
-        _ok("Port 8888 available")
+        _ok(f"Port {_port} available")
 
     # Log size
     log_file = LOGS_DIR / "vllm.log"

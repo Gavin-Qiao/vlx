@@ -7,7 +7,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
-from vx.config import LOGS_DIR, VLLM_BIN
+from vx.config import LOGS_DIR, VLLM_BIN, cfg
 from vx.models import ModelInfo, quant_flag
 
 _log = logging.getLogger("vx.probe")
@@ -312,12 +312,13 @@ def preheat_jit(
     import os
     import tempfile
 
+    c = cfg()
     cmd = [
-        "sudo", "-u", "vllm",
+        "sudo", "-u", c.service_user,
         "env",
-        "PATH=/opt/vllm/venv/bin:/usr/local/cuda/bin:/usr/bin:/bin",
-        "CUDA_HOME=/usr/local/cuda",
-        "HF_HOME=/opt/vllm/models/.hf_cache",
+        f"PATH={c.vllm_bin.parent}:{c.cuda_home / 'bin'}:/usr/bin:/bin",
+        f"CUDA_HOME={c.cuda_home}",
+        f"HF_HOME={c.models_dir / '.hf_cache'}",
         str(VLLM_BIN), "serve", str(model_info.path),
         "--dtype", "bfloat16", "--trust-remote-code",
         "--host", "127.0.0.1", "--port", str(_PROBE_PORT),

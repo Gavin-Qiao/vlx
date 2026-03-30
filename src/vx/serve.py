@@ -3,12 +3,12 @@
 import subprocess
 from pathlib import Path
 
-from vx.config import active_yaml_path
+from vx.config import cfg
 
 
 def _systemctl(action: str) -> tuple[bool, str]:
     result = subprocess.run(
-        ["sudo", "systemctl", action, "vllm"],
+        ["sudo", "systemctl", action, cfg().service_name],
         capture_output=True,
         text=True,
     )
@@ -16,7 +16,7 @@ def _systemctl(action: str) -> tuple[bool, str]:
 
 
 def _update_active_symlink(config_path: Path) -> None:
-    active = active_yaml_path()
+    active = cfg().active_yaml
     active.unlink(missing_ok=True)
     active.symlink_to(config_path.resolve())
 
