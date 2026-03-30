@@ -1251,46 +1251,152 @@ def status():
 
 @app.command()
 def init():
-    """Auto-discover vLLM installation and write config."""
+    """Set up vlx — scan the system, write config, optionally install login banner."""
+    import shutil
+    import subprocess
+    from pathlib import Path as _Path
+
     from vlx.config import (
         CONFIG_FILE, save_config,
         _discover_vllm_root, _discover_cuda_home, _discover_service, _discover_port,
         _build_config, reset_config,
     )
 
-    console.print("\n[bold]Discovering vLLM installation...[/bold]\n")
+    def _ok(msg: str) -> None:
+        console.print(f"  [green]{msg}[/green]")
 
-    root = _discover_vllm_root()
+    def _warn(msg: str) -> None:
+        console.print(f"  [yellow]{msg}[/yellow]")
+
+    def _fail(msg: str) -> None:
+        console.print(f"  [red]{msg}[/red]")
+
+    console.print("\n[bold]vlx setup[/bold]\n")
+    console.print("[dim]Scanning your system...[/dim]\n")
+
+    # ── GPU ──
+    try:
+        from vlx.gpu import get_gpu_info
+        gpu = get_gpu_info()
+        _ok(f"GPU         {gpu.name} ({gpu.vram_total_gb:.0f} GB)")
+        _ok(f"Driver      {gpu.driver}")
+        _ok(f"CUDA        {gpu.cuda}")
+    except Exception:
+        _fail("GPU         nvidia-smi not found or no GPU detected")
+
+    # ── CUDA toolkit ──
     cuda = _discover_cuda_home()
-    svc_name, svc_user = _discover_service()
-
-    if root:
-        console.print(f"  vLLM root:     [green]{root}[/green]")
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        _ok(f"nvcc        {cuda}")
     else:
-        console.print("  vLLM root:     [yellow]not found[/yellow] — using /opt/vllm")
+        _warn(f"nvcc        not on PATH (using {cuda})")
+
+    # ── vLLM ──
+    root = _discover_vllm_root()
+    if root:
+        # Check vLLM version
+        vllm_bin = root / "venv" / "bin" / "vllm"
+        if not vllm_bin.exists():
+            vllm_bin = root / ".venv" / "bin" / "vllm"
+        try:
+            r = subprocess.run(
+                [str(vllm_bin), "--version"],
+                capture_output=True, text=True, timeout=10,
+            )
+            ver = r.stdout.strip() or r.stderr.strip()
+            _ok(f"vLLM        {ver} ({root})")
+        except Exception:
+            _ok(f"vLLM        found at {root}")
+    else:
+        _fail("vLLM        not found")
         root_input = typer.prompt("  vLLM root path", default="/opt/vllm")
-        from pathlib import Path as _Path
         root = _Path(root_input)
 
+    # ── Models ──
+    models_dir = root / "models"
+    if models_dir.is_dir():
+        models = list(models_dir.glob("*/*/config.json"))
+        _ok(f"Models      {len(models)} found at {models_dir}")
+    else:
+        _warn(f"Models      {models_dir} does not exist")
+
+    # ── systemd ──
+    svc_name, svc_user = _discover_service()
+    svc_path = _Path(f"/etc/systemd/system/{svc_name}.service")
+    if svc_path.exists():
+        _ok(f"systemd     {svc_name}.service (user: {svc_user})")
+    else:
+        _warn(f"systemd     no {svc_name}.service found")
+
+    # ── Port ──
     port = _discover_port(root)
-    models_count = len(list((root / "models").glob("*/*"))) if (root / "models").exists() else 0
+    _ok(f"Port        {port}")
 
-    console.print(f"  Models dir:    {root / 'models'} ({models_count} models)")
-    console.print(f"  CUDA:          [green]{cuda}[/green]")
-    console.print(f"  Service:       {svc_name} (user: {svc_user})")
-    console.print(f"  Port:          {port}")
+    # ── Coolbits (fan control) ──
+    xorg_conf = _Path("/etc/X11/xorg.conf")
+    if xorg_conf.exists() and "Coolbits" in xorg_conf.read_text():
+        _ok("Coolbits    enabled (fan control available)")
+    else:
+        _warn("Coolbits    not configured (vlx fan requires it)")
 
+    # ── gum (interactive UI) ──
+    if shutil.which("gum"):
+        _ok("gum         installed (interactive UI enabled)")
+    else:
+        _warn("gum         not installed (vlx download will use basic mode)")
+
+    # ── Write config ──
+    console.print()
     if CONFIG_FILE.exists():
-        console.print(f"\n  [yellow]Config exists:[/yellow] {CONFIG_FILE}")
-        if not typer.confirm("  Overwrite?", default=False):
-            console.print("[dim]Aborted.[/dim]")
-            return
+        console.print(f"  [dim]Config exists at {CONFIG_FILE}[/dim]")
+        if not typer.confirm("  Overwrite config?", default=True):
+            console.print()
+        else:
+            config = _build_config(root, cuda, svc_name, svc_user, port)
+            save_config(config)
+            reset_config()
+            _ok(f"Config written to {CONFIG_FILE}")
+    else:
+        config = _build_config(root, cuda, svc_name, svc_user, port)
+        save_config(config)
+        reset_config()
+        _ok(f"Config written to {CONFIG_FILE}")
 
-    config = _build_config(root, cuda, svc_name, svc_user, port)
-    path = save_config(config)
-    reset_config()
+    # ── Welcome banner ──
+    banner_path = _Path("/etc/profile.d/vlx-welcome.sh")
+    banner_src = _Path(__file__).parent / "welcome.sh"
+    has_banner = banner_path.exists()
 
-    console.print(f"\n[green]Config written to {path}[/green]\n")
+    if has_banner:
+        console.print(f"  [dim]Login banner already installed at {banner_path}[/dim]")
+        if typer.confirm("  Reinstall login banner?", default=False):
+            subprocess.run(
+                ["sudo", "cp", str(banner_src), str(banner_path)],
+                check=True,
+            )
+            _ok(f"Banner updated at {banner_path}")
+    else:
+        console.print()
+        console.print("  [bold]Login banner[/bold]")
+        console.print("  Shows GPU status, model, and commands on every SSH login.")
+        console.print("  Requires: gum")
+        if typer.confirm("  Install login banner?", default=True):
+            subprocess.run(
+                ["sudo", "cp", str(banner_src), str(banner_path)],
+                check=True,
+            )
+            _ok(f"Banner installed at {banner_path}")
+        else:
+            console.print("  [dim]Skipped.[/dim]")
+
+    # ── Next steps ──
+    console.print()
+    console.print("[bold]Next steps[/bold]")
+    console.print("  vlx download    Search & download a model")
+    console.print("  vlx doctor      Full system check")
+    console.print("  vlx             Dashboard")
+    console.print()
 
 
 @app.command()
