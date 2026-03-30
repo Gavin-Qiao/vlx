@@ -846,6 +846,182 @@ def stop():
     console.print("[green]vLLM stopped.[/green]")
 
 
+@app.command()
+def fan(
+    mode: str = typer.Argument(None, help="auto | <30-100> | off"),
+):
+    """GPU fan control — auto curve, fixed speed, or off."""
+    from pathlib import Path
+
+    from vx.fan import PID_PATH, STATE_PATH, read_state
+    from vx.gpu import set_fan_speed, get_fan_speed
+    import os
+    import signal as sig
+    import time
+
+    def _daemon_pid() -> int | None:
+        if not PID_PATH.exists():
+            return None
+        try:
+            pid = int(PID_PATH.read_text().strip())
+            os.kill(pid, 0)
+            # Verify it's actually our daemon, not a recycled PID
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+            if "vx.fan" not in cmdline:
+                PID_PATH.unlink(missing_ok=True)
+                STATE_PATH.unlink(missing_ok=True)
+                return None
+            return pid
+        except (ValueError, OSError):
+            PID_PATH.unlink(missing_ok=True)
+            STATE_PATH.unlink(missing_ok=True)
+            return None
+
+    def _stop_daemon() -> bool:
+        pid = _daemon_pid()
+        if pid is None:
+            return False
+        os.kill(pid, sig.SIGTERM)
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            except OSError:
+                break
+        PID_PATH.unlink(missing_ok=True)
+        STATE_PATH.unlink(missing_ok=True)
+        return True
+
+    def _start_daemon(qs: int, qe: int, qm: int) -> None:
+        _stop_daemon()
+        import subprocess
+        import sys
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "vx.fan",
+                "--quiet-start", str(qs),
+                "--quiet-end", str(qe),
+                "--quiet-max", str(qm),
+            ],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+        if proc.poll() is not None:
+            console.print("[red]Fan daemon failed to start.[/red] Check /opt/vllm/logs/vx-fan.log")
+            raise typer.Exit(1)
+        console.print(f"[green]Fan daemon started[/green] (pid {proc.pid})")
+
+    def _show_status() -> None:
+        speed = get_fan_speed()
+        pid = _daemon_pid()
+        state = read_state() if pid else None
+        try:
+            from vx.fan import _get_gpu_temp
+            temp = _get_gpu_temp()
+        except Exception:
+            temp = None
+
+        temp_str = f"{temp}°C" if temp is not None else "?"
+        console.print(f"\n[bold]GPU Fan[/bold]  {speed}% @ {temp_str}")
+
+        if state:
+            qs, qe, qm = state["quiet_start"], state["quiet_end"], state["quiet_max"]
+            console.print(f"  [green]Auto curve[/green] — quiet {qs:02d}:00-{qe:02d}:00 (max {qm}%), otherwise 100%")
+        elif pid:
+            console.print("  [green]Auto curve[/green] (defaults)")
+        else:
+            console.print("  [dim]No daemon — fixed or NVIDIA auto[/dim]")
+
+    # --- Direct mode (non-interactive) ---
+    if mode == "auto":
+        _start_daemon(9, 18, 60)
+        return
+    if mode == "off":
+        if _stop_daemon():
+            console.print("[green]Fan daemon stopped[/green], auto control restored.")
+        else:
+            console.print("[dim]No fan daemon running.[/dim]")
+        return
+    if mode is not None:
+        try:
+            percent = int(mode)
+        except ValueError:
+            console.print(f"[red]Unknown mode '{mode}'.[/red] Use: auto, off, or 30-100")
+            raise typer.Exit(1)
+        if not 30 <= percent <= 100:
+            console.print("[red]Fan speed must be 30-100.[/red]")
+            raise typer.Exit(1)
+        _stop_daemon()
+        set_fan_speed(percent)
+        actual = get_fan_speed()
+        console.print(f"[green]Fan set to {percent}%[/green] (reading: {actual}%)")
+        return
+
+    # --- Interactive mode ---
+    _show_status()
+
+    pid = _daemon_pid()
+    state = read_state() if pid else None
+
+    options: list[tuple[str, str]] = []
+    if pid:
+        options.append(("curve", "Change quiet hours / fan cap"))
+        options.append(("fixed", "Fixed speed"))
+        options.append(("off", "Off — restore NVIDIA auto"))
+    else:
+        options.append(("curve", "Auto curve (temp-based with quiet hours)"))
+        options.append(("fixed", "Fixed speed"))
+
+    console.print()
+    for i, (_, desc) in enumerate(options, 1):
+        console.print(f"  {i}) {desc}")
+
+    choice = _pick_number("\nChoice", len(options))
+    action = options[choice - 1][0]
+
+    if action == "off":
+        _stop_daemon()
+        console.print("[green]Fan daemon stopped[/green], auto control restored.")
+        return
+
+    if action == "fixed":
+        val = typer.prompt("Fan speed % (30-100)", type=int)
+        if not 30 <= val <= 100:
+            console.print(f"[red]Fan speed must be 30-100, got {val}.[/red]")
+            raise typer.Exit(1)
+        _stop_daemon()
+        set_fan_speed(val)
+        console.print(f"[green]Fan set to {val}%[/green]")
+        return
+
+    # action == "curve"
+    defaults = state or {"quiet_start": 9, "quiet_end": 18, "quiet_max": 60}
+    qs = defaults["quiet_start"]
+    qe = defaults["quiet_end"]
+    qm = defaults["quiet_max"]
+
+    console.print(f"\n  Current: quiet {qs:02d}:00-{qe:02d}:00, max {qm}%")
+    qs = typer.prompt("  Quiet start hour (0-23)", type=int, default=qs)
+    qe = typer.prompt("  Quiet end hour (0-23)", type=int, default=qe)
+    qm = typer.prompt("  Quiet max fan % (30-100)", type=int, default=qm)
+
+    if not 0 <= qs <= 23:
+        console.print(f"[red]Quiet start hour must be 0-23, got {qs}.[/red]")
+        raise typer.Exit(1)
+    if not 0 <= qe <= 23:
+        console.print(f"[red]Quiet end hour must be 0-23, got {qe}.[/red]")
+        raise typer.Exit(1)
+    if not 30 <= qm <= 100:
+        console.print(f"[red]Quiet max fan must be 30-100, got {qm}.[/red]")
+        raise typer.Exit(1)
+
+    _start_daemon(qs, qe, qm)
+    console.print(f"  Quiet {qs:02d}:00-{qe:02d}:00 (max {qm}%), otherwise 100%")
+
+
 PROFILE_DESCRIPTIONS = {
     "interactive": "Low-latency single-user chat — optimized for fastest time-to-first-token (TTFT)",
     "batch": "Maximum throughput for many requests — optimized for tokens/sec across concurrent users",
