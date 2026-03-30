@@ -1,4 +1,4 @@
-"""vx — vLLM model manager CLI."""
+"""vlx — vLLM model manager CLI."""
 
 
 import pathlib
@@ -26,7 +26,7 @@ PROFILE_NAMES = ["interactive", "batch", "agentic", "creative"]
 def _resolve_model(query: str) -> ModelInfo:
     models = scan_models(MODELS_DIR)
     if not models:
-        console.print("[red]No models found.[/red] Run: vx download")
+        console.print("[red]No models found.[/red] Run: vlx download")
         raise typer.Exit(1)
     matches = fuzzy_match(query, models)
     if len(matches) == 0:
@@ -88,12 +88,15 @@ def dashboard(ctx: typer.Context):
     cmd_tbl.add_column(min_width=26)
     cmd_tbl.add_column(style="dim")
     for cmd, desc in [
+        ("download [model]", "Search & download from HuggingFace"),
         ("start [model] [profile]", "Start serving (interactive picker if no args)"),
         ("stop", "Stop the vLLM service"),
         ("status", "Show what's currently serving"),
         ("models", "List models with limits & profiles"),
         ("tune [model] [profile]", "Probe limits + benchmark"),
+        ("fan [auto|off|30-100]", "GPU fan control with temp curve"),
         ("doctor", "Check system readiness"),
+        ("init", "Auto-discover vLLM and write config"),
     ]:
         cmd_tbl.add_row(_Txt(cmd, style="bold cyan"), desc)
 
@@ -102,7 +105,7 @@ def dashboard(ctx: typer.Context):
         "\n".join(lines) + "\n  [bold]Commands[/bold]",
         cmd_tbl,
     )
-    console.print(Panel(body, title="[bold cyan]vx[/bold cyan]", border_style="cyan"))
+    console.print(Panel(body, title="[bold cyan]vlx[/bold cyan]", border_style="cyan"))
 
 
 @app.command()
@@ -110,7 +113,7 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     """List downloaded models."""
     all_models = scan_models(MODELS_DIR)
     if not all_models:
-        console.print("[dim]No models found.[/dim] Run: vx download")
+        console.print("[dim]No models found.[/dim] Run: vlx download")
         return
 
     if model:
@@ -156,7 +159,7 @@ def _show_model_detail(m: ModelInfo):
     console.print(f"  Size: {m.model_size_gb} GB  Max positions: {m.max_position_embeddings}\n")
 
     if not lim:
-        console.print(f"  [dim]Not probed yet.[/dim] Run: vx tune {m.model_name.lower()}\n")
+        console.print(f"  [dim]Not probed yet.[/dim] Run: vlx tune {m.model_name.lower()}\n")
         return
 
     table = Table(title="Context / Concurrency Limits")
@@ -182,45 +185,76 @@ def _show_model_detail(m: ModelInfo):
 
 @app.command()
 def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")):
-    """Download a model from HuggingFace to the models directory."""
+    """Search and download a model from HuggingFace."""
     from huggingface_hub import snapshot_download, HfApi
     from vlx.config import cfg as _cfg
 
     models_dir = _cfg().models_dir
+    api = HfApi()
 
-    if model_id is None:
-        model_id = typer.prompt("HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")
+    # Direct download if full model ID provided
+    if model_id and "/" in model_id:
+        _download_model(model_id, models_dir, snapshot_download)
+        return
 
-    if "/" not in model_id:
-        console.print(f"[yellow]Searching HuggingFace for '{model_id}'...[/yellow]")
-        api = HfApi()
-        results = list(api.list_models(search=model_id, sort="downloads", limit=10))
+    # Interactive search loop
+    query = model_id or ""
+    while True:
+        if not query:
+            query = typer.prompt("\nSearch HuggingFace")
+
+        console.print(f"[dim]Searching '{query}'...[/dim]")
+        results = list(api.list_models(search=query, sort="downloads", limit=15))
+
         if not results:
-            console.print(f"[red]No models found for '{model_id}'.[/red]")
-            raise typer.Exit(1)
+            console.print(f"[yellow]No results for '{query}'.[/yellow]")
+            query = ""
+            continue
 
-        console.print(f"\n[bold]Results for '{model_id}':[/bold]")
+        console.print()
         for i, m in enumerate(results, 1):
-            downloads = f"{m.downloads:,}" if m.downloads else "?"
-            console.print(f"  {i}) {m.id}  [dim]({downloads} downloads)[/dim]")
+            dl = f"{m.downloads:,}" if m.downloads else "?"
+            console.print(f"  [bold]{i:>2}[/bold]) {m.id}  [dim]({dl} downloads)[/dim]")
 
-        choice = _pick_number("\nModel number", len(results))
-        model_id = results[choice - 1].id
+        console.print("\n  [dim]Enter number to download, or type a new search term[/dim]")
+        answer = typer.prompt("\nChoice or search", default="")
 
-    # provider/model_name → local path
+        if not answer:
+            continue
+
+        # Number → pick from results
+        try:
+            idx = int(answer)
+            if 1 <= idx <= len(results):
+                _download_model(results[idx - 1].id, models_dir, snapshot_download)
+                return
+        except ValueError:
+            pass
+
+        # Not a number → new search
+        query = answer
+
+
+def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object) -> None:
+    """Download a single model by its HuggingFace ID."""
     parts = model_id.split("/")
     if len(parts) != 2:
-        console.print(f"[red]Invalid model ID '{model_id}'.[/red] Expected format: provider/model-name")
+        console.print(f"[red]Invalid model ID '{model_id}'.[/red] Expected: provider/model-name")
         raise typer.Exit(1)
 
     provider, model_name = parts
     local_dir = models_dir / provider / model_name
 
+    if local_dir.exists() and any(local_dir.iterdir()):
+        console.print(f"[yellow]{model_id} already exists at {local_dir}[/yellow]")
+        if not typer.confirm("Re-download?", default=False):
+            return
+
     console.print(f"\n[bold]Downloading[/bold] {model_id}")
     console.print(f"  To: {local_dir}\n")
 
     try:
-        snapshot_download(
+        snapshot_download(  # type: ignore[operator]
             repo_id=model_id,
             local_dir=local_dir,
         )
@@ -650,7 +684,7 @@ def tune(
                     config_data[key.replace("_", "-")] = val
 
             cfg_path = profile_path(m.provider, m.model_name, prof)
-            write_profile_yaml(cfg_path, config_data, comment=f"vx tune — {prof} profile\nBenchmark: {exp_dir}")
+            write_profile_yaml(cfg_path, config_data, comment=f"vlx tune — {prof} profile\nBenchmark: {exp_dir}")
             write_timing(m.provider, m.model_name, prof, job_dur)
             console.print(f"  [green]✓ {prof} config written[/green]\n")
             passed += 1
@@ -736,7 +770,7 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
 
     lim = read_limits(limits_path(m.provider, m.model_name))
     if not lim:
-        console.print(f"[red]No probe data for {m.model_name}.[/red] Run: vx tune {m.model_name}")
+        console.print(f"[red]No probe data for {m.model_name}.[/red] Run: vlx tune {m.model_name}")
         raise typer.Exit(1)
 
     gpu = get_gpu_info()
@@ -826,7 +860,7 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
         raise typer.Exit(0)
 
     cfg_path = profile_path(m.provider, m.model_name, "custom")
-    write_profile_yaml(cfg_path, cfg, comment="vx start — custom config")
+    write_profile_yaml(cfg_path, cfg, comment="vlx start — custom config")
     console.clear()
     return cfg_path
 
@@ -841,7 +875,7 @@ def start(
         # Interactive model picker
         all_models = scan_models(MODELS_DIR)
         if not all_models:
-            console.print("[red]No models found.[/red] Run: vx download")
+            console.print("[red]No models found.[/red] Run: vlx download")
             raise typer.Exit(1)
 
         console.print("\n[bold]Select a model:[/bold]")
@@ -861,7 +895,7 @@ def start(
             options.append("custom")
 
         if not options:
-            console.print(f"\n[red]No tuned profiles for {m.model_name}.[/red] Run: vx tune {m.model_name}")
+            console.print(f"\n[red]No tuned profiles for {m.model_name}.[/red] Run: vlx tune {m.model_name}")
             raise typer.Exit(1)
 
         console.print("\n[bold]Select a profile:[/bold]")
@@ -888,7 +922,7 @@ def start(
 
     cfg_path = profile_path(m.provider, m.model_name, profile)
     if not cfg_path.exists():
-        console.print(f"[red]No {profile} profile for {m.model_name}.[/red] Run: vx tune {m.model_name} {profile}")
+        console.print(f"[red]No {profile} profile for {m.model_name}.[/red] Run: vlx tune {m.model_name} {profile}")
         raise typer.Exit(1)
 
     _launch_vllm(cfg_path, f"{profile} profile")
@@ -1104,7 +1138,7 @@ def status():
     from vlx.serve import is_vllm_running
 
     if not is_vllm_running():
-        console.print("[dim]vLLM is not running.[/dim] Start with: vx start")
+        console.print("[dim]vLLM is not running.[/dim] Start with: vlx start")
         return
 
     active = active_yaml_path()
@@ -1245,7 +1279,7 @@ def doctor():
         if fix:
             console.print(f"          Fix: {fix}")
 
-    console.print("\n[bold]vx doctor[/bold]\n")
+    console.print("\n[bold]vlx doctor[/bold]\n")
 
     # -- Environment --
     console.print("  [bold]Environment[/bold]")
@@ -1350,7 +1384,7 @@ def doctor():
         sockets = list(tmp_dir.glob("*"))
         stale = [s for s in sockets if s.is_socket()]
         if len(stale) > 10:
-            _warn(f"{len(stale)} stale sockets in {tmp_dir}", "vx cache clean")
+            _warn(f"{len(stale)} stale sockets in {tmp_dir}", "vlx cache clean")
     else:
         _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
 
@@ -1372,7 +1406,7 @@ def doctor():
     elif active.exists():
         _ok("active.yaml exists (not a symlink)")
     else:
-        _warn("No active.yaml — run vx start to configure")
+        _warn("No active.yaml — run vlx start to configure")
 
     # Port
     _port = _c.port
