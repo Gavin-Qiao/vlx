@@ -183,6 +183,31 @@ def _show_model_detail(m: ModelInfo):
     console.print()
 
 
+def _has_gum() -> bool:
+    import shutil
+    return shutil.which("gum") is not None
+
+
+def _gum_input(placeholder: str) -> str | None:
+    """Interactive text input via gum. Returns None on Esc/Ctrl-C."""
+    import subprocess
+    r = subprocess.run(
+        ["gum", "input", "--placeholder", placeholder, "--width", "60"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _gum_filter(items: list[str], header: str = "") -> str | None:
+    """Interactive fuzzy filter via gum. Returns None on Esc/Ctrl-C."""
+    import subprocess
+    cmd = ["gum", "filter", "--height", "15", "--placeholder", "Type to filter..."]
+    if header:
+        cmd.extend(["--header", header])
+    r = subprocess.run(cmd, input="\n".join(items), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
 @app.command()
 def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")):
     """Search and download a model from HuggingFace."""
@@ -197,42 +222,61 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
         _download_model(model_id, models_dir, snapshot_download)
         return
 
-    # Interactive search loop
+    use_gum = _has_gum()
+
+    # Search loop
     query = model_id or ""
     while True:
         if not query:
-            query = typer.prompt("\nSearch HuggingFace")
+            if use_gum:
+                query = _gum_input("Search HuggingFace (e.g. qwen 27b fp8)") or ""
+            else:
+                query = typer.prompt("\nSearch HuggingFace")
+            if not query:
+                continue
 
         console.print(f"[dim]Searching '{query}'...[/dim]")
-        results = list(api.list_models(search=query, sort="downloads", limit=15))
+        results = list(api.list_models(search=query, sort="downloads", limit=20))
 
         if not results:
             console.print(f"[yellow]No results for '{query}'.[/yellow]")
             query = ""
             continue
 
-        console.print()
-        for i, m in enumerate(results, 1):
-            dl = f"{m.downloads:,}" if m.downloads else "?"
-            console.print(f"  [bold]{i:>2}[/bold]) {m.id}  [dim]({dl} downloads)[/dim]")
+        if use_gum:
+            # Build display lines for gum filter
+            lines = []
+            for m in results:
+                dl = f"{m.downloads:,}" if m.downloads else "?"
+                lines.append(f"{m.id}  ({dl} downloads)")
 
-        console.print("\n  [dim]Enter number to download, or type a new search term[/dim]")
-        answer = typer.prompt("\nChoice or search", default="")
+            selected = _gum_filter(lines, header=f"Results for '{query}' — Esc to search again")
+            if selected is None:
+                query = ""
+                continue
 
-        if not answer:
-            continue
+            picked_id = selected.split("  (")[0]
+            _download_model(picked_id, models_dir, snapshot_download)
+            return
+        else:
+            # Fallback: numbered list
+            console.print()
+            for i, m in enumerate(results, 1):
+                dl = f"{m.downloads:,}" if m.downloads else "?"
+                console.print(f"  [bold]{i:>2}[/bold]) {m.id}  [dim]({dl} downloads)[/dim]")
 
-        # Number → pick from results
-        try:
-            idx = int(answer)
-            if 1 <= idx <= len(results):
-                _download_model(results[idx - 1].id, models_dir, snapshot_download)
-                return
-        except ValueError:
-            pass
-
-        # Not a number → new search
-        query = answer
+            console.print("\n  [dim]Enter number to download, or type a new search[/dim]")
+            answer = typer.prompt("\nChoice or search", default="")
+            if not answer:
+                continue
+            try:
+                idx = int(answer)
+                if 1 <= idx <= len(results):
+                    _download_model(results[idx - 1].id, models_dir, snapshot_download)
+                    return
+            except ValueError:
+                pass
+            query = answer
 
 
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object) -> None:
