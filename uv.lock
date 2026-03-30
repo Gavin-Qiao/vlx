@@ -526,7 +526,7 @@ wheels = [
 ]
 
 [[package]]
-name = "vx"
+name = "vlx"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

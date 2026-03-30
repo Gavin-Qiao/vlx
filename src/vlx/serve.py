@@ -3,7 +3,7 @@
 import subprocess
 from pathlib import Path
 
-from vx.config import cfg
+from vlx.config import cfg
 
 
 def _systemctl(action: str) -> tuple[bool, str]:

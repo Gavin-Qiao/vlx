@@ -1,4 +1,4 @@
-from vx.fan import (
+from vlx.fan import (
     compute_fan_speed,
     read_state,
     EMERGENCY_TEMP,
@@ -99,9 +99,9 @@ class TestComputeFanSpeed:
 
 class TestReadState:
     def _patch_paths(self, mocker, tmp_path):
-        import vx.fan
-        vx.fan._paths_resolved = False
-        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+        import vlx.fan
+        vlx.fan._paths_resolved = False
+        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path, run_dir=tmp_path,
         ))
 
@@ -136,33 +136,33 @@ class TestResolvePaths:
     """Test the lazy path resolution that cli.py depends on."""
 
     def test_resolve_sets_paths(self, tmp_path, mocker):
-        import vx.fan
-        vx.fan._paths_resolved = False
-        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+        import vlx.fan
+        vlx.fan._paths_resolved = False
+        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path / "logs",
             run_dir=tmp_path / "run",
         ))
-        vx.fan._resolve_paths()
-        assert vx.fan.PID_PATH == tmp_path / "run" / "vx-fan.pid"
-        assert vx.fan.STATE_PATH == tmp_path / "run" / "vx-fan.json"
-        assert vx.fan.LOG_PATH == tmp_path / "logs" / "vx-fan.log"
+        vlx.fan._resolve_paths()
+        assert vlx.fan.PID_PATH == tmp_path / "run" / "vx-fan.pid"
+        assert vlx.fan.STATE_PATH == tmp_path / "run" / "vx-fan.json"
+        assert vlx.fan.LOG_PATH == tmp_path / "logs" / "vx-fan.log"
 
     def test_resolve_is_idempotent(self, tmp_path, mocker):
-        import vx.fan
-        vx.fan._paths_resolved = False
-        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+        import vlx.fan
+        vlx.fan._paths_resolved = False
+        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path, run_dir=tmp_path,
         ))
-        vx.fan._resolve_paths()
-        first = vx.fan.PID_PATH
-        vx.fan._resolve_paths()  # should not re-resolve
-        assert vx.fan.PID_PATH is first
+        vlx.fan._resolve_paths()
+        first = vlx.fan.PID_PATH
+        vlx.fan._resolve_paths()  # should not re-resolve
+        assert vlx.fan.PID_PATH is first
 
     def test_cli_import_pattern_works(self, tmp_path, mocker):
         """Reproduces the exact import pattern from cli.py that broke."""
-        import vx.fan as _fan
+        import vlx.fan as _fan
         _fan._paths_resolved = False
-        mocker.patch("vx.fan.cfg", return_value=mocker.Mock(
+        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path, run_dir=tmp_path,
         ))
         _fan._resolve_paths()

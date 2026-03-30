@@ -1,14 +1,14 @@
 import pytest
 
-from vx.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed
+from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed
 
 
 def test_parse_gpu_info(mocker):
     mocker.patch(
-        "vx.gpu._run_nvidia_smi",
+        "vlx.gpu._run_nvidia_smi",
         return_value="NVIDIA RTX PRO 5000 Blackwell, 48935, 0, 1024, 590.48.01",
     )
-    mocker.patch("vx.gpu._get_cuda_version", return_value="13.1")
+    mocker.patch("vlx.gpu._get_cuda_version", return_value="13.1")
     info = get_gpu_info()
     assert info.name == "NVIDIA RTX PRO 5000 Blackwell"
     assert info.vram_total_mb == 48935
@@ -29,7 +29,7 @@ def test_compute_gpu_memory_utilization_small_gpu():
 
 def test_get_fan_speed(mocker):
     mocker.patch(
-        "vx.gpu.subprocess.run",
+        "vlx.gpu.subprocess.run",
         return_value=mocker.Mock(stdout="80\n", returncode=0),
     )
     assert get_fan_speed() == 80
@@ -38,9 +38,9 @@ def test_get_fan_speed(mocker):
 def test_set_fan_speed_valid(mocker):
     mock_popen = mocker.Mock()
     mock_popen.wait.return_value = None
-    mocker.patch("vx.gpu.subprocess.Popen", return_value=mock_popen)
-    mock_run = mocker.patch("vx.gpu.subprocess.run", return_value=mocker.Mock(returncode=0))
-    mocker.patch("vx.gpu.time.sleep")
+    mocker.patch("vlx.gpu.subprocess.Popen", return_value=mock_popen)
+    mock_run = mocker.patch("vlx.gpu.subprocess.run", return_value=mocker.Mock(returncode=0))
+    mocker.patch("vlx.gpu.time.sleep")
 
     set_fan_speed(80)
 

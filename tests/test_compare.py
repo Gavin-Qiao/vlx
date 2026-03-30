@@ -1,5 +1,5 @@
 import pytest
-from vx.compare import filter_models_for_workload, rank_models
+from vlx.compare import filter_models_for_workload, rank_models
 
 
 @pytest.fixture

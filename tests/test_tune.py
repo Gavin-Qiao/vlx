@@ -1,6 +1,6 @@
 import json
 import pytest
-from vx.tune import generate_sweep_params, pick_winner, PROFILES
+from vlx.tune import generate_sweep_params, pick_winner, PROFILES
 
 
 def test_profiles_exist():

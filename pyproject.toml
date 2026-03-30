@@ -1,8 +1,22 @@
 [project]
-name = "vx"
+name = "vlx"
 version = "0.1.0"
-description = "vLLM model manager — download, probe, tune, serve, compare"
+description = "CLI for managing vLLM inference on GPU workstations"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
+authors = [{ name = "Mohan Qiao" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "typer>=0.15",
     "rich>=14",
@@ -13,15 +27,20 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-mock>=3", "ruff>=0.15", "mypy>=1.15", "types-PyYAML>=6", "types-requests>=2.33"]
 
+[project.urls]
+Homepage = "https://github.com/Gavin-Qiao/vlx"
+Repository = "https://github.com/Gavin-Qiao/vlx"
+Issues = "https://github.com/Gavin-Qiao/vlx/issues"
+
 [project.scripts]
-vx = "vx.cli:app"
+vlx = "vlx.cli:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/vx"]
+packages = ["src/vlx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

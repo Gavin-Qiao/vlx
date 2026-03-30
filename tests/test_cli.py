@@ -1,6 +1,6 @@
 from pathlib import Path
 from typer.testing import CliRunner
-from vx.cli import app
+from vlx.cli import app
 
 runner = CliRunner()
 
@@ -37,13 +37,9 @@ def test_stop_command_exists():
     assert result.exit_code == 0
 
 
-def test_compare_command_exists():
-    result = runner.invoke(app, ["compare", "--help"])
-    assert result.exit_code == 0
-
 
 def test_models_runs(mocker):
-    from vx.models import ModelInfo
+    from vlx.models import ModelInfo
 
     fake = ModelInfo(
         path=Path("/opt/vllm/models/test/Model-7B"),
@@ -56,8 +52,8 @@ def test_models_runs(mocker):
         is_moe=False,
         model_size_gb=7.2,
     )
-    mocker.patch("vx.cli.scan_models", return_value=[fake])
-    mocker.patch("vx.cli.read_limits", return_value=None)
+    mocker.patch("vlx.cli.scan_models", return_value=[fake])
+    mocker.patch("vlx.cli.read_limits", return_value=None)
 
     result = runner.invoke(app, ["models"])
     assert result.exit_code == 0

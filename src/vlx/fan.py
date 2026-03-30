@@ -10,7 +10,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from vx.config import cfg
+from vlx.config import cfg
 
 LOG_PATH: Path  # resolved lazily
 PID_PATH: Path
@@ -36,7 +36,7 @@ SUBPROCESS_TIMEOUT = 10
 MAX_CONSECUTIVE_FAILURES = 30  # 30 × 5s = 2.5 min → exit for systemd restart
 FAILURE_RESET_THRESHOLD = 5   # force re-apply after 5 failures
 
-_log = logging.getLogger("vx.fan")
+_log = logging.getLogger("vlx.fan")
 
 
 def read_state() -> dict | None:

@@ -7,10 +7,10 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
-from vx.config import LOGS_DIR, VLLM_BIN, cfg
-from vx.models import ModelInfo, quant_flag
+from vlx.config import LOGS_DIR, VLLM_BIN, cfg
+from vlx.models import ModelInfo, quant_flag
 
-_log = logging.getLogger("vx.probe")
+_log = logging.getLogger("vlx.probe")
 
 CONTEXT_STEPS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 CONCURRENCY_STEPS = [1, 2, 4, 8, 16, 32, 64, 128, 256]

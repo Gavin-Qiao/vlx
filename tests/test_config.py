@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from vx.config import (
+from vlx.config import (
     cfg,
     load_config,
     save_config,
@@ -49,7 +49,7 @@ def test_build_config():
 
 
 def test_save_and_load_config(tmp_path, mocker):
-    mocker.patch("vx.config.CONFIG_FILE", tmp_path / "config.yaml")
+    mocker.patch("vlx.config.CONFIG_FILE", tmp_path / "config.yaml")
     c = _build_config(
         vllm_root=Path("/my/vllm"),
         cuda_home=Path("/my/cuda"),
@@ -119,25 +119,25 @@ def test_discover_vllm_root_from_path(mocker, tmp_path):
     venv = tmp_path / "venv" / "bin"
     venv.mkdir(parents=True)
     (venv / "vllm").touch()
-    mocker.patch("vx.config.shutil.which", return_value=str(venv / "vllm"))
+    mocker.patch("vlx.config.shutil.which", return_value=str(venv / "vllm"))
     assert _discover_vllm_root() == tmp_path
 
 
 def test_discover_vllm_root_from_common_path(mocker, tmp_path):
     """Discovery finds vllm at /opt/vllm (common location)."""
-    mocker.patch("vx.config.shutil.which", return_value=None)
+    mocker.patch("vlx.config.shutil.which", return_value=None)
     fake_opt = tmp_path / "opt" / "vllm"
     (fake_opt / "venv" / "bin").mkdir(parents=True)
     (fake_opt / "venv" / "bin" / "vllm").touch()
     # Patch the candidate list to include our tmp dir
-    mocker.patch("vx.config.Path.home", return_value=tmp_path / "nope")
+    mocker.patch("vlx.config.Path.home", return_value=tmp_path / "nope")
     # Can't easily patch the hardcoded /opt/vllm, so just test the PATH method
-    mocker.patch("vx.config.shutil.which", return_value=str(fake_opt / "venv" / "bin" / "vllm"))
+    mocker.patch("vlx.config.shutil.which", return_value=str(fake_opt / "venv" / "bin" / "vllm"))
     assert _discover_vllm_root() == fake_opt
 
 
 def test_discover_vllm_root_not_found(mocker):
-    mocker.patch("vx.config.shutil.which", return_value=None)
+    mocker.patch("vlx.config.shutil.which", return_value=None)
     # Ensure common paths don't exist (they won't in CI)
     result = _discover_vllm_root()
     # May return None or a real path if /opt/vllm exists on this machine
@@ -148,12 +148,12 @@ def test_discover_cuda_home_from_nvcc(mocker, tmp_path):
     cuda = tmp_path / "cuda" / "bin"
     cuda.mkdir(parents=True)
     (cuda / "nvcc").touch()
-    mocker.patch("vx.config.shutil.which", return_value=str(cuda / "nvcc"))
+    mocker.patch("vlx.config.shutil.which", return_value=str(cuda / "nvcc"))
     assert _discover_cuda_home() == tmp_path / "cuda"
 
 
 def test_discover_cuda_home_fallback(mocker):
-    mocker.patch("vx.config.shutil.which", return_value=None)
+    mocker.patch("vlx.config.shutil.which", return_value=None)
     assert _discover_cuda_home() == Path("/usr/local/cuda")
 
 
@@ -184,7 +184,7 @@ def test_load_config_from_file(tmp_path, mocker):
         "service_user: myuser\n"
         "port: 7777\n"
     )
-    mocker.patch("vx.config.CONFIG_FILE", config_file)
+    mocker.patch("vlx.config.CONFIG_FILE", config_file)
     reset_config()
     c = load_config()
     assert c.vllm_root == Path("/custom/vllm")
@@ -197,7 +197,7 @@ def test_load_config_partial_file_uses_defaults(tmp_path, mocker):
     """Config file with only some fields uses defaults for the rest."""
     config_file = tmp_path / "config.yaml"
     config_file.write_text("vllm_root: /my/vllm\n")
-    mocker.patch("vx.config.CONFIG_FILE", config_file)
+    mocker.patch("vlx.config.CONFIG_FILE", config_file)
     reset_config()
     c = load_config()
     assert c.vllm_root == Path("/my/vllm")

@@ -1,6 +1,6 @@
 import pytest
-from vx.models import detect_model, ModelInfo
-from vx.probe import (
+from vlx.models import detect_model, ModelInfo
+from vlx.probe import (
     probe_context_limit,
     probe_concurrency_limit,
     probe_model,
@@ -19,7 +19,7 @@ def test_context_steps_are_powers_of_two():
 
 
 def test_probe_context_limit_success(mocker, sample_model_info):
-    mocker.patch("vx.probe._try_start_vllm", return_value=True)
+    mocker.patch("vlx.probe._try_start_vllm", return_value=True)
     result = probe_context_limit(
         model_info=sample_model_info,
         context_len=4096,
@@ -30,7 +30,7 @@ def test_probe_context_limit_success(mocker, sample_model_info):
 
 
 def test_probe_context_limit_oom(mocker, sample_model_info):
-    mocker.patch("vx.probe._try_start_vllm", return_value=False)
+    mocker.patch("vlx.probe._try_start_vllm", return_value=False)
     result = probe_context_limit(
         model_info=sample_model_info,
         context_len=262144,
@@ -44,7 +44,7 @@ def test_probe_concurrency_limit(mocker, sample_model_info):
     def fake_start(*, model_info, context_len, kv_dtype, gpu_mem_util, max_num_seqs):
         return max_num_seqs <= 32
 
-    mocker.patch("vx.probe._try_start_vllm", side_effect=fake_start)
+    mocker.patch("vlx.probe._try_start_vllm", side_effect=fake_start)
     max_seqs = probe_concurrency_limit(
         model_info=sample_model_info,
         context_len=8192,
@@ -55,7 +55,7 @@ def test_probe_concurrency_limit(mocker, sample_model_info):
 
 
 def test_probe_concurrency_limit_none(mocker, sample_model_info):
-    mocker.patch("vx.probe._try_start_vllm", return_value=False)
+    mocker.patch("vlx.probe._try_start_vllm", return_value=False)
     max_seqs = probe_concurrency_limit(
         model_info=sample_model_info,
         context_len=262144,
@@ -75,7 +75,7 @@ def test_probe_model_full(mocker, sample_model_info):
             return False
         return True
 
-    mocker.patch("vx.probe._try_start_vllm", side_effect=fake_start)
+    mocker.patch("vlx.probe._try_start_vllm", side_effect=fake_start)
 
     limits = probe_model(
         model_info=sample_model_info,

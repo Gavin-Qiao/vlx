@@ -7,7 +7,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from vx.config import (
+from vlx.config import (
     MODELS_DIR,
     limits_path,
     profile_path,
@@ -15,7 +15,7 @@ from vx.config import (
     read_timing,
     write_timing,
 )
-from vx.models import scan_models, fuzzy_match, ModelInfo
+from vlx.models import scan_models, fuzzy_match, ModelInfo
 
 app = typer.Typer(help="vLLM model manager")
 console = Console()
@@ -49,14 +49,14 @@ def dashboard(ctx: typer.Context):
         return
 
     try:
-        from vx.gpu import get_gpu_info
+        from vlx.gpu import get_gpu_info
         gpu = get_gpu_info()
         gpu_line = f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, CUDA {gpu.cuda})"
     except Exception:
         gpu_line = "[dim]unavailable[/dim]"
 
-    from vx.serve import is_vllm_running
-    from vx.config import active_yaml_path, read_profile_yaml
+    from vlx.serve import is_vllm_running
+    from vlx.config import active_yaml_path, read_profile_yaml
 
     models = scan_models(MODELS_DIR)
     probed = sum(
@@ -181,9 +181,63 @@ def _show_model_detail(m: ModelInfo):
 
 
 @app.command()
-def download(model_id: str = typer.Argument(None, help="HuggingFace model ID")):
-    """Search & download a model from HuggingFace."""
-    console.print("[dim]Download not yet implemented.[/dim]")
+def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")):
+    """Download a model from HuggingFace to the models directory."""
+    from huggingface_hub import snapshot_download, HfApi
+    from vlx.config import cfg as _cfg
+
+    models_dir = _cfg().models_dir
+
+    if model_id is None:
+        model_id = typer.prompt("HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")
+
+    if "/" not in model_id:
+        console.print(f"[yellow]Searching HuggingFace for '{model_id}'...[/yellow]")
+        api = HfApi()
+        results = list(api.list_models(search=model_id, sort="downloads", limit=10))
+        if not results:
+            console.print(f"[red]No models found for '{model_id}'.[/red]")
+            raise typer.Exit(1)
+
+        console.print(f"\n[bold]Results for '{model_id}':[/bold]")
+        for i, m in enumerate(results, 1):
+            downloads = f"{m.downloads:,}" if m.downloads else "?"
+            console.print(f"  {i}) {m.id}  [dim]({downloads} downloads)[/dim]")
+
+        choice = _pick_number("\nModel number", len(results))
+        model_id = results[choice - 1].id
+
+    # provider/model_name → local path
+    parts = model_id.split("/")
+    if len(parts) != 2:
+        console.print(f"[red]Invalid model ID '{model_id}'.[/red] Expected format: provider/model-name")
+        raise typer.Exit(1)
+
+    provider, model_name = parts
+    local_dir = models_dir / provider / model_name
+
+    console.print(f"\n[bold]Downloading[/bold] {model_id}")
+    console.print(f"  To: {local_dir}\n")
+
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            local_dir=local_dir,
+        )
+    except Exception as e:
+        console.print(f"[red]Download failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    from vlx.models import detect_model
+    info = detect_model(local_dir)
+    if info:
+        console.print(f"\n[green]Downloaded {info.full_name}[/green]")
+        console.print(f"  Size: {info.model_size_gb:.1f} GB")
+        console.print(f"  Quant: {info.quant_method or 'none'}")
+        console.print(f"  Context: {info.max_position_embeddings:,} tokens")
+        console.print(f"\nNext: vlx tune {model_name}")
+    else:
+        console.print(f"\n[green]Downloaded to {local_dir}[/green]")
 
 
 @app.command()
@@ -198,11 +252,11 @@ def tune(
     """Probe limits + benchmark a model."""
     import subprocess
     from datetime import datetime
-    from vx.gpu import get_gpu_info, compute_gpu_memory_utilization
-    from vx.config import BENCHMARKS_DIR, VLLM_BIN, write_limits, write_profile_yaml
-    from vx.probe import probe_model
-    from vx.tune import generate_sweep_params, pick_winner, PROFILES
-    from vx.models import quant_flag as get_quant_flag
+    from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization
+    from vlx.config import BENCHMARKS_DIR, VLLM_BIN, write_limits, write_profile_yaml
+    from vlx.probe import probe_model
+    from vlx.tune import generate_sweep_params, pick_winner, PROFILES
+    from vlx.models import quant_flag as get_quant_flag
 
     # Resolve which models to tune
     if all_models:
@@ -407,7 +461,7 @@ def tune(
                     console.print(f"  [green]✓ Limits saved[/green] ({_fmt_duration(job_dur)} elapsed)")
 
                     # Preheat flashinfer JIT cache for the service user
-                    from vx.probe import preheat_jit
+                    from vlx.probe import preheat_jit
                     console.print("  [dim]Preheating JIT cache for service user...[/dim]")
                     for kv in ("auto", "fp8"):
                         ok = preheat_jit(model_info=m, gpu_mem_util=gpu_mem_util, kv_dtype=kv)
@@ -560,7 +614,7 @@ def tune(
                     _bench_stderr = _sf.read()
                 if proc.returncode != 0 and _bench_stderr.strip():
                     _stderr_tail = _bench_stderr[-2000:]
-                    from vx.config import LOGS_DIR
+                    from vlx.config import LOGS_DIR
                     LOGS_DIR.mkdir(parents=True, exist_ok=True)
                     _log_name = LOGS_DIR / f"bench-{m.model_name}-{prof}-{attempt}.log"
                     _log_name.write_text(_bench_stderr)
@@ -611,8 +665,8 @@ def tune(
 
 def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
     """Stop any running vLLM, start with given config, wait for health."""
-    from vx.config import read_profile_yaml
-    from vx.serve import start_vllm, stop_vllm, is_vllm_running
+    from vlx.config import read_profile_yaml
+    from vlx.serve import start_vllm, stop_vllm, is_vllm_running
     import time
 
     cfg = read_profile_yaml(cfg_path) or {}
@@ -643,7 +697,7 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
             if resp.status == 200:
                 console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
                 console.print(f"  Config: {cfg_path}")
-                from vx.config import cfg as _cfg
+                from vlx.config import cfg as _cfg
                 svc = _cfg().service_name
                 console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
                 return
@@ -651,13 +705,13 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
             pass
         # Detect crash-loop early — if systemd gave up, no point waiting
         if i > 5 and not is_vllm_running():
-            from vx.config import cfg as _cfg
+            from vlx.config import cfg as _cfg
             svc = _cfg().service_name
             console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
             raise typer.Exit(1)
         if i > 0 and i % 15 == 0:
             console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-    from vx.config import cfg as _cfg
+    from vlx.config import cfg as _cfg
     svc = _cfg().service_name
     console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
     raise typer.Exit(1)
@@ -677,8 +731,8 @@ def _pick_number(prompt: str, max_val: int) -> int:
 
 def _custom_config(m: ModelInfo) -> "pathlib.Path":
     """Guide user through manual parameter selection, write a temp config."""
-    from vx.config import read_limits, write_profile_yaml
-    from vx.gpu import get_gpu_info, compute_gpu_memory_utilization
+    from vlx.config import read_limits, write_profile_yaml
+    from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization
 
     lim = read_limits(limits_path(m.provider, m.model_name))
     if not lim:
@@ -754,7 +808,7 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
 
     qf = m.quant_method
     if qf and qf not in ("none", "compressed-tensors"):
-        from vx.models import QUANT_FLAGS
+        from vlx.models import QUANT_FLAGS
         flag = QUANT_FLAGS.get(qf, "")
         if flag:
             cfg["quantization"] = flag.split()[-1]
@@ -843,7 +897,7 @@ def start(
 @app.command()
 def stop():
     """Stop the vLLM service."""
-    from vx.serve import stop_vllm, is_vllm_running
+    from vlx.serve import stop_vllm, is_vllm_running
 
     if not is_vllm_running():
         console.print("[dim]vLLM is not running.[/dim]")
@@ -860,9 +914,9 @@ def fan(
     """GPU fan control — auto curve, fixed speed, or off."""
     from pathlib import Path
 
-    import vx.fan as _fan
-    from vx.fan import read_state
-    from vx.gpu import set_fan_speed, get_fan_speed
+    import vlx.fan as _fan
+    from vlx.fan import read_state
+    from vlx.gpu import set_fan_speed, get_fan_speed
     import os
     import signal as sig
     import time
@@ -879,7 +933,7 @@ def fan(
             os.kill(pid, 0)
             # Verify it's actually our daemon, not a recycled PID
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
-            if "vx.fan" not in cmdline:
+            if "vlx.fan" not in cmdline:
                 PID_PATH.unlink(missing_ok=True)
                 STATE_PATH.unlink(missing_ok=True)
                 return None
@@ -910,7 +964,7 @@ def fan(
         import sys
         proc = subprocess.Popen(
             [
-                sys.executable, "-m", "vx.fan",
+                sys.executable, "-m", "vlx.fan",
                 "--quiet-start", str(qs),
                 "--quiet-end", str(qe),
                 "--quiet-max", str(qm),
@@ -922,7 +976,8 @@ def fan(
         )
         time.sleep(2)
         if proc.poll() is not None:
-            console.print("[red]Fan daemon failed to start.[/red] Check /opt/vllm/logs/vx-fan.log")
+            from vlx.config import cfg as _cfg
+            console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vx-fan.log'}")
             raise typer.Exit(1)
         console.print(f"[green]Fan daemon started[/green] (pid {proc.pid})")
 
@@ -931,7 +986,7 @@ def fan(
         pid = _daemon_pid()
         state = read_state() if pid else None
         try:
-            from vx.fan import _get_gpu_temp
+            from vlx.fan import _get_gpu_temp
             temp = _get_gpu_temp()
         except Exception:
             temp = None
@@ -1045,8 +1100,8 @@ PROFILE_DESCRIPTIONS = {
 @app.command()
 def status():
     """Show current vLLM serving status."""
-    from vx.config import active_yaml_path, read_profile_yaml
-    from vx.serve import is_vllm_running
+    from vlx.config import active_yaml_path, read_profile_yaml
+    from vlx.serve import is_vllm_running
 
     if not is_vllm_running():
         console.print("[dim]vLLM is not running.[/dim] Start with: vx start")
@@ -1119,7 +1174,7 @@ def status():
 @app.command()
 def init():
     """Auto-discover vLLM installation and write config."""
-    from vx.config import (
+    from vlx.config import (
         CONFIG_FILE, save_config,
         _discover_vllm_root, _discover_cuda_home, _discover_service, _discover_port,
         _build_config, reset_config,
@@ -1167,8 +1222,8 @@ def doctor():
     import socket
     from pathlib import Path
 
-    from vx.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
-    from vx.serve import is_vllm_running
+    from vlx.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
+    from vlx.serve import is_vllm_running
 
     ok_count = 0
     fail_count = 0
@@ -1216,7 +1271,7 @@ def doctor():
 
     # GPU
     try:
-        from vx.gpu import get_gpu_info
+        from vlx.gpu import get_gpu_info
         gpu = get_gpu_info()
         mem_used = 0
         try:
@@ -1230,7 +1285,7 @@ def doctor():
         _fail("GPU not accessible", "Check nvidia-smi")
 
     # Service user
-    from vx.config import cfg as _cfg
+    from vlx.config import cfg as _cfg
     _c = _cfg()
     try:
         r = subprocess.run(["id", _c.service_user], capture_output=True, text=True, timeout=5)
@@ -1348,11 +1403,3 @@ def doctor():
                   f"({ok_count} ok, {fail_count} fail)\n")
 
 
-@app.command()
-def compare(
-    users: int = typer.Option(None, "--users", "-u", help="Number of concurrent users"),
-    use_case: str = typer.Option(None, "--use-case", help="interactive, batch, agentic, creative"),
-    context: int = typer.Option(None, "--context", "-c", help="Required context length in tokens"),
-):
-    """Find the best model for a workload."""
-    console.print("[dim]Compare not yet implemented.[/dim]")

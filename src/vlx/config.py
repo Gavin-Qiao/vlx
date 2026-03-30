@@ -183,7 +183,7 @@ def reset_config() -> None:
 
 
 # Backward-compatible module-level constants via __getattr__.
-# `from vx.config import MODELS_DIR` resolves lazily on first access,
+# `from vlx.config import MODELS_DIR` resolves lazily on first access,
 # returning a real Path from cfg(). Zero changes needed in callers.
 _COMPAT = {
     "MODELS_DIR": "models_dir",
@@ -199,7 +199,7 @@ _COMPAT = {
 def __getattr__(name: str):  # type: ignore[override]
     if name in _COMPAT:
         return getattr(cfg(), _COMPAT[name])
-    raise AttributeError(f"module 'vx.config' has no attribute {name!r}")
+    raise AttributeError(f"module 'vlx.config' has no attribute {name!r}")
 
 
 def limits_path(provider: str, model_name: str) -> Path:
