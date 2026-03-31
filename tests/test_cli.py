@@ -1,6 +1,6 @@
 from pathlib import Path
 from typer.testing import CliRunner
-from vlx.cli import app
+from vserve.cli import app
 
 runner = CliRunner()
 
@@ -39,7 +39,7 @@ def test_stop_command_exists():
 
 
 def test_models_runs(mocker):
-    from vlx.models import ModelInfo
+    from vserve.models import ModelInfo
 
     fake = ModelInfo(
         path=Path("/opt/vllm/models/test/Model-7B"),
@@ -52,8 +52,8 @@ def test_models_runs(mocker):
         is_moe=False,
         model_size_gb=7.2,
     )
-    mocker.patch("vlx.cli.scan_models", return_value=[fake])
-    mocker.patch("vlx.cli.read_limits", return_value=None)
+    mocker.patch("vserve.cli.scan_models", return_value=[fake])
+    mocker.patch("vserve.cli.read_limits", return_value=None)
 
     result = runner.invoke(app, ["models"])
     assert result.exit_code == 0
@@ -62,13 +62,13 @@ def test_models_runs(mocker):
 
 def test_download_shows_variant_picker(mocker):
     """Download with full repo ID shows variant picker."""
-    from vlx.variants import Variant
+    from vserve.variants import Variant
 
     mock_api_cls = mocker.patch("huggingface_hub.HfApi")
     mock_api = mock_api_cls.return_value
     mock_api.repo_exists.return_value = True
 
-    mocker.patch("vlx.variants.fetch_repo_variants", return_value=(
+    mocker.patch("vserve.variants.fetch_repo_variants", return_value=(
         [
             Variant(label="mxfp4", files={
                 "model.safetensors.index.json": 50_000,
@@ -77,10 +77,10 @@ def test_download_shows_variant_picker(mocker):
         ],
         {"config.json": 1200, "tokenizer.json": 4_000_000},
     ))
-    mocker.patch("vlx.cli._has_gum", return_value=False)
+    mocker.patch("vserve.cli._has_gum", return_value=False)
     mocker.patch("huggingface_hub.snapshot_download")
-    mocker.patch("vlx.cli.VlxLock")
-    mocker.patch("vlx.models.detect_model", side_effect=FileNotFoundError)
+    mocker.patch("vserve.cli.VserveLock")
+    mocker.patch("vserve.models.detect_model", side_effect=FileNotFoundError)
 
     result = runner.invoke(app, ["download", "test/model"], input="1\ny\n")
 
@@ -95,7 +95,7 @@ def test_download_nonexistent_repo_falls_to_search(mocker):
     mock_api.repo_exists.return_value = False
     mock_api.list_models.return_value = []
 
-    mocker.patch("vlx.cli._has_gum", return_value=False)
+    mocker.patch("vserve.cli._has_gum", return_value=False)
 
     result = runner.invoke(app, ["download", "nonexistent/model"], input="\n")
 

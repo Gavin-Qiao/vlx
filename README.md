@@ -1,6 +1,6 @@
 <div align="center">
 
-# vlx
+# vserve
 
 **A modern CLI for managing vLLM inference on GPU workstations.**
 
@@ -21,19 +21,19 @@ Probe limits. Benchmark profiles. Tune configs. Serve models. Control fans.
 
 Running vLLM on a workstation means juggling model downloads, context limits, concurrency tuning, benchmark configs, systemd services, and fan curves — all through fragile bash scripts.
 
-**vlx** replaces all of that with a single CLI. It probes your GPU's actual limits, benchmarks across workload profiles, generates optimized serving configs, and keeps everything running.
+**vserve** replaces all of that with a single CLI. It probes your GPU's actual limits, benchmarks across workload profiles, generates optimized serving configs, and keeps everything running.
 
 ---
 
 ## Quick Start
 
 ```bash
-pip install vlx
-vlx init                  # auto-discover vLLM installation
-vlx                       # dashboard
-vlx download <model>      # download from HuggingFace
-vlx tune <model>          # probe limits + benchmark
-vlx start <model>         # configure & serve
+pip install vserve
+vserve init                  # auto-discover vLLM installation
+vserve                       # dashboard
+vserve download <model>      # download from HuggingFace
+vserve tune <model>          # probe limits + benchmark
+vserve start <model>         # configure & serve
 ```
 
 ---
@@ -42,24 +42,24 @@ vlx start <model>         # configure & serve
 
 | Command | Description |
 |:--------|:------------|
-| `vlx` | Dashboard — GPU info, models, available commands |
-| `vlx init` | Auto-discover vLLM installation and write config |
-| `vlx download [model]` | Search and download a model from HuggingFace |
-| `vlx models [name]` | List models or show detail (fuzzy match) |
-| `vlx tune <model> [profile]` | Probe context/concurrency limits, then benchmark |
-| `vlx start [model]` | Configure and start serving — interactive picker if no args |
-| `vlx stop` | Stop the vLLM service |
-| `vlx status` | Show current serving config |
-| `vlx fan [auto\|off\|30-100]` | GPU fan control with temp-based curve |
-| `vlx doctor` | Check system readiness |
+| `vserve` | Dashboard — GPU info, models, available commands |
+| `vserve init` | Auto-discover vLLM installation and write config |
+| `vserve download [model]` | Search and download a model from HuggingFace |
+| `vserve models [name]` | List models or show detail (fuzzy match) |
+| `vserve tune <model> [profile]` | Probe context/concurrency limits, then benchmark |
+| `vserve start [model]` | Configure and start serving — interactive picker if no args |
+| `vserve stop` | Stop the vLLM service |
+| `vserve status` | Show current serving config |
+| `vserve fan [auto\|off\|30-100]` | GPU fan control with temp-based curve |
+| `vserve doctor` | Check system readiness |
 
-All commands support **fuzzy matching** — `vlx start qwen fp8` finds the right model.
+All commands support **fuzzy matching** — `vserve start qwen fp8` finds the right model.
 
 ---
 
 ## Configuration
 
-vlx auto-discovers your vLLM installation on first run. Override with `~/.config/vx/config.yaml`:
+vserve auto-discovers your vLLM installation on first run. Override with `~/.config/vserve/config.yaml`:
 
 ```yaml
 vllm_root: /opt/vllm
@@ -69,13 +69,13 @@ service_user: vllm
 port: 8888
 ```
 
-Run `vlx init` to regenerate from auto-discovery.
+Run `vserve init` to regenerate from auto-discovery.
 
 ---
 
 ## Fan Control
 
-`vlx fan auto` runs a temperature-based fan curve daemon with quiet-hours scheduling:
+`vserve fan auto` runs a temperature-based fan curve daemon with quiet-hours scheduling:
 
 ```
 Temp (C)   Quiet hours (09-18)    Off hours (18-09)
@@ -88,10 +88,10 @@ Temp (C)   Quiet hours (09-18)    Off hours (18-09)
 The emergency override at 88C ignores quiet hours — thermal safety always wins.
 
 ```bash
-vlx fan              # interactive — view status, configure
-vlx fan auto         # start daemon with default quiet hours
-vlx fan off          # stop daemon, restore NVIDIA auto
-vlx fan 80           # fixed 80%
+vserve fan              # interactive — view status, configure
+vserve fan auto         # start daemon with default quiet hours
+vserve fan off          # stop daemon, restore NVIDIA auto
+vserve fan 80           # fixed 80%
 ```
 
 Requires [Coolbits](docs/troubleshooting.md#coolbits-setup) enabled in X11 config for manual fan control.
@@ -101,14 +101,14 @@ Requires [Coolbits](docs/troubleshooting.md#coolbits-setup) enabled in X11 confi
 ## How It Works
 
 ```
-vlx tune <model>           # calculate limits (instant, no GPU needed)
+vserve tune <model>           # calculate limits (instant, no GPU needed)
    |
    +-- Read model architecture (config.json: kv_heads, head_dim, layers)
    +-- Read GPU info (nvidia-smi: total VRAM)
    +-- KV formula: available_kv = VRAM × util − model_weights − overhead
    +-- Output: context × concurrency table for auto and fp8 KV dtypes
 
-vlx start <model>          # interactive config picker → serve
+vserve start <model>          # interactive config picker → serve
    |
    +-- Pick context window, KV dtype, concurrent slots from limits
    +-- Write config YAML, start vLLM via systemd
@@ -118,7 +118,7 @@ vlx start <model>          # interactive config picker → serve
 
 ## Prerequisites
 
-You need these before installing vlx:
+You need these before installing vserve:
 
 **1. NVIDIA GPU + drivers**
 
@@ -147,7 +147,7 @@ See [vLLM installation guide](https://docs.vllm.ai/en/latest/getting_started/ins
 
 **4. systemd** (for service management)
 
-vlx uses systemd to manage the vLLM service. Most Linux servers have it. You'll need a service unit — `vlx init` will detect an existing one, or see [troubleshooting](docs/troubleshooting.md) for setup.
+vserve uses systemd to manage the vLLM service. Most Linux servers have it. You'll need a service unit — `vserve init` will detect an existing one, or see [troubleshooting](docs/troubleshooting.md) for setup.
 
 **5. sudo access** (for systemctl, fan control)
 
@@ -156,28 +156,28 @@ vlx uses systemd to manage the vLLM service. Most Linux servers have it. You'll 
 ## Setup
 
 ```bash
-pip install vlx
-vlx init                          # scans GPU, vLLM, CUDA, systemd — writes config
-vlx doctor                        # verify everything is ready
+pip install vserve
+vserve init                          # scans GPU, vLLM, CUDA, systemd — writes config
+vserve doctor                        # verify everything is ready
 ```
 
 Or from source:
 
 ```bash
-git clone https://github.com/Gavin-Qiao/vlx.git ~/vlx
-cd ~/vlx
+git clone https://github.com/Gavin-Qiao/vserve.git ~/vserve
+cd ~/vserve
 uv sync && uv pip install -e .
-sudo ln -sf ~/vlx/.venv/bin/vlx /usr/local/bin/vlx
-vlx init
+sudo ln -sf ~/vserve/.venv/bin/vserve /usr/local/bin/vserve
+vserve init
 ```
 
-**Multi-user:** Install to a shared venv so all users can run vlx:
+**Multi-user:** Install to a shared venv so all users can run vserve:
 
 ```bash
-sudo uv venv /opt/vlx-app --python 3.12
-sudo uv pip install --python /opt/vlx-app/bin/python vlx
-sudo ln -sf /opt/vlx-app/bin/vlx /usr/local/bin/vlx
-# Each user runs: vlx init
+sudo uv venv /opt/vserve-app --python 3.12
+sudo uv pip install --python /opt/vserve-app/bin/python vserve
+sudo ln -sf /opt/vserve-app/bin/vserve /usr/local/bin/vserve
+# Each user runs: vserve init
 ```
 
 **Development:**
@@ -185,7 +185,7 @@ sudo ln -sf /opt/vlx-app/bin/vlx /usr/local/bin/vlx
 ```bash
 uv run pytest tests/              # 126 tests
 uv run ruff check src/ tests/     # linting
-uv run mypy src/vlx/              # type checking
+uv run mypy src/vserve/              # type checking
 ```
 
 ---
@@ -193,9 +193,9 @@ uv run mypy src/vlx/              # type checking
 ## Project Structure
 
 ```
-src/vlx/
+src/vserve/
   cli.py        Typer CLI — commands, interactive pickers, dashboard
-  config.py     Auto-discovery, VxConfig, YAML/JSON I/O
+  config.py     Auto-discovery, VserveConfig, YAML/JSON I/O
   models.py     Model detection, fuzzy matching, metadata
   gpu.py        GPU info, VRAM calculations, fan speed control
   fan.py        Fan curve daemon — temp polling, quiet hours, emergency override

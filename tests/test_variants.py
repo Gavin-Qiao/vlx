@@ -1,4 +1,4 @@
-from vlx.variants import discover_variants, Variant
+from vserve.variants import discover_variants, Variant
 
 
 def test_single_index_standard_repo():
@@ -262,7 +262,7 @@ def test_fetch_repo_variants(mocker):
     import json
     import tempfile
     from unittest.mock import MagicMock
-    from vlx.variants import fetch_repo_variants
+    from vserve.variants import fetch_repo_variants
 
     mock_api = MagicMock()
 
@@ -306,7 +306,7 @@ def test_fetch_repo_variants(mocker):
 
 
 def test_format_variant_line_sharded():
-    from vlx.variants import format_variant_line
+    from vserve.variants import format_variant_line
 
     v = Variant(label="mxfp4", files={
         "model.safetensors.index.json": 50_000,
@@ -322,7 +322,7 @@ def test_format_variant_line_sharded():
 
 
 def test_format_variant_line_single_file():
-    from vlx.variants import format_variant_line
+    from vserve.variants import format_variant_line
 
     v = Variant(label="consolidated.safetensors", files={
         "consolidated.safetensors": 10_000_000_000,

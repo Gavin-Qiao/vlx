@@ -1,6 +1,6 @@
 import pytest
 
-from vlx.models import (
+from vserve.models import (
     detect_model,
     scan_models,
     fuzzy_match,

@@ -22,7 +22,7 @@ NVRM: Xid (PCI:0000:02:00): 8, pid=..., name=VLLM::EngineCor
 
 **Prevention:**
 - Use the production driver branch (595.x), not the new-feature branch (590.x).
-- `vlx fan auto` keeps temps below throttle threshold.
+- `vserve fan auto` keeps temps below throttle threshold.
 - systemd `Restart=always` with exponential backoff recovers automatically.
 - If crashes persist, try `--enforce-eager` (disables CUDA graphs, ~2.3x throughput cost).
 
@@ -55,7 +55,7 @@ Section "Device"
 EndSection
 ```
 
-On headless systems, `vlx fan` uses a temporary Xvfb virtual display — no persistent X server needed.
+On headless systems, `vserve fan` uses a temporary Xvfb virtual display — no persistent X server needed.
 
 ### Hardware thermal failsafe
 
@@ -64,7 +64,7 @@ Even if the fan daemon crashes and the fan is stuck at 30%, the GPU has hardware
 - Aggressive power limiting at ~90°C
 - Hardware shutdown at ~100-105°C (cannot be overridden by software)
 
-The `vlx fan` emergency override (100% fan at 88°C regardless of quiet hours) is software-level defense. The hardware failsafe is always present underneath.
+The `vserve fan` emergency override (100% fan at 88°C regardless of quiet hours) is software-level defense. The hardware failsafe is always present underneath.
 
 ## JIT Compilation
 
@@ -76,7 +76,7 @@ vLLM 0.18+ uses FlashInfer with just-in-time compiled CUDA kernels. First run fo
 
 **Problem:** If vLLM runs as a different user (e.g., systemd `User=vllm`), the JIT cache must be writable by that user. First-time startup will be slow.
 
-**The preheat solution:** `vlx tune` runs a preheat step that starts vLLM briefly as the service user to build the JIT cache before benchmarking. This uses `sudo -u <service_user>` with the correct `CUDA_HOME`, `PATH`, and `HF_HOME` environment.
+**The preheat solution:** `vserve tune` runs a preheat step that starts vLLM briefly as the service user to build the JIT cache before benchmarking. This uses `sudo -u <service_user>` with the correct `CUDA_HOME`, `PATH`, and `HF_HOME` environment.
 
 ### torch.compile cache
 

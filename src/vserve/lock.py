@@ -1,6 +1,6 @@
 """File-based locking for multi-user concurrency.
 
-Uses fcntl.flock() on files in /run/lock/vlx/ — advisory locks that auto-release
+Uses fcntl.flock() on files in /run/lock/vserve/ — advisory locks that auto-release
 on process exit or crash. Lock metadata (pid, user, timestamp) is written for
 diagnostics when a lock is held by another process.
 """
@@ -14,7 +14,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-LOCK_DIR = Path("/run/lock/vlx")
+LOCK_DIR = Path("/run/lock/vserve")
 
 
 @dataclass
@@ -44,12 +44,12 @@ class LockHeld(Exception):
         return f"Lock '{self.name}' is held by another process"
 
 
-class VlxLock:
+class VserveLock:
     """Advisory file lock via fcntl.flock().
 
     Usage::
 
-        with VlxLock("fan", "fan daemon"):
+        with VserveLock("fan", "fan daemon"):
             ...  # exclusive access
 
     The lock is held as long as the file descriptor is open.
@@ -59,7 +59,7 @@ class VlxLock:
     def __init__(self, name: str, description: str) -> None:
         self.name = name
         self.description = description
-        self._path = LOCK_DIR / f"vlx-{name}.lock"
+        self._path = LOCK_DIR / f"vserve-{name}.lock"
         self._fd: int | None = None
 
     def acquire(self) -> None:
@@ -118,7 +118,7 @@ class VlxLock:
             except OSError:
                 pass  # another user's sticky-bit protection
 
-    def __enter__(self) -> VlxLock:
+    def __enter__(self) -> VserveLock:
         self.acquire()
         return self
 
@@ -148,7 +148,7 @@ def wait_for_release(name: str, timeout: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            lock = VlxLock(name, "wait-probe")
+            lock = VserveLock(name, "wait-probe")
             lock.acquire()
             lock.release()
             return True
@@ -174,7 +174,7 @@ def notify_user(username: str, message: str) -> bool:
                 tty = f"/dev/{parts[1]}"
                 try:
                     with open(tty, "w") as f:
-                        f.write(f"\r\n\033[1;36m[vlx]\033[0m {message}\r\n")
+                        f.write(f"\r\n\033[1;36m[vserve]\033[0m {message}\r\n")
                     sent = True
                 except OSError:
                     continue

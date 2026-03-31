@@ -1,6 +1,6 @@
-"""Tests for vlx.fan — piecewise-linear fan curve with quiet hours."""
+"""Tests for vserve.fan — piecewise-linear fan curve with quiet hours."""
 
-from vlx.fan import (
+from vserve.fan import (
     compute_fan_speed,
     read_state,
     _interpolate_curve,
@@ -155,9 +155,9 @@ class TestComputeFanSpeed:
 
 class TestReadState:
     def _patch_paths(self, mocker, tmp_path):
-        import vlx.fan
-        vlx.fan._paths_resolved = False
-        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
+        import vserve.fan
+        vserve.fan._paths_resolved = False
+        mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path, run_dir=tmp_path,
         ))
 
@@ -209,32 +209,32 @@ class TestConstants:
 
 class TestResolvePaths:
     def test_resolve_sets_paths(self, tmp_path, mocker):
-        import vlx.fan
-        vlx.fan._paths_resolved = False
-        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
+        import vserve.fan
+        vserve.fan._paths_resolved = False
+        mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path / "logs",
             run_dir=tmp_path / "run",
         ))
-        vlx.fan._resolve_paths()
-        assert vlx.fan.PID_PATH == tmp_path / "run" / "vx-fan.pid"
-        assert vlx.fan.STATE_PATH == tmp_path / "run" / "vx-fan.json"
-        assert vlx.fan.LOG_PATH == tmp_path / "logs" / "vx-fan.log"
+        vserve.fan._resolve_paths()
+        assert vserve.fan.PID_PATH == tmp_path / "run" / "vx-fan.pid"
+        assert vserve.fan.STATE_PATH == tmp_path / "run" / "vx-fan.json"
+        assert vserve.fan.LOG_PATH == tmp_path / "logs" / "vx-fan.log"
 
     def test_resolve_is_idempotent(self, tmp_path, mocker):
-        import vlx.fan
-        vlx.fan._paths_resolved = False
-        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
+        import vserve.fan
+        vserve.fan._paths_resolved = False
+        mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path, run_dir=tmp_path,
         ))
-        vlx.fan._resolve_paths()
-        first = vlx.fan.PID_PATH
-        vlx.fan._resolve_paths()
-        assert vlx.fan.PID_PATH is first
+        vserve.fan._resolve_paths()
+        first = vserve.fan.PID_PATH
+        vserve.fan._resolve_paths()
+        assert vserve.fan.PID_PATH is first
 
     def test_cli_import_pattern_works(self, tmp_path, mocker):
-        import vlx.fan as _fan
+        import vserve.fan as _fan
         _fan._paths_resolved = False
-        mocker.patch("vlx.fan.cfg", return_value=mocker.Mock(
+        mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
             logs_dir=tmp_path, run_dir=tmp_path,
         ))
         _fan._resolve_paths()
@@ -247,13 +247,13 @@ class TestResolvePaths:
 
 def test_run_fixed_daemon_exists():
     """run_fixed_daemon is importable and callable."""
-    from vlx.fan import run_fixed_daemon
+    from vserve.fan import run_fixed_daemon
     assert callable(run_fixed_daemon)
 
 
 def test_run_daemon_exists():
     """run_daemon is importable and callable."""
-    from vlx.fan import run_daemon
+    from vserve.fan import run_daemon
     assert callable(run_daemon)
 
 
@@ -262,7 +262,7 @@ def test_fan_main_block_fixed_flag():
     import subprocess
     import sys
     r = subprocess.run(
-        [sys.executable, "-m", "vlx.fan", "--help"],
+        [sys.executable, "-m", "vserve.fan", "--help"],
         capture_output=True, text=True, timeout=5,
     )
     assert "--fixed" in r.stdout

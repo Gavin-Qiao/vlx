@@ -8,7 +8,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from vlx.config import cfg
+from vserve.config import cfg
 
 LOG_PATH: Path  # resolved lazily
 PID_PATH: Path
@@ -35,7 +35,7 @@ HYSTERESIS = 4  # °C deadband — ramp-down requires temp to drop this much bel
 MAX_RAMP_PER_CYCLE = 5  # max fan % change per poll cycle to avoid audible jumps
 SMOOTHING_SAMPLES = 3   # moving average window for temperature readings
 
-_log = logging.getLogger("vlx.fan")
+_log = logging.getLogger("vserve.fan")
 
 # Piecewise-linear curve: (temp_C, fan_%).
 # Shallow at low temps, steep near throttle zone.
@@ -145,13 +145,13 @@ def _setup_logging() -> None:
 def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -> None:
     """Main fan curve loop. Blocks until SIGTERM."""
     import json
-    from vlx.lock import VlxLock, LockHeld
+    from vserve.lock import VserveLock, LockHeld
 
     _resolve_paths()
     _setup_logging()
 
     try:
-        _fan_lock = VlxLock("fan", "fan daemon")
+        _fan_lock = VserveLock("fan", "fan daemon")
         _fan_lock.acquire()
     except LockHeld as exc:
         _log.error("Another fan daemon is running: %s", exc.message())
@@ -256,19 +256,19 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
         if restored:
             _log.info("Fan daemon stopped, auto control restored")
         else:
-            _log.warning("Fan daemon stopped, auto control NOT restored — run: vlx fan off")
+            _log.warning("Fan daemon stopped, auto control NOT restored — run: vserve fan off")
 
 
 def run_fixed_daemon(speed: int) -> None:
     """Hold GPU fan at a fixed speed. Blocks until SIGTERM."""
     import json
-    from vlx.lock import VlxLock, LockHeld
+    from vserve.lock import VserveLock, LockHeld
 
     _resolve_paths()
     _setup_logging()
 
     try:
-        _fan_lock = VlxLock("fan", f"fan fixed {speed}%")
+        _fan_lock = VserveLock("fan", f"fan fixed {speed}%")
         _fan_lock.acquire()
     except LockHeld as exc:
         _log.error("Another fan daemon is running: %s", exc.message())
@@ -316,7 +316,7 @@ def run_fixed_daemon(speed: int) -> None:
         if restored:
             _log.info("Fan fixed daemon stopped, auto control restored")
         else:
-            _log.warning("Fan fixed daemon stopped, auto control NOT restored — run: vlx fan off")
+            _log.warning("Fan fixed daemon stopped, auto control NOT restored — run: vserve fan off")
 
 
 if __name__ == "__main__":

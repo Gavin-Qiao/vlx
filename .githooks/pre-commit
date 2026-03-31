@@ -7,7 +7,7 @@ echo "=== ruff ==="
 uv run ruff check src/ tests/
 
 echo "=== mypy ==="
-uv run mypy src/vlx/ --ignore-missing-imports
+uv run mypy src/vserve/ --ignore-missing-imports
 
 echo "=== pytest ==="
 uv run pytest tests/ -q --tb=short

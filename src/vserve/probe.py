@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from vlx.models import ModelInfo
+from vserve.models import ModelInfo
 
 CONTEXT_STEPS = [4096, 8192, 16384, 32768, 65536, 131072]
 

@@ -1,8 +1,8 @@
-"""Tests for vlx.probe — analytical KV cache limit calculation."""
+"""Tests for vserve.probe — analytical KV cache limit calculation."""
 
 import pytest
 
-from vlx.probe import CONTEXT_STEPS, calculate_limits, kv_bytes_per_token
+from vserve.probe import CONTEXT_STEPS, calculate_limits, kv_bytes_per_token
 
 
 def test_context_steps_are_powers_of_two():
@@ -28,7 +28,7 @@ def test_fp8_is_half_of_auto():
 
 
 def test_calculate_limits_basic(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
     result = calculate_limits(model_info=m, vram_total_gb=48.0, gpu_mem_util=0.90)
@@ -42,7 +42,7 @@ def test_calculate_limits_basic(fake_model_dir):
 
 
 def test_calculate_limits_fp8_doubles_capacity(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
     result = calculate_limits(model_info=m, vram_total_gb=48.0, gpu_mem_util=0.90)
@@ -55,7 +55,7 @@ def test_calculate_limits_fp8_doubles_capacity(fake_model_dir):
 
 
 def test_calculate_limits_higher_context_fewer_users(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
     result = calculate_limits(model_info=m, vram_total_gb=48.0, gpu_mem_util=0.90)
@@ -70,7 +70,7 @@ def test_calculate_limits_higher_context_fewer_users(fake_model_dir):
 
 
 def test_calculate_limits_tiny_vram(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
     result = calculate_limits(model_info=m, vram_total_gb=0.1, gpu_mem_util=0.90)
@@ -80,7 +80,7 @@ def test_calculate_limits_tiny_vram(fake_model_dir):
 
 
 def test_calculate_limits_missing_arch_fields(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
     m.num_kv_heads = None
 
@@ -89,7 +89,7 @@ def test_calculate_limits_missing_arch_fields(fake_model_dir):
 
 
 def test_calculate_limits_gpu_util(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
     low = calculate_limits(model_info=m, vram_total_gb=48.0, gpu_mem_util=0.80)
@@ -99,7 +99,7 @@ def test_calculate_limits_gpu_util(fake_model_dir):
 
 
 def test_calculate_limits_output_format(fake_model_dir):
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
     result = calculate_limits(model_info=m, vram_total_gb=48.0)
@@ -120,7 +120,7 @@ def test_sanity_qwen3_27b_on_rtx_pro_5000():
     Qwen3-27B-FP8: 28 layers, 4 kv_heads, 128 head_dim, 28.7 GB weights
     RTX PRO 5000: 48 GB VRAM
     """
-    from vlx.models import ModelInfo
+    from vserve.models import ModelInfo
     from pathlib import Path
 
     m = ModelInfo(
@@ -165,7 +165,7 @@ def test_sanity_qwen3_27b_on_rtx_pro_5000():
 
 def test_calculate_limits_model_exceeds_vram():
     """Model weights alone exceed available VRAM — all limits should be None."""
-    from vlx.models import ModelInfo
+    from vserve.models import ModelInfo
     from pathlib import Path
 
     m = ModelInfo(
@@ -184,7 +184,7 @@ def test_calculate_limits_model_exceeds_vram():
 
 def test_calculate_limits_max_pos_below_smallest_step():
     """Model with 2K context — no CONTEXT_STEPS apply, limits should be empty."""
-    from vlx.models import ModelInfo
+    from vserve.models import ModelInfo
     from pathlib import Path
 
     m = ModelInfo(
@@ -200,7 +200,7 @@ def test_calculate_limits_max_pos_below_smallest_step():
 
 def test_calculate_limits_moe_model(fake_moe_model_dir):
     """MoE models should calculate limits normally when arch fields are present."""
-    from vlx.models import detect_model
+    from vserve.models import detect_model
     m = detect_model(fake_moe_model_dir)
 
     result = calculate_limits(model_info=m, vram_total_gb=48.0, gpu_mem_util=0.90)

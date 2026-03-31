@@ -1,15 +1,15 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed, restore_fan_auto
+from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed, restore_fan_auto
 
 
 def test_parse_gpu_info(mocker):
     mocker.patch(
-        "vlx.gpu._run_nvidia_smi",
+        "vserve.gpu._run_nvidia_smi",
         return_value="NVIDIA RTX PRO 5000 Blackwell, 48935, 0, 1024, 590.48.01",
     )
-    mocker.patch("vlx.gpu._get_cuda_version", return_value="13.1")
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="13.1")
     info = get_gpu_info()
     assert info.name == "NVIDIA RTX PRO 5000 Blackwell"
     assert info.vram_total_mb == 48935

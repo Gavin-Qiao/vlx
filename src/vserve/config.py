@@ -19,7 +19,7 @@ _DEFAULT_CUDA_HOME = "/usr/local/cuda"
 
 
 @dataclass
-class VxConfig:
+class VserveConfig:
     vllm_root: Path
     models_dir: Path
     configs_dir: Path
@@ -104,8 +104,8 @@ def _discover_port(vllm_root: Path) -> int:
 
 
 def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
-                  service_user: str, port: int) -> VxConfig:
-    return VxConfig(
+                  service_user: str, port: int) -> VserveConfig:
+    return VserveConfig(
         vllm_root=vllm_root,
         models_dir=vllm_root / "models",
         configs_dir=vllm_root / "configs" / "models",
@@ -121,7 +121,7 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
     )
 
 
-def load_config() -> VxConfig:
+def load_config() -> VserveConfig:
     """Load config: file > auto-discovery > defaults."""
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
@@ -143,8 +143,8 @@ def load_config() -> VxConfig:
     return _build_config(root, cuda_home, service_name, service_user, port)
 
 
-def save_config(cfg: VxConfig) -> Path:
-    """Write config to ~/.config/vx/config.yaml."""
+def save_config(cfg: VserveConfig) -> Path:
+    """Write config to ~/.config/vserve/config.yaml."""
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "vllm_root": str(cfg.vllm_root),
@@ -161,10 +161,10 @@ def save_config(cfg: VxConfig) -> Path:
 
 # --- Lazy singleton ---
 
-_cfg: VxConfig | None = None
+_cfg: VserveConfig | None = None
 
 
-def cfg() -> VxConfig:
+def cfg() -> VserveConfig:
     """Return the global config, loading on first access."""
     global _cfg
     if _cfg is None:
@@ -183,7 +183,7 @@ def reset_config() -> None:
 
 
 # Backward-compatible module-level constants via __getattr__.
-# `from vlx.config import MODELS_DIR` resolves lazily on first access,
+# `from vserve.config import MODELS_DIR` resolves lazily on first access,
 # returning a real Path from cfg(). Zero changes needed in callers.
 _COMPAT = {
     "MODELS_DIR": "models_dir",
@@ -199,7 +199,7 @@ _COMPAT = {
 def __getattr__(name: str):  # type: ignore[override]
     if name in _COMPAT:
         return getattr(cfg(), _COMPAT[name])
-    raise AttributeError(f"module 'vlx.config' has no attribute {name!r}")
+    raise AttributeError(f"module 'vserve.config' has no attribute {name!r}")
 
 
 def limits_path(provider: str, model_name: str) -> Path:

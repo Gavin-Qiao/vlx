@@ -1,4 +1,4 @@
-"""Tests for vlx.lock — file-based multi-user locking."""
+"""Tests for vserve.lock — file-based multi-user locking."""
 
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from vlx.lock import LockHeld, LockInfo, VlxLock, _format_elapsed, wait_for_release
+from vserve.lock import LockHeld, LockInfo, VserveLock, _format_elapsed, wait_for_release
 
 
 # ── Helpers ──────────────────────────────────────────
@@ -17,16 +17,16 @@ from vlx.lock import LockHeld, LockInfo, VlxLock, _format_elapsed, wait_for_rele
 @pytest.fixture(autouse=True)
 def _use_tmp_lock_dir(tmp_path, monkeypatch):
     """Redirect LOCK_DIR to a temp dir for all tests."""
-    monkeypatch.setattr("vlx.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
 
 
 # ── Basic acquire / release ──────────────────────────
 
 def test_acquire_and_release(tmp_path):
-    lock = VlxLock("test", "test op")
+    lock = VserveLock("test", "test op")
     lock.acquire()
     assert lock._fd is not None
-    lock_file = tmp_path / "vlx-test.lock"
+    lock_file = tmp_path / "vserve-test.lock"
     assert lock_file.exists()
     # Metadata written
     data = json.loads(lock_file.read_text().strip())
@@ -37,14 +37,14 @@ def test_acquire_and_release(tmp_path):
 
 
 def test_context_manager(tmp_path):
-    with VlxLock("ctx", "ctx test") as lock:
+    with VserveLock("ctx", "ctx test") as lock:
         assert lock._fd is not None
-        assert (tmp_path / "vlx-ctx.lock").exists()
+        assert (tmp_path / "vserve-ctx.lock").exists()
     assert lock._fd is None
 
 
 def test_release_idempotent():
-    lock = VlxLock("idem", "test")
+    lock = VserveLock("idem", "test")
     lock.acquire()
     lock.release()
     lock.release()  # should not raise
@@ -57,9 +57,9 @@ def test_second_acquire_raises(tmp_path):
     holder_script = textwrap.dedent(f"""\
         import sys, os, fcntl, time
         sys.path.insert(0, "{Path(__file__).resolve().parent.parent / 'src'}")
-        from vlx import lock
+        from vserve import lock
         lock.LOCK_DIR = __import__("pathlib").Path("{tmp_path}")
-        lk = lock.VlxLock("contend", "holder process")
+        lk = lock.VserveLock("contend", "holder process")
         lk.acquire()
         sys.stdout.write("locked\\n")
         sys.stdout.flush()
@@ -76,7 +76,7 @@ def test_second_acquire_raises(tmp_path):
 
         # Parent should fail
         with pytest.raises(LockHeld) as exc_info:
-            VlxLock("contend", "parent attempt").acquire()
+            VserveLock("contend", "parent attempt").acquire()
         assert exc_info.value.info is not None
         assert exc_info.value.info.pid == proc.pid
         assert "holder process" in exc_info.value.info.command
@@ -90,9 +90,9 @@ def test_lock_released_on_process_death(tmp_path):
     holder_script = textwrap.dedent(f"""\
         import sys
         sys.path.insert(0, "{Path(__file__).resolve().parent.parent / 'src'}")
-        from vlx import lock
+        from vserve import lock
         lock.LOCK_DIR = __import__("pathlib").Path("{tmp_path}")
-        lk = lock.VlxLock("die", "dying process")
+        lk = lock.VserveLock("die", "dying process")
         lk.acquire()
         sys.stdout.write("locked\\n")
         sys.stdout.flush()
@@ -107,7 +107,7 @@ def test_lock_released_on_process_death(tmp_path):
     proc.wait(timeout=5)
 
     # Lock file may still exist, but flock is released
-    lock = VlxLock("die", "reacquire")
+    lock = VserveLock("die", "reacquire")
     lock.acquire()  # should not raise
     lock.release()
 
@@ -115,8 +115,8 @@ def test_lock_released_on_process_death(tmp_path):
 # ── Per-model download lock names ────────────────────
 
 def test_different_model_locks_independent(tmp_path):
-    lock_a = VlxLock("download-Qwen--Qwen3-27B", "dl model A")
-    lock_b = VlxLock("download-Meta--Llama-8B", "dl model B")
+    lock_a = VserveLock("download-Qwen--Qwen3-27B", "dl model A")
+    lock_b = VserveLock("download-Meta--Llama-8B", "dl model B")
     lock_a.acquire()
     lock_b.acquire()  # should not raise — different lock names
     lock_a.release()
@@ -128,9 +128,9 @@ def test_same_model_lock_contends(tmp_path):
     holder_script = textwrap.dedent(f"""\
         import sys, time
         sys.path.insert(0, "{Path(__file__).resolve().parent.parent / 'src'}")
-        from vlx import lock
+        from vserve import lock
         lock.LOCK_DIR = __import__("pathlib").Path("{tmp_path}")
-        lk = lock.VlxLock("download-Qwen--Model", "downloading Qwen/Model")
+        lk = lock.VserveLock("download-Qwen--Model", "downloading Qwen/Model")
         lk.acquire()
         sys.stdout.write("locked\\n")
         sys.stdout.flush()
@@ -143,7 +143,7 @@ def test_same_model_lock_contends(tmp_path):
     try:
         proc.stdout.readline()
         with pytest.raises(LockHeld):
-            VlxLock("download-Qwen--Model", "parent dl").acquire()
+            VserveLock("download-Qwen--Model", "parent dl").acquire()
     finally:
         proc.terminate()
         proc.wait(timeout=5)
@@ -182,8 +182,8 @@ def test_format_elapsed_invalid():
 
 def test_lock_dir_created(tmp_path, monkeypatch):
     subdir = tmp_path / "nested" / "lock"
-    monkeypatch.setattr("vlx.lock.LOCK_DIR", subdir)
-    lock = VlxLock("mkdir", "test")
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", subdir)
+    lock = VserveLock("mkdir", "test")
     lock.acquire()
     assert subdir.exists()
     lock.release()
@@ -201,9 +201,9 @@ def test_wait_for_release_held_then_freed(tmp_path):
     holder_script = textwrap.dedent(f"""\
         import sys, time
         sys.path.insert(0, "{Path(__file__).resolve().parent.parent / 'src'}")
-        from vlx import lock
+        from vserve import lock
         lock.LOCK_DIR = __import__("pathlib").Path("{tmp_path}")
-        lk = lock.VlxLock("handoff", "holder")
+        lk = lock.VserveLock("handoff", "holder")
         lk.acquire()
         sys.stdout.write("locked\\n")
         sys.stdout.flush()
@@ -226,9 +226,9 @@ def test_wait_for_release_timeout(tmp_path):
     holder_script = textwrap.dedent(f"""\
         import sys, time
         sys.path.insert(0, "{Path(__file__).resolve().parent.parent / 'src'}")
-        from vlx import lock
+        from vserve import lock
         lock.LOCK_DIR = __import__("pathlib").Path("{tmp_path}")
-        lk = lock.VlxLock("stuck", "holder")
+        lk = lock.VserveLock("stuck", "holder")
         lk.acquire()
         sys.stdout.write("locked\\n")
         sys.stdout.flush()

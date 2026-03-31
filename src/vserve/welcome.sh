@@ -1,14 +1,14 @@
 #!/bin/bash
-# vlx login banner — reads from vlx config (single source of truth)
-# Installed by: vlx init → ~/.config/vx/welcome.sh
-# Remove with:  rm ~/.config/vx/welcome.sh  (and delete the source line from your shell rc)
+# vserve login banner — reads from vserve config (single source of truth)
+# Installed by: vserve init → ~/.config/vserve/welcome.sh
+# Remove with:  rm ~/.config/vserve/welcome.sh  (and delete the source line from your shell rc)
 
 [ -z "$BASH_VERSION" ] && [ -z "$ZSH_VERSION" ] && return 0
 command -v gum &>/dev/null || return 0
 
-# ── Read vlx config ──────────────────────────────────
+# ── Read vserve config ──────────────────────────────────
 
-_vlx_cfg="$HOME/.config/vx/config.yaml"
+_vlx_cfg="$HOME/.config/vserve/config.yaml"
 _vllm_root="/opt/vllm"
 _svc_name="vllm"
 _port="8888"
@@ -72,7 +72,7 @@ _lbl() { gum style --foreground 243 --width 16 "$1"; }
     || _status="$(gum style --foreground 167 'OFFLINE')"
 
 _header="$(gum join --horizontal \
-    "$(gum style --bold --foreground 37 'vlx')" \
+    "$(gum style --bold --foreground 37 'vserve')" \
     "$(gum style --foreground 243 '  inference server')")"
 
 _sec_server="$(gum join --vertical \
@@ -121,14 +121,14 @@ fi
 _sep="$(gum style --foreground 238 '────────────────────────────────────────────────────────')"
 
 _sec_cmds="$(gum join --vertical \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx download [model]')"    "$(gum style --foreground 240 'search & download from HuggingFace')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx start [model]')"        "$(gum style --foreground 240 'start serving (interactive config)')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx stop')"              "$(gum style --foreground 240 'stop the vLLM service')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx status')"            "$(gum style --foreground 240 'show what is currently serving')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx models')"            "$(gum style --foreground 240 'list models with limits & profiles')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx tune [model] [prof]')"  "$(gum style --foreground 240 'probe limits + benchmark')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx fan [auto|off|30-100]')" "$(gum style --foreground 240 'GPU fan control')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx doctor')"            "$(gum style --foreground 240 'check system readiness')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve download [model]')"    "$(gum style --foreground 240 'search & download from HuggingFace')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve start [model]')"        "$(gum style --foreground 240 'start serving (interactive config)')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve stop')"              "$(gum style --foreground 240 'stop the vLLM service')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve status')"            "$(gum style --foreground 240 'show what is currently serving')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve models')"            "$(gum style --foreground 240 'list models with limits & profiles')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve tune [model] [prof]')"  "$(gum style --foreground 240 'probe limits + benchmark')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve fan [auto|off|30-100]')" "$(gum style --foreground 240 'GPU fan control')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve doctor')"            "$(gum style --foreground 240 'check system readiness')")" \
 )"
 
 _body="$(gum join --vertical \

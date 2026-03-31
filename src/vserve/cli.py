@@ -1,4 +1,4 @@
-"""vlx — vLLM model manager CLI."""
+"""vserve — vLLM model manager CLI."""
 
 
 import pathlib
@@ -7,31 +7,31 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from vlx.config import (
+from vserve.config import (
     CONFIG_FILE,
     MODELS_DIR,
     limits_path,
     profile_path,
     read_limits,
 )
-from vlx.models import scan_models, fuzzy_match, ModelInfo
-from vlx.lock import VlxLock, LockHeld, notify_user
+from vserve.models import scan_models, fuzzy_match, ModelInfo
+from vserve.lock import VserveLock, LockHeld, notify_user
 
 app = typer.Typer(help="vLLM model manager")
 console = Console()
 
 
 
-def _lock_or_exit(name: str, description: str) -> VlxLock:
+def _lock_or_exit(name: str, description: str) -> VserveLock:
     """Acquire a lock or DM the holder and exit."""
     import os
-    lock = VlxLock(name, description)
+    lock = VserveLock(name, description)
     try:
         lock.acquire()
     except LockHeld as exc:
         console.print(Panel(
             f"[bold]{exc.message()}[/bold]",
-            title=f"[red]vlx: {name} locked[/red]",
+            title=f"[red]vserve: {name} locked[/red]",
             border_style="red",
         ))
         # DM the lock holder
@@ -48,7 +48,7 @@ def _lock_or_exit(name: str, description: str) -> VlxLock:
 def _resolve_model(query: str) -> ModelInfo:
     models = scan_models(MODELS_DIR)
     if not models:
-        console.print("[red]No models found.[/red] Run: vlx download")
+        console.print("[red]No models found.[/red] Run: vserve download")
         raise typer.Exit(1)
     matches = fuzzy_match(query, models)
     if len(matches) == 0:
@@ -72,19 +72,19 @@ def dashboard(ctx: typer.Context):
 
     if not CONFIG_FILE.exists():
         console.print(Panel(
-            "[bold]First time? Run [cyan]vlx init[/cyan] to set up your system.[/bold]",
+            "[bold]First time? Run [cyan]vserve init[/cyan] to set up your system.[/bold]",
             border_style="yellow",
         ))
 
     try:
-        from vlx.gpu import get_gpu_info
+        from vserve.gpu import get_gpu_info
         gpu = get_gpu_info()
         gpu_line = f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, CUDA {gpu.cuda})"
     except Exception:
         gpu_line = "[dim]unavailable[/dim]"
 
-    from vlx.serve import is_vllm_running
-    from vlx.config import active_yaml_path, read_profile_yaml
+    from vserve.serve import is_vllm_running
+    from vserve.config import active_yaml_path, read_profile_yaml
 
     models = scan_models(MODELS_DIR)
     probed = sum(
@@ -133,7 +133,7 @@ def dashboard(ctx: typer.Context):
         "\n".join(lines) + "\n  [bold]Commands[/bold]",
         cmd_tbl,
     )
-    console.print(Panel(body, title="[bold cyan]vlx[/bold cyan]", border_style="cyan"))
+    console.print(Panel(body, title="[bold cyan]vserve[/bold cyan]", border_style="cyan"))
 
 
 @app.command()
@@ -141,7 +141,7 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     """List downloaded models."""
     all_models = scan_models(MODELS_DIR)
     if not all_models:
-        console.print("[dim]No models found.[/dim] Run: vlx download")
+        console.print("[dim]No models found.[/dim] Run: vserve download")
         return
 
     if model:
@@ -179,7 +179,7 @@ def _show_model_detail(m: ModelInfo):
     console.print(f"  Size: {m.model_size_gb} GB  Max positions: {m.max_position_embeddings}\n")
 
     if not lim:
-        console.print(f"  [dim]Not probed yet.[/dim] Run: vlx tune {m.model_name.lower()}\n")
+        console.print(f"  [dim]Not probed yet.[/dim] Run: vserve tune {m.model_name.lower()}\n")
         return
 
     table = Table(title="Context / Concurrency Limits")
@@ -226,7 +226,7 @@ def _gum_filter(items: list[str], header: str = "") -> str | None:
 def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")):
     """Search and download a model from HuggingFace."""
     from huggingface_hub import snapshot_download, HfApi
-    from vlx.config import cfg as _cfg
+    from vserve.config import cfg as _cfg
 
     models_dir = _cfg().models_dir
     api = HfApi()
@@ -320,7 +320,7 @@ def _pick_variants(variants: list) -> list:
     import subprocess
 
     if _has_gum():
-        from vlx.variants import format_variant_line
+        from vserve.variants import format_variant_line
         lines = [format_variant_line(v, index=i) for i, v in enumerate(variants, 1)]
         cmd = [
             "gum", "choose", "--no-limit",
@@ -356,7 +356,7 @@ def _pick_variants(variants: list) -> list:
 
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
     """Download a single model by its HuggingFace ID. Returns True if download happened."""
-    from vlx.variants import fetch_repo_variants, format_variant_line, _format_bytes
+    from vserve.variants import fetch_repo_variants, format_variant_line, _format_bytes
 
     parts = model_id.split("/")
     if len(parts) != 2:
@@ -418,7 +418,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     console.print(f"  To: {local_dir}\n")
 
     lock_name = f"download-{provider}--{model_name}"
-    lock = VlxLock(lock_name, f"downloading {model_id}")
+    lock = VserveLock(lock_name, f"downloading {model_id}")
     try:
         lock.acquire()
     except LockHeld as exc:
@@ -431,13 +431,13 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
             )
         console.print(f"[yellow]{model_id} is being downloaded by {exc.info.user if exc.info else 'another user'}.[/yellow]")
         console.print("[dim]Waiting for it to finish...[/dim]")
-        from vlx.lock import wait_for_release
+        from vserve.lock import wait_for_release
         if not wait_for_release(lock_name, timeout=7200):
             console.print("[red]Timed out waiting for download.[/red]")
             raise typer.Exit(1)
         if local_dir.exists() and any(local_dir.iterdir()):
             try:
-                from vlx.models import detect_model
+                from vserve.models import detect_model
                 info = detect_model(local_dir)
             except Exception:
                 info = None
@@ -467,7 +467,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         lock.release()
 
     try:
-        from vlx.models import detect_model
+        from vserve.models import detect_model
         info = detect_model(local_dir)
     except Exception:
         info = None
@@ -476,7 +476,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         console.print(f"  Size: {info.model_size_gb:.1f} GB")
         console.print(f"  Quant: {info.quant_method or 'none'}")
         console.print(f"  Context: {info.max_position_embeddings:,} tokens")
-        console.print(f"\nNext: vlx tune {model_name}")
+        console.print(f"\nNext: vserve tune {model_name}")
     else:
         console.print(f"\n[green]Downloaded to {local_dir}[/green]")
     return True
@@ -494,9 +494,9 @@ def tune(
         console.print("[red]--gpu-util must be between 0.5 and 0.99[/red]")
         raise typer.Exit(1)
 
-    from vlx.gpu import get_gpu_info
-    from vlx.probe import calculate_limits
-    from vlx.config import write_limits
+    from vserve.gpu import get_gpu_info
+    from vserve.probe import calculate_limits
+    from vserve.config import write_limits
 
     # Resolve which models to tune
     if all_models:
@@ -507,7 +507,7 @@ def tune(
     else:
         all_m = scan_models(MODELS_DIR)
         if not all_m:
-            console.print("[red]No models found.[/red] Run: vlx download")
+            console.print("[red]No models found.[/red] Run: vserve download")
             raise typer.Exit(1)
         for i, m in enumerate(all_m):
             console.print(f"  {i + 1}) {m.full_name}")
@@ -520,7 +520,7 @@ def tune(
 
     gpu = get_gpu_info()
 
-    console.print(f"\n[bold]vlx tune[/bold]  [dim]{gpu.name} ({gpu.vram_total_gb:.0f} GB, util {gpu_util:.0%})[/dim]\n")
+    console.print(f"\n[bold]vserve tune[/bold]  [dim]{gpu.name} ({gpu.vram_total_gb:.0f} GB, util {gpu_util:.0%})[/dim]\n")
 
     for m in models_to_tune:
         # Check cached limits (invalidate if gpu_util changed)
@@ -581,8 +581,8 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
 
 def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
     """Stop any running vLLM, start with given config, wait for health."""
-    from vlx.config import read_profile_yaml
-    from vlx.serve import start_vllm, stop_vllm, is_vllm_running
+    from vserve.config import read_profile_yaml
+    from vserve.serve import start_vllm, stop_vllm, is_vllm_running
     import time
 
     lock = _lock_or_exit("gpu", f"starting vLLM ({label})")
@@ -609,7 +609,7 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
         try:
             start_vllm(cfg_path)
         except RuntimeError as e:
-            from vlx.config import cfg as _cfg
+            from vserve.config import cfg as _cfg
             svc = _cfg().service_name
             console.print(f"[red]{e}[/red]")
             console.print(f"  Check: sudo journalctl -u {svc} --no-pager -n 20")
@@ -619,7 +619,7 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
         port = cfg.get("port", 8888)
         health_url = f"http://localhost:{port}/health"
 
-        from vlx.config import cfg as _cfg
+        from vserve.config import cfg as _cfg
         fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
         if not fi_cache.is_dir() or not list(fi_cache.glob("*.so")):
             console.print("  [yellow]First run — compiling kernels (~5-10 min). Subsequent starts will be fast.[/yellow]")
@@ -632,20 +632,20 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
                 if resp.status == 200:
                     console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
                     console.print(f"  Config: {cfg_path}")
-                    from vlx.config import cfg as _cfg
+                    from vserve.config import cfg as _cfg
                     svc = _cfg().service_name
                     console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
                     return
             except Exception:
                 pass
             if i > 5 and not is_vllm_running():
-                from vlx.config import cfg as _cfg
+                from vserve.config import cfg as _cfg
                 svc = _cfg().service_name
                 console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
                 raise typer.Exit(1)
             if i > 0 and i % 15 == 0:
                 console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-        from vlx.config import cfg as _cfg
+        from vserve.config import cfg as _cfg
         svc = _cfg().service_name
         console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
         raise typer.Exit(1)
@@ -667,12 +667,12 @@ def _pick_number(prompt: str, max_val: int) -> int:
 
 def _custom_config(m: ModelInfo) -> "pathlib.Path":
     """Guide user through manual parameter selection, write a temp config."""
-    from vlx.config import read_limits, write_profile_yaml
-    from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization
+    from vserve.config import read_limits, write_profile_yaml
+    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
 
     lim = read_limits(limits_path(m.provider, m.model_name))
     if not lim:
-        console.print(f"[red]No probe data for {m.model_name}.[/red] Run: vlx tune {m.model_name}")
+        console.print(f"[red]No probe data for {m.model_name}.[/red] Run: vserve tune {m.model_name}")
         raise typer.Exit(1)
 
     gpu = get_gpu_info()
@@ -744,7 +744,7 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
 
     qf = m.quant_method
     if qf and qf not in ("none", "compressed-tensors"):
-        from vlx.models import QUANT_FLAGS
+        from vserve.models import QUANT_FLAGS
         flag = QUANT_FLAGS.get(qf, "")
         if flag:
             cfg["quantization"] = flag.split()[-1]
@@ -762,7 +762,7 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
         raise typer.Exit(0)
 
     cfg_path = profile_path(m.provider, m.model_name, "custom")
-    write_profile_yaml(cfg_path, cfg, comment="vlx start — custom config")
+    write_profile_yaml(cfg_path, cfg, comment="vserve start — custom config")
     console.clear()
     return cfg_path
 
@@ -775,21 +775,21 @@ def start(
     if model is None:
         all_models = scan_models(MODELS_DIR)
         if not all_models:
-            console.print("[red]No models found.[/red] Run: vlx download")
+            console.print("[red]No models found.[/red] Run: vserve download")
             raise typer.Exit(1)
 
         while True:
             console.print("\n[bold]Select a model:[/bold]")
             for i, m in enumerate(all_models, 1):
                 has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
-                status = "[green]tuned[/green]" if has_limits else "[dim]run vlx tune first[/dim]"
+                status = "[green]tuned[/green]" if has_limits else "[dim]run vserve tune first[/dim]"
                 console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
 
             choice = _pick_number("\nModel number", len(all_models))
             m = all_models[choice - 1]
             if read_limits(limits_path(m.provider, m.model_name)) is not None:
                 break
-            console.print(f"[yellow]Run vlx tune {m.model_name} first.[/yellow]")
+            console.print(f"[yellow]Run vserve tune {m.model_name} first.[/yellow]")
     else:
         m = _resolve_model(model)
 
@@ -800,7 +800,7 @@ def start(
 @app.command()
 def stop():
     """Stop the vLLM service."""
-    from vlx.serve import stop_vllm, is_vllm_running
+    from vserve.serve import stop_vllm, is_vllm_running
 
     lock = _lock_or_exit("gpu", "stopping vLLM")
     try:
@@ -825,9 +825,9 @@ def fan(
     """GPU fan control — auto curve, fixed speed, or off."""
     from pathlib import Path
 
-    import vlx.fan as _fan
-    from vlx.fan import read_state
-    from vlx.gpu import get_fan_speed
+    import vserve.fan as _fan
+    from vserve.fan import read_state
+    from vserve.gpu import get_fan_speed
     import os
     import signal as sig
     import time
@@ -850,7 +850,7 @@ def fan(
             os.kill(pid, 0)
             # Verify it's actually our daemon, not a recycled PID
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
-            if "vlx.fan" not in cmdline:
+            if "vserve.fan" not in cmdline:
                 PID_PATH.unlink(missing_ok=True)
                 STATE_PATH.unlink(missing_ok=True)
                 return None
@@ -878,7 +878,7 @@ def fan(
     def _start_daemon(qs: int, qe: int, qm: int) -> None:
         _stop_daemon()
         # Wait for old daemon to release its fan lock (cleanup in finally block)
-        from vlx.lock import wait_for_release
+        from vserve.lock import wait_for_release
         if not wait_for_release("fan", timeout=5.0):
             console.print("[red]Old fan daemon did not release lock in time.[/red]")
             raise typer.Exit(1)
@@ -886,7 +886,7 @@ def fan(
         import sys
         proc = subprocess.Popen(
             [
-                sys.executable, "-m", "vlx.fan",
+                sys.executable, "-m", "vserve.fan",
                 "--quiet-start", str(qs),
                 "--quiet-end", str(qe),
                 "--quiet-max", str(qm),
@@ -898,21 +898,21 @@ def fan(
         )
         time.sleep(2)
         if proc.poll() is not None:
-            from vlx.config import cfg as _cfg
+            from vserve.config import cfg as _cfg
             console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vx-fan.log'}")
             raise typer.Exit(1)
         console.print(f"[green]Fan daemon started[/green] (pid {proc.pid})")
 
     def _start_fixed_daemon(speed: int) -> None:
         _stop_daemon()
-        from vlx.lock import wait_for_release
+        from vserve.lock import wait_for_release
         if not wait_for_release("fan", timeout=5.0):
             console.print("[red]Old fan daemon did not release lock in time.[/red]")
             raise typer.Exit(1)
         import subprocess
         import sys
         proc = subprocess.Popen(
-            [sys.executable, "-m", "vlx.fan", "--fixed", str(speed)],
+            [sys.executable, "-m", "vserve.fan", "--fixed", str(speed)],
             start_new_session=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -920,7 +920,7 @@ def fan(
         )
         time.sleep(2)
         if proc.poll() is not None:
-            from vlx.config import cfg as _cfg
+            from vserve.config import cfg as _cfg
             console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vx-fan.log'}")
             raise typer.Exit(1)
         console.print(f"[green]Fan held at {speed}%[/green] (pid {proc.pid})")
@@ -937,7 +937,7 @@ def fan(
         _fan._resolve_paths()
         _fan.PID_PATH.unlink(missing_ok=True)
         _fan.STATE_PATH.unlink(missing_ok=True)
-        from vlx.gpu import restore_fan_auto
+        from vserve.gpu import restore_fan_auto
         try:
             restore_fan_auto()
             console.print("[green]Fan auto control restored.[/green]")
@@ -949,7 +949,7 @@ def fan(
         pid = _daemon_pid()
         state = read_state() if pid else None
         try:
-            from vlx.fan import _get_gpu_temp
+            from vserve.fan import _get_gpu_temp
             temp = _get_gpu_temp()
         except Exception:
             temp = None
@@ -959,7 +959,7 @@ def fan(
 
         if _is_orphaned_fan():
             console.print("  [red]Warning: fan daemon crashed — fan may be stuck in manual mode[/red]")
-            console.print("  [red]Run: sudo vlx fan off[/red]")
+            console.print("  [red]Run: sudo vserve fan off[/red]")
         elif state and "fixed" in state:
             console.print(f"  [green]Fixed at {state['fixed']}%[/green] (daemon holding)")
         elif state:
@@ -1062,11 +1062,11 @@ def fan(
 @app.command()
 def status():
     """Show current vLLM serving status."""
-    from vlx.config import active_yaml_path, read_profile_yaml
-    from vlx.serve import is_vllm_running
+    from vserve.config import active_yaml_path, read_profile_yaml
+    from vserve.serve import is_vllm_running
 
     if not is_vllm_running():
-        console.print("[dim]vLLM is not running.[/dim] Start with: vlx start")
+        console.print("[dim]vLLM is not running.[/dim] Start with: vserve start")
         return
 
     active = active_yaml_path()
@@ -1108,12 +1108,12 @@ def status():
 
 @app.command()
 def init():
-    """Set up vlx — scan the system, write config, optionally install login banner."""
+    """Set up vserve — scan the system, write config, optionally install login banner."""
     import shutil
     import subprocess
     from pathlib import Path as _Path
 
-    from vlx.config import (
+    from vserve.config import (
         CONFIG_FILE, save_config,
         _discover_vllm_root, _discover_cuda_home, _discover_service, _discover_port,
         _build_config, reset_config,
@@ -1128,19 +1128,19 @@ def init():
     def _fail(msg: str) -> None:
         console.print(f"  [red]{msg}[/red]")
 
-    console.print("\n[bold]vlx setup[/bold]\n")
+    console.print("\n[bold]vserve setup[/bold]\n")
     console.print("[dim]Scanning your system...[/dim]\n")
 
     # ── GPU ──
     try:
-        from vlx.gpu import get_gpu_info
+        from vserve.gpu import get_gpu_info
         gpu = get_gpu_info()
         _ok(f"GPU         {gpu.name} ({gpu.vram_total_gb:.0f} GB)")
         _ok(f"Driver      {gpu.driver}")
         _ok(f"CUDA        {gpu.cuda}")
     except Exception:
         _fail("GPU         nvidia-smi not found or no GPU detected")
-        _fail("            vlx requires an NVIDIA GPU with drivers installed")
+        _fail("            vserve requires an NVIDIA GPU with drivers installed")
         _fail("            Install drivers: https://www.nvidia.com/drivers")
 
     # ── CUDA toolkit ──
@@ -1189,7 +1189,7 @@ def init():
     if svc_path.exists():
         _ok(f"systemd     {svc_name}.service (user: {svc_user})")
     else:
-        _fail("systemd     no vLLM systemd service found (required for vlx start/stop)")
+        _fail("systemd     no vLLM systemd service found (required for vserve start/stop)")
         _fail(f"            Create /etc/systemd/system/{svc_name}.service with:")
         _fail("            [Service] ExecStart=/opt/vllm/venv/bin/vllm serve ...")
 
@@ -1202,13 +1202,13 @@ def init():
     if xorg_conf.exists() and "Coolbits" in xorg_conf.read_text():
         _ok("Coolbits    enabled (fan control available)")
     else:
-        _warn("Coolbits    not configured (vlx fan requires it)")
+        _warn("Coolbits    not configured (vserve fan requires it)")
 
     # ── gum (interactive UI) ──
     if shutil.which("gum"):
         _ok("gum         installed (interactive UI enabled)")
     else:
-        _warn("gum         not installed (vlx download will use basic mode)")
+        _warn("gum         not installed (vserve download will use basic mode)")
 
     # ── Write config ──
     console.print()
@@ -1230,7 +1230,7 @@ def init():
     # ── Welcome banner ──
     banner_src = _Path(__file__).parent / "welcome.sh"
     banner_dest = CONFIG_FILE.parent / "welcome.sh"
-    _marker = "# vlx login banner"
+    _marker = "# vserve login banner"
 
     # Detect shell rc file
     import os
@@ -1272,9 +1272,9 @@ def init():
     # ── Next steps ──
     console.print()
     console.print("[bold]Next steps[/bold]")
-    console.print("  vlx download    Search & download a model")
-    console.print("  vlx doctor      Full system check")
-    console.print("  vlx             Dashboard")
+    console.print("  vserve download    Search & download a model")
+    console.print("  vserve doctor      Full system check")
+    console.print("  vserve             Dashboard")
     console.print()
 
 
@@ -1286,8 +1286,8 @@ def doctor():
     import socket
     from pathlib import Path
 
-    from vlx.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
-    from vlx.serve import is_vllm_running
+    from vserve.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
+    from vserve.serve import is_vllm_running
 
     ok_count = 0
     fail_count = 0
@@ -1309,7 +1309,7 @@ def doctor():
         if fix:
             console.print(f"          Fix: {fix}")
 
-    console.print("\n[bold]vlx doctor[/bold]\n")
+    console.print("\n[bold]vserve doctor[/bold]\n")
 
     # -- Environment --
     console.print("  [bold]Environment[/bold]")
@@ -1335,7 +1335,7 @@ def doctor():
 
     # GPU
     try:
-        from vlx.gpu import get_gpu_info
+        from vserve.gpu import get_gpu_info
         gpu = get_gpu_info()
         mem_used = 0
         try:
@@ -1349,7 +1349,7 @@ def doctor():
         _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
 
     # Service user
-    from vlx.config import cfg as _cfg
+    from vserve.config import cfg as _cfg
     _c = _cfg()
     try:
         r = subprocess.run(["id", _c.service_user], capture_output=True, text=True, timeout=5)
@@ -1374,7 +1374,7 @@ def doctor():
             _ok("systemd unit configured correctly")
     else:
         _fail(f"No systemd unit at {svc_path}",
-              "Create one: https://docs.vllm.ai  or see vlx docs/troubleshooting.md")
+              "Create one: https://docs.vllm.ai  or see vserve docs/troubleshooting.md")
 
     # .env
     env_path = VLLM_ROOT / "configs" / ".env"
@@ -1415,7 +1415,7 @@ def doctor():
         sockets = list(tmp_dir.glob("*"))
         stale = [s for s in sockets if s.is_socket()]
         if len(stale) > 10:
-            _warn(f"{len(stale)} stale sockets in {tmp_dir}", "vlx cache clean")
+            _warn(f"{len(stale)} stale sockets in {tmp_dir}", "vserve cache clean")
     else:
         _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
 
@@ -1437,7 +1437,7 @@ def doctor():
     elif active.exists():
         _ok("active.yaml exists (not a symlink)")
     else:
-        _warn("No active.yaml — run vlx start to configure")
+        _warn("No active.yaml — run vserve start to configure")
 
     # Port
     _port = _c.port
@@ -1447,7 +1447,7 @@ def doctor():
         _ok(f"vLLM serving on port {_port}")
     elif port_in_use:
         _fail(f"Port {_port} in use but vLLM not running — something else is bound",
-              f"Check: sudo lsof -i :{_port}  then stop the other service or change port in ~/.config/vx/config.yaml")
+              f"Check: sudo lsof -i :{_port}  then stop the other service or change port in ~/.config/vserve/config.yaml")
     else:
         _ok(f"Port {_port} available")
 
@@ -1469,7 +1469,7 @@ def doctor():
         if me in tty_members:
             _ok("tty group (terminal messaging between users)")
         else:
-            _warn(f"'{me}' not in tty group — vlx can't DM other users",
+            _warn(f"'{me}' not in tty group — vserve can't DM other users",
                   f"sudo usermod -aG tty {me}  (then re-login)")
     except KeyError:
         _warn("tty group not found")
