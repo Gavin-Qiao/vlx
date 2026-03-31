@@ -74,6 +74,8 @@ def get_gpu_info() -> GpuInfo:
 def compute_gpu_memory_utilization(
     vram_total_gb: float, overhead_gb: float = 2.0
 ) -> float:
+    if vram_total_gb <= 0:
+        return 0.90
     return (vram_total_gb - overhead_gb) / vram_total_gb
 
 

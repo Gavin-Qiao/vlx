@@ -233,7 +233,12 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
 
     # Check if argument is an existing repo
     if model_id and "/" in model_id:
-        if api.repo_exists(model_id, repo_type="model"):
+        try:
+            exists = api.repo_exists(model_id, repo_type="model")
+        except Exception as e:
+            console.print(f"[red]HuggingFace error:[/red] {e}")
+            raise typer.Exit(1)
+        if exists:
             _download_model(model_id, models_dir, snapshot_download, api)
             return
         # Not found — fall through to keyword search
@@ -256,7 +261,12 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
         # Only re-search if we don't already have results for this query
         if not results:
             console.print(f"[dim]Searching '{query}'...[/dim]")
-            results = list(api.list_models(search=query, sort="downloads", limit=20))
+            try:
+                results = list(api.list_models(search=query, sort="downloads", limit=20))
+            except Exception as e:
+                console.print(f"[red]HuggingFace error:[/red] {e}")
+                query = ""
+                continue
 
             if not results:
                 console.print(f"[yellow]No results for '{query}'.[/yellow]")
@@ -324,7 +334,7 @@ def _pick_variants(variants: list) -> list:
         selected = []
         for line in selected_lines:
             for i, v in enumerate(variants, 1):
-                if f"{i})" in line:
+                if line.lstrip().startswith(f"{i}) "):
                     selected.append(v)
                     break
         return selected
@@ -365,11 +375,15 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     console.print(f"\n[bold]{model_id}[/bold]\n")
     console.print("[dim]Fetching file list...[/dim]")
 
-    variants, shared = fetch_repo_variants(model_id, api)
+    try:
+        variants, shared = fetch_repo_variants(model_id, api)
+    except Exception as e:
+        console.print(f"[red]Failed to fetch file list:[/red] {e}")
+        return False
 
     if not variants:
         console.print("[yellow]No weight files found in this repo.[/yellow]")
-        raise typer.Exit(1)
+        return False
 
     # Show shared files summary
     shared_size = sum(shared.values())
@@ -422,14 +436,23 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
             console.print("[red]Timed out waiting for download.[/red]")
             raise typer.Exit(1)
         if local_dir.exists() and any(local_dir.iterdir()):
-            from vlx.models import detect_model
-            info = detect_model(local_dir)
+            try:
+                from vlx.models import detect_model
+                info = detect_model(local_dir)
+            except Exception:
+                info = None
             if info:
                 console.print(f"\n[green]{info.full_name} is ready[/green] (downloaded by {exc.info.user if exc.info else 'another user'})")
             else:
                 console.print(f"\n[green]{model_id} is ready.[/green]")
             return True
         console.print("[yellow]Download seems to have failed. Retrying...[/yellow]")
+        # Reacquire the lock for the retry
+        try:
+            lock.acquire()
+        except LockHeld:
+            console.print("[yellow]Another download started. Exiting.[/yellow]")
+            return True
 
     try:
         snapshot_download(  # type: ignore[operator]
@@ -443,8 +466,11 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     finally:
         lock.release()
 
-    from vlx.models import detect_model
-    info = detect_model(local_dir)
+    try:
+        from vlx.models import detect_model
+        info = detect_model(local_dir)
+    except Exception:
+        info = None
     if info:
         console.print(f"\n[green]Downloaded {info.full_name}[/green]")
         console.print(f"  Size: {info.model_size_gb:.1f} GB")
@@ -464,6 +490,10 @@ def tune(
     gpu_util: float = typer.Option(0.90, "--gpu-util", help="GPU memory utilization (0.0-1.0)"),
 ):
     """Calculate context and concurrency limits for a model."""
+    if not 0.5 <= gpu_util <= 0.99:
+        console.print("[red]--gpu-util must be between 0.5 and 0.99[/red]")
+        raise typer.Exit(1)
+
     from vlx.gpu import get_gpu_info
     from vlx.probe import calculate_limits
     from vlx.config import write_limits
@@ -482,7 +512,7 @@ def tune(
         for i, m in enumerate(all_m):
             console.print(f"  {i + 1}) {m.full_name}")
         console.print(f"  {len(all_m) + 1}) All models")
-        idx = typer.prompt("Which model?", type=int) - 1
+        idx = _pick_number("Which model?", len(all_m) + 1) - 1
         if idx == len(all_m):
             models_to_tune = all_m
         else:
@@ -497,7 +527,7 @@ def tune(
         lim_path = limits_path(m.provider, m.model_name)
         if not recalc:
             existing = read_limits(lim_path)
-            if existing and existing.get("gpu_memory_utilization") == gpu_util:
+            if existing and existing.get("gpu_memory_utilization") == gpu_util and existing.get("vram_total_gb") == gpu.vram_total_gb:
                 console.print(f"[bold]{m.full_name}[/bold]  [dim](cached — use --recalc to refresh)[/dim]")
                 _print_limits_table(existing, m)
                 continue
@@ -560,8 +590,14 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
 
     try:
         if is_vllm_running():
-            console.print("[yellow]vLLM is already running. Stopping first...[/yellow]")
-            stop_vllm()
+            console.print("[yellow]vLLM is already running.[/yellow]")
+            if not typer.confirm("Stop and restart?", default=False):
+                lock.release()
+                return
+            try:
+                stop_vllm()
+            except RuntimeError as e:
+                console.print(f"[red]{e}[/red]")
             time.sleep(2)
 
         ctx = cfg.get("max-model-len", "?")
@@ -570,7 +606,14 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
         console.print(f"  context: {ctx_d}  kv: {cfg.get('kv-cache-dtype', 'auto')}"
                       f"  seqs: {cfg.get('max-num-seqs', '?')}")
 
-        start_vllm(cfg_path)
+        try:
+            start_vllm(cfg_path)
+        except RuntimeError as e:
+            from vlx.config import cfg as _cfg
+            svc = _cfg().service_name
+            console.print(f"[red]{e}[/red]")
+            console.print(f"  Check: sudo journalctl -u {svc} --no-pager -n 20")
+            raise typer.Exit(1)
 
         from urllib.request import urlopen
         port = cfg.get("port", 8888)
@@ -611,15 +654,15 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
 
 
 def _pick_number(prompt: str, max_val: int) -> int:
-    choice = typer.prompt(prompt)
-    try:
-        n = int(choice)
-        if 1 <= n <= max_val:
-            return n
-    except ValueError:
-        pass
-    console.print("[red]Invalid choice.[/red]")
-    raise typer.Exit(1)
+    while True:
+        choice = typer.prompt(prompt)
+        try:
+            n = int(choice)
+            if 1 <= n <= max_val:
+                return n
+        except ValueError:
+            pass
+        console.print(f"[red]Enter a number 1-{max_val}.[/red]")
 
 
 def _custom_config(m: ModelInfo) -> "pathlib.Path":
@@ -735,14 +778,18 @@ def start(
             console.print("[red]No models found.[/red] Run: vlx download")
             raise typer.Exit(1)
 
-        console.print("\n[bold]Select a model:[/bold]")
-        for i, m in enumerate(all_models, 1):
-            has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
-            status = "[green]limits calculated[/green]" if has_limits else "[dim]run vlx tune first[/dim]"
-            console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
+        while True:
+            console.print("\n[bold]Select a model:[/bold]")
+            for i, m in enumerate(all_models, 1):
+                has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
+                status = "[green]tuned[/green]" if has_limits else "[dim]run vlx tune first[/dim]"
+                console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
 
-        choice = _pick_number("\nModel number", len(all_models))
-        m = all_models[choice - 1]
+            choice = _pick_number("\nModel number", len(all_models))
+            m = all_models[choice - 1]
+            if read_limits(limits_path(m.provider, m.model_name)) is not None:
+                break
+            console.print(f"[yellow]Run vlx tune {m.model_name} first.[/yellow]")
     else:
         m = _resolve_model(model)
 
@@ -761,7 +808,11 @@ def stop():
             console.print("[dim]vLLM is not running.[/dim]")
             return
 
-        stop_vllm()
+        try:
+            stop_vllm()
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
         console.print("[green]vLLM stopped.[/green]")
     finally:
         lock.release()
@@ -874,6 +925,25 @@ def fan(
             raise typer.Exit(1)
         console.print(f"[green]Fan held at {speed}%[/green] (pid {proc.pid})")
 
+    def _is_orphaned_fan() -> bool:
+        """Check if fan daemon crashed, leaving stale PID/state files."""
+        if _daemon_pid() is not None:
+            return False  # daemon is alive
+        _fan._resolve_paths()
+        return _fan.PID_PATH.exists() or _fan.STATE_PATH.exists()
+
+    def _clean_orphaned_fan() -> None:
+        """Remove stale PID/state files from crashed daemon."""
+        _fan._resolve_paths()
+        _fan.PID_PATH.unlink(missing_ok=True)
+        _fan.STATE_PATH.unlink(missing_ok=True)
+        from vlx.gpu import restore_fan_auto
+        try:
+            restore_fan_auto()
+            console.print("[green]Fan auto control restored.[/green]")
+        except Exception:
+            console.print("[yellow]Could not restore auto fan control via NVML.[/yellow]")
+
     def _show_status() -> None:
         speed = get_fan_speed()
         pid = _daemon_pid()
@@ -887,7 +957,10 @@ def fan(
         temp_str = f"{temp}°C" if temp is not None else "?"
         console.print(f"\n[bold]GPU Fan[/bold]  {speed}% @ {temp_str}")
 
-        if state and "fixed" in state:
+        if _is_orphaned_fan():
+            console.print("  [red]Warning: fan daemon crashed — fan may be stuck in manual mode[/red]")
+            console.print("  [red]Run: sudo vlx fan off[/red]")
+        elif state and "fixed" in state:
             console.print(f"  [green]Fixed at {state['fixed']}%[/green] (daemon holding)")
         elif state:
             qs, qe, qm = state["quiet_start"], state["quiet_end"], state["quiet_max"]
@@ -903,8 +976,12 @@ def fan(
         _start_daemon(9, 18, 60)
         return
     if mode == "off":
+        if _daemon_pid() or _is_orphaned_fan():
+            _sudo_reexec()
         if _stop_daemon():
             console.print("[green]Fan daemon stopped[/green], auto control restored.")
+        elif _is_orphaned_fan():
+            _clean_orphaned_fan()
         else:
             console.print("[dim]No fan daemon running.[/dim]")
         return
@@ -1169,7 +1246,9 @@ def init():
     _rc_has_marker = _rc.exists() and _marker in _rc.read_text()
     has_banner = banner_dest.exists() and _rc_has_marker
 
-    if has_banner:
+    if _shell == "fish":
+        console.print("  [yellow]Login banner not supported for fish shell.[/yellow]")
+    elif has_banner:
         console.print(f"  [dim]Login banner already installed ({_rc.name} → {banner_dest})[/dim]")
         if typer.confirm("  Reinstall login banner?", default=False):
             import shutil
@@ -1202,6 +1281,7 @@ def init():
 @app.command()
 def doctor():
     """Check system readiness for vLLM serving."""
+    import os
     import subprocess
     import socket
     from pathlib import Path
@@ -1237,7 +1317,7 @@ def doctor():
     # nvcc
     try:
         r = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5,
-                           env={"PATH": "/usr/local/cuda/bin:/usr/bin:/bin"})
+                           env={**os.environ, "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", "")})
         if r.returncode == 0:
             ver = [ln for ln in r.stdout.splitlines() if "release" in ln]
             _ok(f"nvcc {ver[0].split('release')[-1].strip().rstrip(',') if ver else 'found'}")

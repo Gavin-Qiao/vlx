@@ -28,6 +28,11 @@ def test_compute_gpu_memory_utilization_small_gpu():
     assert abs(util - 0.75) < 0.001
 
 
+def test_compute_gpu_memory_utilization_zero_vram():
+    assert compute_gpu_memory_utilization(0.0) == 0.90
+    assert compute_gpu_memory_utilization(-1.0) == 0.90
+
+
 def _mock_pynvml():
     """Create a mock pynvml module for testing."""
     mock = MagicMock()

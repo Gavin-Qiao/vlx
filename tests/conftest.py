@@ -59,7 +59,7 @@ def fake_limits() -> dict:
     return {
         "model_path": "/opt/vllm/models/testprovider/TestModel-7B-FP8",
         "calculated_at": "2026-03-27T10:00:00",
-        "vram_total_gb": 47.8,
+        "vram_total_gb": 48.0,
         "gpu_memory_utilization": 0.90,
         "available_kv_gb": 12.3,
         "model_size_gb": 7.2,

@@ -85,6 +85,17 @@ def test_tune_recalc_ignores_cache(mocker, fake_model_dir, fake_limits):
     assert "slots" in result.output
 
 
+def test_tune_gpu_util_out_of_range(mocker, fake_model_dir):
+    """gpu_util outside 0.5-0.99 should fail with a clear error."""
+    result = runner.invoke(app, ["tune", "TestModel", "--gpu-util", "0.3"])
+    assert result.exit_code == 1
+    assert "--gpu-util must be between 0.5 and 0.99" in result.output
+
+    result = runner.invoke(app, ["tune", "TestModel", "--gpu-util", "1.0"])
+    assert result.exit_code == 1
+    assert "--gpu-util must be between 0.5 and 0.99" in result.output
+
+
 def test_tune_missing_arch_fields(mocker, tmp_path):
     """Model without architecture fields shows clear error, doesn't crash."""
     import json

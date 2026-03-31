@@ -243,3 +243,26 @@ class TestResolvePaths:
         from pathlib import Path
         assert isinstance(PID_PATH, Path)
         assert isinstance(STATE_PATH, Path)
+
+
+def test_run_fixed_daemon_exists():
+    """run_fixed_daemon is importable and callable."""
+    from vlx.fan import run_fixed_daemon
+    assert callable(run_fixed_daemon)
+
+
+def test_run_daemon_exists():
+    """run_daemon is importable and callable."""
+    from vlx.fan import run_daemon
+    assert callable(run_daemon)
+
+
+def test_fan_main_block_fixed_flag():
+    """Fan module __main__ block accepts --fixed flag."""
+    import subprocess
+    import sys
+    r = subprocess.run(
+        [sys.executable, "-m", "vlx.fan", "--help"],
+        capture_output=True, text=True, timeout=5,
+    )
+    assert "--fixed" in r.stdout

@@ -100,3 +100,18 @@ def test_download_nonexistent_repo_falls_to_search(mocker):
     result = runner.invoke(app, ["download", "nonexistent/model"], input="\n")
 
     assert "Searching" in result.output
+
+
+def test_status_command_exists():
+    result = runner.invoke(app, ["status", "--help"])
+    assert result.exit_code == 0
+
+
+def test_doctor_command_exists():
+    result = runner.invoke(app, ["doctor", "--help"])
+    assert result.exit_code == 0
+
+
+def test_init_command_exists():
+    result = runner.invoke(app, ["init", "--help"])
+    assert result.exit_code == 0
