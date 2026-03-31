@@ -64,12 +64,28 @@ class VlxLock:
 
     def acquire(self) -> None:
         LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
-        # Open with 0o666 so any user can subsequently flock it
+        # A prior sudo run may have left a root-owned lock file.
+        # Try to fix permissions, or delete and recreate if stale.
+        if self._path.exists():
+            try:
+                os.chmod(str(self._path), 0o666)
+            except PermissionError:
+                # Can't chmod — check if the lock is actually held
+                info = _read_lock_info(self._path)
+                if info and _pid_alive(info.pid):
+                    raise LockHeld(self.name, info)
+                # Stale lock from another user — try to remove
+                try:
+                    self._path.unlink()
+                except PermissionError:
+                    raise PermissionError(
+                        f"Cannot acquire lock: {self._path} is owned by another user. "
+                        f"Run: sudo rm {self._path}"
+                    )
         self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT, 0o666)
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError):
-            # Lock is held — read metadata for error reporting
             info = _read_lock_info(self._path)
             os.close(self._fd)
             self._fd = None
@@ -108,6 +124,14 @@ class VlxLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _read_lock_info(path: Path) -> LockInfo | None:

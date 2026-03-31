@@ -776,10 +776,16 @@ def fan(
 
     import vlx.fan as _fan
     from vlx.fan import read_state
-    from vlx.gpu import set_fan_speed, get_fan_speed
+    from vlx.gpu import get_fan_speed
     import os
     import signal as sig
     import time
+
+    def _sudo_reexec() -> None:
+        """Re-execute this command under sudo if not already root."""
+        if os.geteuid() != 0:
+            import sys
+            os.execvp("sudo", ("sudo", *sys.argv))
 
     _fan._resolve_paths()
     PID_PATH = _fan.PID_PATH
@@ -846,6 +852,28 @@ def fan(
             raise typer.Exit(1)
         console.print(f"[green]Fan daemon started[/green] (pid {proc.pid})")
 
+    def _start_fixed_daemon(speed: int) -> None:
+        _stop_daemon()
+        from vlx.lock import wait_for_release
+        if not wait_for_release("fan", timeout=5.0):
+            console.print("[red]Old fan daemon did not release lock in time.[/red]")
+            raise typer.Exit(1)
+        import subprocess
+        import sys
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "vlx.fan", "--fixed", str(speed)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+        if proc.poll() is not None:
+            from vlx.config import cfg as _cfg
+            console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vx-fan.log'}")
+            raise typer.Exit(1)
+        console.print(f"[green]Fan held at {speed}%[/green] (pid {proc.pid})")
+
     def _show_status() -> None:
         speed = get_fan_speed()
         pid = _daemon_pid()
@@ -859,16 +887,19 @@ def fan(
         temp_str = f"{temp}°C" if temp is not None else "?"
         console.print(f"\n[bold]GPU Fan[/bold]  {speed}% @ {temp_str}")
 
-        if state:
+        if state and "fixed" in state:
+            console.print(f"  [green]Fixed at {state['fixed']}%[/green] (daemon holding)")
+        elif state:
             qs, qe, qm = state["quiet_start"], state["quiet_end"], state["quiet_max"]
             console.print(f"  [green]Auto curve[/green] — quiet {qs:02d}:00-{qe:02d}:00 (max {qm}%), otherwise 100%")
         elif pid:
-            console.print("  [green]Auto curve[/green] (defaults)")
+            console.print("  [green]Daemon running[/green]")
         else:
-            console.print("  [dim]No daemon — fixed or NVIDIA auto[/dim]")
+            console.print("  [dim]No daemon — NVIDIA auto[/dim]")
 
     # --- Direct mode (non-interactive) ---
     if mode == "auto":
+        _sudo_reexec()
         _start_daemon(9, 18, 60)
         return
     if mode == "off":
@@ -886,15 +917,12 @@ def fan(
         if not 30 <= percent <= 100:
             console.print("[red]Fan speed must be 30-100.[/red]")
             raise typer.Exit(1)
-        _stop_daemon()
-        lock = _lock_or_exit("fan", f"setting fan to {percent}%")
-        set_fan_speed(percent)
-        lock.release()
-        actual = get_fan_speed()
-        console.print(f"[green]Fan set to {percent}%[/green] (reading: {actual}%)")
+        _sudo_reexec()
+        _start_fixed_daemon(percent)
         return
 
     # --- Interactive mode ---
+    _sudo_reexec()
     _show_status()
 
     pid = _daemon_pid()
@@ -926,11 +954,7 @@ def fan(
         if not 30 <= val <= 100:
             console.print(f"[red]Fan speed must be 30-100, got {val}.[/red]")
             raise typer.Exit(1)
-        _stop_daemon()
-        lock = _lock_or_exit("fan", f"setting fan to {val}%")
-        set_fan_speed(val)
-        lock.release()
-        console.print(f"[green]Fan set to {val}%[/green]")
+        _start_fixed_daemon(val)
         return
 
     # action == "curve"

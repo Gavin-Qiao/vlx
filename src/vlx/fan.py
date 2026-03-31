@@ -259,6 +259,66 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
             _log.warning("Fan daemon stopped, auto control NOT restored — run: vlx fan off")
 
 
+def run_fixed_daemon(speed: int) -> None:
+    """Hold GPU fan at a fixed speed. Blocks until SIGTERM."""
+    import json
+    from vlx.lock import VlxLock, LockHeld
+
+    _resolve_paths()
+    _setup_logging()
+
+    try:
+        _fan_lock = VlxLock("fan", f"fan fixed {speed}%")
+        _fan_lock.acquire()
+    except LockHeld as exc:
+        _log.error("Another fan daemon is running: %s", exc.message())
+        return
+
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PID_PATH.write_text(str(os.getpid()))
+    STATE_PATH.write_text(json.dumps({"fixed": speed}))
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    import pynvml
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    try:
+        pynvml.nvmlDeviceSetFanControlPolicy(handle, 0, 1)  # manual
+        _apply_fan(speed, handle)
+        _log.info("Fan fixed at %d%%", speed)
+
+        while not stop.is_set():
+            try:
+                _apply_fan(speed, handle)
+            except Exception:
+                _log.exception("Fan re-apply failed")
+            stop.wait(timeout=POLL_INTERVAL)
+    finally:
+        restored = False
+        try:
+            num_fans = pynvml.nvmlDeviceGetNumFans(handle)
+            for i in range(num_fans):
+                pynvml.nvmlDeviceSetFanControlPolicy(handle, i, 0)
+            restored = True
+        except Exception:
+            _log.exception("Failed to restore auto fan control")
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+        PID_PATH.unlink(missing_ok=True)
+        STATE_PATH.unlink(missing_ok=True)
+        _fan_lock.release()
+        if restored:
+            _log.info("Fan fixed daemon stopped, auto control restored")
+        else:
+            _log.warning("Fan fixed daemon stopped, auto control NOT restored — run: vlx fan off")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -266,5 +326,9 @@ if __name__ == "__main__":
     p.add_argument("--quiet-start", type=int, default=9)
     p.add_argument("--quiet-end", type=int, default=18)
     p.add_argument("--quiet-max", type=int, default=60)
+    p.add_argument("--fixed", type=int, default=None, help="Hold a fixed fan speed")
     args = p.parse_args()
-    run_daemon(args.quiet_start, args.quiet_end, args.quiet_max)
+    if args.fixed is not None:
+        run_fixed_daemon(args.fixed)
+    else:
+        run_daemon(args.quiet_start, args.quiet_end, args.quiet_max)
