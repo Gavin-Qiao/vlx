@@ -899,7 +899,7 @@ def fan(
         time.sleep(2)
         if proc.poll() is not None:
             from vserve.config import cfg as _cfg
-            console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vx-fan.log'}")
+            console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vserve-fan.log'}")
             raise typer.Exit(1)
         console.print(f"[green]Fan daemon started[/green] (pid {proc.pid})")
 
@@ -921,7 +921,7 @@ def fan(
         time.sleep(2)
         if proc.poll() is not None:
             from vserve.config import cfg as _cfg
-            console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vx-fan.log'}")
+            console.print(f"[red]Fan daemon failed to start.[/red] Check {_cfg().logs_dir / 'vserve-fan.log'}")
             raise typer.Exit(1)
         console.print(f"[green]Fan held at {speed}%[/green] (pid {proc.pid})")
 

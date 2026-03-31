@@ -167,14 +167,14 @@ class TestReadState:
 
     def test_valid_json(self, tmp_path, mocker):
         self._patch_paths(mocker, tmp_path)
-        f = tmp_path / "vx-fan.json"
+        f = tmp_path / "vserve-fan.json"
         f.write_text('{"quiet_start": 22, "quiet_end": 6, "quiet_max": 50}')
         state = read_state()
         assert state == {"quiet_start": 22, "quiet_end": 6, "quiet_max": 50}
 
     def test_corrupted_json(self, tmp_path, mocker):
         self._patch_paths(mocker, tmp_path)
-        f = tmp_path / "vx-fan.json"
+        f = tmp_path / "vserve-fan.json"
         f.write_text("not json{{{")
         assert read_state() is None
 
@@ -216,9 +216,9 @@ class TestResolvePaths:
             run_dir=tmp_path / "run",
         ))
         vserve.fan._resolve_paths()
-        assert vserve.fan.PID_PATH == tmp_path / "run" / "vx-fan.pid"
-        assert vserve.fan.STATE_PATH == tmp_path / "run" / "vx-fan.json"
-        assert vserve.fan.LOG_PATH == tmp_path / "logs" / "vx-fan.log"
+        assert vserve.fan.PID_PATH == tmp_path / "run" / "vserve-fan.pid"
+        assert vserve.fan.STATE_PATH == tmp_path / "run" / "vserve-fan.json"
+        assert vserve.fan.LOG_PATH == tmp_path / "logs" / "vserve-fan.log"
 
     def test_resolve_is_idempotent(self, tmp_path, mocker):
         import vserve.fan

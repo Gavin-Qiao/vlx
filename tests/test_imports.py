@@ -1,6 +1,6 @@
 """Smoke tests — verify every public import path works at runtime.
 
-This file exists because a lazy-resolution bug in fan.py broke `vx fan`
+This file exists because a lazy-resolution bug in fan.py broke `vserve fan`
 but passed all unit tests. Every import pattern used by CLI code must
 be tested here.
 """

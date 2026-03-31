@@ -21,9 +21,9 @@ def _resolve_paths() -> None:
     if _paths_resolved:
         return
     c = cfg()
-    LOG_PATH = c.logs_dir / "vx-fan.log"
-    PID_PATH = c.run_dir / "vx-fan.pid"
-    STATE_PATH = c.run_dir / "vx-fan.json"
+    LOG_PATH = c.logs_dir / "vserve-fan.log"
+    PID_PATH = c.run_dir / "vserve-fan.pid"
+    STATE_PATH = c.run_dir / "vserve-fan.json"
     _paths_resolved = True
 
 MIN_FAN = 30
