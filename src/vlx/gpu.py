@@ -1,7 +1,6 @@
 """GPU info via nvidia-smi."""
 
 import subprocess
-import time
 from dataclasses import dataclass
 
 
@@ -79,55 +78,38 @@ def compute_gpu_memory_utilization(
 
 
 def get_fan_speed() -> int:
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=fan.speed", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    return int(result.stdout.strip())
+    """Read current fan speed via NVML."""
+    import pynvml
+    pynvml.nvmlInit()
+    try:
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return pynvml.nvmlDeviceGetFanSpeed_v2(h, 0)
+    finally:
+        pynvml.nvmlShutdown()
 
 
 def set_fan_speed(percent: int) -> None:
-    """Set GPU fan to a fixed percentage (30-100) via nvidia-settings + Xvfb."""
+    """Set GPU fan to a fixed percentage (30-100) via NVML. Requires root."""
     if not 30 <= percent <= 100:
         raise ValueError(f"Fan speed must be 30-100, got {percent}")
 
-    import os
-
-    xvfb = subprocess.Popen(
-        ["sudo", "Xvfb", ":98", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(1)
-
-    env = {**os.environ, "DISPLAY": ":98"}
+    import pynvml
+    pynvml.nvmlInit()
     try:
-        subprocess.run(
-            ["sudo", "nvidia-settings", "-a", "[gpu:0]/GPUFanControlState=1"],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=env,
-            timeout=10,
-        )
-        subprocess.run(
-            ["sudo", "nvidia-settings", "-a", f"[fan:0]/GPUTargetFanSpeed={percent}"],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=env,
-            timeout=10,
-        )
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        pynvml.nvmlDeviceSetFanSpeed_v2(h, 0, percent)
     finally:
-        xvfb.terminate()
-        try:
-            xvfb.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            xvfb.kill()
-            try:
-                xvfb.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+        pynvml.nvmlShutdown()
+
+
+def restore_fan_auto() -> None:
+    """Restore automatic (vBIOS-controlled) fan control via NVML. Requires root."""
+    import pynvml
+    pynvml.nvmlInit()
+    try:
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        num_fans = pynvml.nvmlDeviceGetNumFans(h)
+        for i in range(num_fans):
+            pynvml.nvmlDeviceSetFanControlPolicy(h, i, 0)
+    finally:
+        pynvml.nvmlShutdown()

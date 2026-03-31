@@ -22,6 +22,7 @@ dependencies = [
     "rich>=14",
     "huggingface-hub>=0.30",
     "pyyaml>=6",
+    "nvidia-ml-py>=13.595.45",
 ]
 
 [project.optional-dependencies]

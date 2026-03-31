@@ -3,9 +3,7 @@
 import logging
 import os
 import signal
-import subprocess
 import threading
-import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -108,51 +106,28 @@ def compute_fan_speed(
     return _interpolate_curve(temp, cap)
 
 
+def _nvml_init():
+    """Initialize NVML and return the GPU handle."""
+    import pynvml
+    pynvml.nvmlInit()
+    return pynvml.nvmlDeviceGetHandleByIndex(0)
+
+
 def _get_gpu_temp() -> int:
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=SUBPROCESS_TIMEOUT,
-    )
-    return int(result.stdout.strip())
-
-
-def _apply_fan(percent: int, env: dict[str, str]) -> None:
-    """Set fan speed via nvidia-settings."""
-    subprocess.run(
-        ["sudo", "nvidia-settings", "-a", f"[fan:0]/GPUTargetFanSpeed={percent}"],
-        capture_output=True,
-        env=env,
-        check=True,
-        timeout=SUBPROCESS_TIMEOUT,
-    )
-
-
-def _start_xvfb() -> subprocess.Popen[bytes]:
-    """Start Xvfb with security hardening."""
-    proc = subprocess.Popen(
-        ["sudo", "Xvfb", ":99", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(1)
-    return proc
-
-
-def _kill_xvfb(xvfb: subprocess.Popen[bytes]) -> None:
-    """Terminate Xvfb, escalate to SIGKILL if needed."""
-    xvfb.terminate()
+    """Read GPU temperature via NVML."""
+    import pynvml
+    pynvml.nvmlInit()
     try:
-        xvfb.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        _log.warning("Xvfb did not exit on SIGTERM, sending SIGKILL")
-        xvfb.kill()
-        try:
-            xvfb.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def _apply_fan(percent: int, handle: object) -> None:
+    """Set fan speed via NVML."""
+    import pynvml
+    pynvml.nvmlDeviceSetFanSpeed_v2(handle, 0, percent)  # type: ignore[arg-type]
 
 
 def _setup_logging() -> None:
@@ -194,22 +169,17 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    env = {**os.environ, "DISPLAY": ":99"}
-    xvfb = _start_xvfb()
+    import pynvml
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
     try:
-        # Enable manual fan control — fail fast if this doesn't work
-        subprocess.run(
-            ["sudo", "nvidia-settings", "-a", "[gpu:0]/GPUFanControlState=1"],
-            capture_output=True,
-            env=env,
-            check=True,
-            timeout=SUBPROCESS_TIMEOUT,
-        )
+        # Enable manual fan control via NVML — no X11/Xvfb needed
+        pynvml.nvmlDeviceSetFanControlPolicy(handle, 0, 1)  # 1 = manual
 
         current_speed = -1
         consecutive_failures = 0
-        temp_history: list[int] = []  # rolling window for smoothing
+        temp_history: list[int] = []
         _log.info(
             "Fan daemon started (quiet %02d:00-%02d:00 cap %d%%)",
             quiet_start, quiet_end, quiet_max,
@@ -217,17 +187,9 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
 
         while not stop.is_set():
             try:
-                # Restart Xvfb if it died
-                if xvfb.poll() is not None:
-                    _log.warning("Xvfb died (rc=%s), restarting", xvfb.returncode)
-                    xvfb = _start_xvfb()
-                    subprocess.run(
-                        ["sudo", "nvidia-settings", "-a", "[gpu:0]/GPUFanControlState=1"],
-                        capture_output=True, env=env, check=True,
-                        timeout=SUBPROCESS_TIMEOUT,
-                    )
-
-                raw_temp = _get_gpu_temp()
+                raw_temp = pynvml.nvmlDeviceGetTemperature(
+                    handle, pynvml.NVML_TEMPERATURE_GPU,
+                )
 
                 # Temperature smoothing — moving average
                 temp_history.append(raw_temp)
@@ -255,7 +217,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
                 target = max(MIN_FAN, min(100, target))
 
                 if target != current_speed:
-                    _apply_fan(target, env)
+                    _apply_fan(target, handle)
                     _log.info("temp=%d°C (raw=%d) hour=%02d:00 fan=%d%%", temp, raw_temp, hour, target)
                     current_speed = target
 
@@ -275,17 +237,19 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
 
             stop.wait(timeout=POLL_INTERVAL)
     finally:
-        # Restore auto fan control — best effort
+        # Restore auto fan control via NVML — best effort
         restored = False
         try:
-            subprocess.run(
-                ["sudo", "nvidia-settings", "-a", "[gpu:0]/GPUFanControlState=0"],
-                capture_output=True, env=env, timeout=SUBPROCESS_TIMEOUT,
-            )
+            num_fans = pynvml.nvmlDeviceGetNumFans(handle)
+            for i in range(num_fans):
+                pynvml.nvmlDeviceSetFanControlPolicy(handle, i, 0)  # 0 = auto
             restored = True
         except Exception:
             _log.exception("Failed to restore auto fan control")
-        _kill_xvfb(xvfb)
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
         PID_PATH.unlink(missing_ok=True)
         STATE_PATH.unlink(missing_ok=True)
         _fan_lock.release()

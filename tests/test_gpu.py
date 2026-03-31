@@ -1,6 +1,7 @@
 import pytest
+from unittest.mock import MagicMock, patch
 
-from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed
+from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed, restore_fan_auto
 
 
 def test_parse_gpu_info(mocker):
@@ -27,27 +28,30 @@ def test_compute_gpu_memory_utilization_small_gpu():
     assert abs(util - 0.75) < 0.001
 
 
-def test_get_fan_speed(mocker):
-    mocker.patch(
-        "vlx.gpu.subprocess.run",
-        return_value=mocker.Mock(stdout="80\n", returncode=0),
-    )
-    assert get_fan_speed() == 80
+def _mock_pynvml():
+    """Create a mock pynvml module for testing."""
+    mock = MagicMock()
+    mock.NVML_TEMPERATURE_GPU = 0
+    handle = MagicMock()
+    mock.nvmlDeviceGetHandleByIndex.return_value = handle
+    return mock, handle
 
 
-def test_set_fan_speed_valid(mocker):
-    mock_popen = mocker.Mock()
-    mock_popen.wait.return_value = None
-    mocker.patch("vlx.gpu.subprocess.Popen", return_value=mock_popen)
-    mock_run = mocker.patch("vlx.gpu.subprocess.run", return_value=mocker.Mock(returncode=0))
-    mocker.patch("vlx.gpu.time.sleep")
+def test_get_fan_speed():
+    mock_nvml, handle = _mock_pynvml()
+    mock_nvml.nvmlDeviceGetFanSpeed_v2.return_value = 80
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        speed = get_fan_speed()
+    assert speed == 80
+    mock_nvml.nvmlInit.assert_called_once()
+    mock_nvml.nvmlShutdown.assert_called_once()
 
-    set_fan_speed(80)
 
-    calls = mock_run.call_args_list
-    assert any("[gpu:0]/GPUFanControlState=1" in str(c) for c in calls)
-    assert any("[fan:0]/GPUTargetFanSpeed=80" in str(c) for c in calls)
-    mock_popen.terminate.assert_called_once()
+def test_set_fan_speed_valid():
+    mock_nvml, handle = _mock_pynvml()
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        set_fan_speed(80)
+    mock_nvml.nvmlDeviceSetFanSpeed_v2.assert_called_once_with(handle, 0, 80)
 
 
 def test_set_fan_speed_rejects_out_of_range():
@@ -55,3 +59,11 @@ def test_set_fan_speed_rejects_out_of_range():
         set_fan_speed(10)
     with pytest.raises(ValueError, match="30-100"):
         set_fan_speed(101)
+
+
+def test_restore_fan_auto():
+    mock_nvml, handle = _mock_pynvml()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 1
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        restore_fan_auto()
+    mock_nvml.nvmlDeviceSetFanControlPolicy.assert_called_once_with(handle, 0, 0)
