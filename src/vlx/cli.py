@@ -487,7 +487,7 @@ def tune(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
     recalc: bool = typer.Option(False, "--recalc", help="Force recalculation even if cached"),
-    gpu_util: float = typer.Option(0.90, "--gpu-util", help="GPU memory utilization (0.0-1.0)"),
+    gpu_util: float = typer.Option(0.90, "--gpu-util", help="GPU memory utilization (0.5-0.99)"),
 ):
     """Calculate context and concurrency limits for a model."""
     if not 0.5 <= gpu_util <= 0.99:
