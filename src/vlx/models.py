@@ -16,6 +16,9 @@ class ModelInfo:
     max_position_embeddings: int
     is_moe: bool
     model_size_gb: float
+    num_kv_heads: int | None = None
+    num_layers: int | None = None
+    head_dim: int | None = None
 
     @property
     def full_name(self) -> str:
@@ -54,8 +57,31 @@ def detect_model(model_dir: Path) -> ModelInfo:
         "max_position_embeddings",
         config.get("max_position_embeddings", 32768),
     )
-    num_experts = text_config.get("num_experts", config.get("num_experts"))
+    num_experts = text_config.get(
+        "num_experts",
+        config.get("num_experts",
+                    text_config.get("num_local_experts",
+                                    config.get("num_local_experts"))),
+    )
     is_moe = num_experts is not None and num_experts > 0
+
+    # Architecture fields for KV cache calculation
+    num_kv_heads = text_config.get(
+        "num_key_value_heads",
+        config.get("num_key_value_heads"),
+    )
+    num_layers = text_config.get(
+        "num_hidden_layers",
+        config.get("num_hidden_layers"),
+    )
+    hidden_size = text_config.get("hidden_size", config.get("hidden_size"))
+    num_attn_heads = text_config.get(
+        "num_attention_heads",
+        config.get("num_attention_heads"),
+    )
+    head_dim_val = text_config.get("head_dim", config.get("head_dim"))
+    if head_dim_val is None and hidden_size and num_attn_heads:
+        head_dim_val = hidden_size // num_attn_heads
 
     size_bytes = sum(f.stat().st_size for f in model_dir.glob("*.safetensors"))
     size_gb = round(size_bytes / (1024**3), 1)
@@ -70,6 +96,9 @@ def detect_model(model_dir: Path) -> ModelInfo:
         max_position_embeddings=max_pos,
         is_moe=is_moe,
         model_size_gb=size_gb,
+        num_kv_heads=num_kv_heads,
+        num_layers=num_layers,
+        head_dim=head_dim_val,
     )
 
 

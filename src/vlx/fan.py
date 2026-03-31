@@ -29,14 +29,28 @@ def _resolve_paths() -> None:
     _paths_resolved = True
 
 MIN_FAN = 30
-TEMP_LOW = 35
-TEMP_HIGH = 80
 POLL_INTERVAL = 5
 SUBPROCESS_TIMEOUT = 10
 MAX_CONSECUTIVE_FAILURES = 30  # 30 × 5s = 2.5 min → exit for systemd restart
 FAILURE_RESET_THRESHOLD = 5   # force re-apply after 5 failures
+HYSTERESIS = 4  # °C deadband — ramp-down requires temp to drop this much below ramp-up threshold
+MAX_RAMP_PER_CYCLE = 5  # max fan % change per poll cycle to avoid audible jumps
+SMOOTHING_SAMPLES = 3   # moving average window for temperature readings
 
 _log = logging.getLogger("vlx.fan")
+
+# Piecewise-linear curve: (temp_C, fan_%).
+# Shallow at low temps, steep near throttle zone.
+# Used for non-quiet hours (cap=100%).
+_CURVE = [
+    (35, 30),
+    (55, 35),
+    (65, 50),
+    (75, 75),
+    (80, 100),
+]
+
+EMERGENCY_TEMP = 88  # ignore quiet hours above this
 
 
 def read_state() -> dict | None:
@@ -51,7 +65,22 @@ def read_state() -> dict | None:
         return None
 
 
-EMERGENCY_TEMP = 88  # ignore quiet cap above this
+def _interpolate_curve(temp: int, cap: int) -> int:
+    """Evaluate the piecewise-linear curve, scaling to the given cap."""
+    if temp <= _CURVE[0][0]:
+        return MIN_FAN
+    if temp >= _CURVE[-1][0]:
+        return cap
+
+    # Find the segment
+    for i in range(len(_CURVE) - 1):
+        t0, s0 = _CURVE[i]
+        t1, s1 = _CURVE[i + 1]
+        if t0 <= temp <= t1:
+            frac = (temp - t0) / (t1 - t0)
+            raw = s0 + frac * (s1 - s0)
+            return min(int(raw), cap)
+    return cap  # shouldn't reach here
 
 
 def compute_fan_speed(
@@ -61,12 +90,12 @@ def compute_fan_speed(
     quiet_end: int = 18,
     quiet_max: int = 60,
 ) -> int:
-    """Map GPU temperature to fan speed, respecting quiet-hours cap.
+    """Map GPU temperature to fan speed using piecewise-linear curve.
 
-    Emergency override: if temp >= EMERGENCY_TEMP, always return 100%
-    regardless of quiet hours.
+    During quiet hours, the curve is scaled so the max output is quiet_max
+    instead of 100%, with a smooth ramp (no hard cap cliff).
+    Emergency override at EMERGENCY_TEMP always returns 100%.
     """
-    # Emergency override — thermal safety trumps noise
     if temp >= EMERGENCY_TEMP:
         return 100
 
@@ -76,13 +105,7 @@ def compute_fan_speed(
         in_quiet = hour >= quiet_start or hour < quiet_end
     cap = quiet_max if in_quiet else 100
 
-    if temp <= TEMP_LOW:
-        return MIN_FAN
-    if temp >= TEMP_HIGH:
-        return cap
-
-    fraction = (temp - TEMP_LOW) / (TEMP_HIGH - TEMP_LOW)
-    return int(MIN_FAN + fraction * (cap - MIN_FAN))
+    return _interpolate_curve(temp, cap)
 
 
 def _get_gpu_temp() -> int:
@@ -147,9 +170,17 @@ def _setup_logging() -> None:
 def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -> None:
     """Main fan curve loop. Blocks until SIGTERM."""
     import json
+    from vlx.lock import VlxLock, LockHeld
 
     _resolve_paths()
     _setup_logging()
+
+    try:
+        _fan_lock = VlxLock("fan", "fan daemon")
+        _fan_lock.acquire()
+    except LockHeld as exc:
+        _log.error("Another fan daemon is running: %s", exc.message())
+        return
 
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
@@ -176,8 +207,9 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
             timeout=SUBPROCESS_TIMEOUT,
         )
 
-        last_speed = -1
+        current_speed = -1
         consecutive_failures = 0
+        temp_history: list[int] = []  # rolling window for smoothing
         _log.info(
             "Fan daemon started (quiet %02d:00-%02d:00 cap %d%%)",
             quiet_start, quiet_end, quiet_max,
@@ -189,21 +221,43 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
                 if xvfb.poll() is not None:
                     _log.warning("Xvfb died (rc=%s), restarting", xvfb.returncode)
                     xvfb = _start_xvfb()
-                    # Re-enable manual control on new Xvfb
                     subprocess.run(
                         ["sudo", "nvidia-settings", "-a", "[gpu:0]/GPUFanControlState=1"],
                         capture_output=True, env=env, check=True,
                         timeout=SUBPROCESS_TIMEOUT,
                     )
 
-                temp = _get_gpu_temp()
+                raw_temp = _get_gpu_temp()
+
+                # Temperature smoothing — moving average
+                temp_history.append(raw_temp)
+                if len(temp_history) > SMOOTHING_SAMPLES:
+                    temp_history.pop(0)
+                temp = sum(temp_history) // len(temp_history)
+
                 hour = datetime.now().hour
                 target = compute_fan_speed(temp, hour, quiet_start, quiet_end, quiet_max)
 
-                if target != last_speed:
+                # Hysteresis — only ramp down if temp dropped enough
+                if target < current_speed and current_speed != -1:
+                    ramp_down_temp = compute_fan_speed(
+                        temp + HYSTERESIS, hour, quiet_start, quiet_end, quiet_max,
+                    )
+                    if ramp_down_temp >= current_speed:
+                        target = current_speed  # hold — not cool enough yet
+
+                # Rate limiting — max change per cycle
+                if current_speed != -1:
+                    delta = target - current_speed
+                    if abs(delta) > MAX_RAMP_PER_CYCLE:
+                        target = current_speed + (MAX_RAMP_PER_CYCLE if delta > 0 else -MAX_RAMP_PER_CYCLE)
+
+                target = max(MIN_FAN, min(100, target))
+
+                if target != current_speed:
                     _apply_fan(target, env)
-                    _log.info("temp=%d°C hour=%02d:00 fan=%d%%", temp, hour, target)
-                    last_speed = target
+                    _log.info("temp=%d°C (raw=%d) hour=%02d:00 fan=%d%%", temp, raw_temp, hour, target)
+                    current_speed = target
 
                 consecutive_failures = 0
             except Exception:
@@ -215,7 +269,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
                     )
                     break
                 if consecutive_failures >= FAILURE_RESET_THRESHOLD:
-                    last_speed = -1  # force re-apply on next success
+                    current_speed = -1  # force re-apply on next success
                 if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
                     _log.exception("Fan update failed (%d consecutive)", consecutive_failures)
 
@@ -234,10 +288,11 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
         _kill_xvfb(xvfb)
         PID_PATH.unlink(missing_ok=True)
         STATE_PATH.unlink(missing_ok=True)
+        _fan_lock.release()
         if restored:
             _log.info("Fan daemon stopped, auto control restored")
         else:
-            _log.warning("Fan daemon stopped, auto control NOT restored — run: vx fan off")
+            _log.warning("Fan daemon stopped, auto control NOT restored — run: vlx fan off")
 
 
 if __name__ == "__main__":

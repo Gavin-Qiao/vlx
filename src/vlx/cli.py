@@ -8,19 +8,41 @@ from rich.table import Table
 from rich.panel import Panel
 
 from vlx.config import (
+    CONFIG_FILE,
     MODELS_DIR,
     limits_path,
     profile_path,
     read_limits,
-    read_timing,
-    write_timing,
 )
 from vlx.models import scan_models, fuzzy_match, ModelInfo
+from vlx.lock import VlxLock, LockHeld, notify_user
 
 app = typer.Typer(help="vLLM model manager")
 console = Console()
 
-PROFILE_NAMES = ["interactive", "batch", "agentic", "creative"]
+
+
+def _lock_or_exit(name: str, description: str) -> VlxLock:
+    """Acquire a lock or DM the holder and exit."""
+    import os
+    lock = VlxLock(name, description)
+    try:
+        lock.acquire()
+    except LockHeld as exc:
+        console.print(Panel(
+            f"[bold]{exc.message()}[/bold]",
+            title=f"[red]vlx: {name} locked[/red]",
+            border_style="red",
+        ))
+        # DM the lock holder
+        me = os.environ.get("USER", "?")
+        if exc.info and exc.info.user != me:
+            notify_user(
+                exc.info.user,
+                f"{me} is waiting for {name} (you: {exc.info.command})",
+            )
+        raise typer.Exit(1) from None
+    return lock
 
 
 def _resolve_model(query: str) -> ModelInfo:
@@ -47,6 +69,12 @@ def dashboard(ctx: typer.Context):
     """Show status dashboard when called with no subcommand."""
     if ctx.invoked_subcommand is not None:
         return
+
+    if not CONFIG_FILE.exists():
+        console.print(Panel(
+            "[bold]First time? Run [cyan]vlx init[/cyan] to set up your system.[/bold]",
+            border_style="yellow",
+        ))
 
     try:
         from vlx.gpu import get_gpu_info
@@ -89,11 +117,11 @@ def dashboard(ctx: typer.Context):
     cmd_tbl.add_column(style="dim")
     for cmd, desc in [
         ("download [model]", "Search & download from HuggingFace"),
-        ("start [model] [profile]", "Start serving (interactive picker if no args)"),
+        ("start [model]", "Start serving (interactive config picker)"),
         ("stop", "Stop the vLLM service"),
         ("status", "Show what's currently serving"),
         ("models", "List models with limits & profiles"),
-        ("tune [model] [profile]", "Probe limits + benchmark"),
+        ("tune [model]", "Calculate context & concurrency limits"),
         ("fan [auto|off|30-100]", "GPU fan control with temp curve"),
         ("doctor", "Check system readiness"),
         ("init", "Auto-discover vLLM and write config"),
@@ -124,19 +152,11 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     table = Table(title="Downloaded Models")
     table.add_column("Model", style="bold")
     table.add_column("Size", justify="right")
-    table.add_column("Probed")
-    table.add_column("Tuned")
+    table.add_column("Limits")
     table.add_column("Max Context", justify="right")
 
     for m in all_models:
         lim = read_limits(limits_path(m.provider, m.model_name))
-        probed = "\u2713" if lim else "\u2717"
-
-        tuned_profiles = [
-            p for p in PROFILE_NAMES
-            if profile_path(m.provider, m.model_name, p).exists()
-        ]
-        tuned = ", ".join(tuned_profiles) if tuned_profiles else "\u2717"
 
         max_ctx = "\u2014"
         if lim:
@@ -146,7 +166,7 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
                     max_ctx = f"{int(ctx_str) // 1024}k"
                     break
 
-        table.add_row(m.full_name, f"{m.model_size_gb} GB", probed, tuned, max_ctx)
+        table.add_row(m.full_name, f"{m.model_size_gb} GB", "\u2713" if lim else "\u2717", max_ctx)
 
     console.print(table)
 
@@ -174,12 +194,6 @@ def _show_model_detail(m: ModelInfo):
         table.add_row(f"{int(ctx_str) // 1024}k", auto, fp8)
 
     console.print(table)
-
-    tuned = [p for p in PROFILE_NAMES if profile_path(m.provider, m.model_name, p).exists()]
-    if tuned:
-        console.print(f"\n  Tuned profiles: {', '.join(tuned)}")
-    else:
-        console.print("\n  [dim]No profiles tuned yet.[/dim]")
     console.print()
 
 
@@ -193,7 +207,7 @@ def _gum_input(placeholder: str) -> str | None:
     import subprocess
     r = subprocess.run(
         ["gum", "input", "--placeholder", placeholder, "--width", "60"],
-        capture_output=True, text=True,
+        stdout=subprocess.PIPE, text=True,
     )
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
@@ -204,7 +218,7 @@ def _gum_filter(items: list[str], header: str = "") -> str | None:
     cmd = ["gum", "filter", "--height", "15", "--placeholder", "Type to filter..."]
     if header:
         cmd.extend(["--header", header])
-    r = subprocess.run(cmd, input="\n".join(items), capture_output=True, text=True)
+    r = subprocess.run(cmd, input="\n".join(items), stdout=subprocess.PIPE, text=True)
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
@@ -297,6 +311,37 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     console.print(f"\n[bold]Downloading[/bold] {model_id}")
     console.print(f"  To: {local_dir}\n")
 
+    lock_name = f"download-{provider}--{model_name}"
+    lock = VlxLock(lock_name, f"downloading {model_id}")
+    try:
+        lock.acquire()
+    except LockHeld as exc:
+        # Same model is being downloaded — wait for it instead of failing
+        import os
+        me = os.environ.get("USER", "?")
+        if exc.info and exc.info.user != me:
+            notify_user(
+                exc.info.user,
+                f"{me} is also waiting for {model_id} download",
+            )
+        console.print(f"[yellow]{model_id} is being downloaded by {exc.info.user if exc.info else 'another user'}.[/yellow]")
+        console.print("[dim]Waiting for it to finish...[/dim]")
+        from vlx.lock import wait_for_release
+        if not wait_for_release(lock_name, timeout=7200):
+            console.print("[red]Timed out waiting for download.[/red]")
+            raise typer.Exit(1)
+        # Check if model landed successfully
+        if local_dir.exists() and any(local_dir.iterdir()):
+            from vlx.models import detect_model
+            info = detect_model(local_dir)
+            if info:
+                console.print(f"\n[green]{info.full_name} is ready[/green] (downloaded by {exc.info.user if exc.info else 'another user'})")
+            else:
+                console.print(f"\n[green]{model_id} is ready.[/green]")
+            return
+        console.print("[yellow]Download seems to have failed. Retrying...[/yellow]")
+        # Fall through to download it ourselves
+
     try:
         snapshot_download(  # type: ignore[operator]
             repo_id=model_id,
@@ -305,6 +350,8 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     except Exception as e:
         console.print(f"[red]Download failed:[/red] {e}")
         raise typer.Exit(1)
+    finally:
+        lock.release()
 
     from vlx.models import detect_model
     info = detect_model(local_dir)
@@ -321,33 +368,25 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
 @app.command()
 def tune(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
-    profile: str = typer.Argument(None, help="Profile: interactive, batch, agentic, creative, all"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show commands without running"),
-    reprobe: bool = typer.Option(False, "--reprobe", help="Force re-probe even if cached"),
-    no_probe: bool = typer.Option(False, "--no-probe", help="Skip probe phase"),
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
+    recalc: bool = typer.Option(False, "--recalc", help="Force recalculation even if cached"),
+    gpu_util: float = typer.Option(0.90, "--gpu-util", help="GPU memory utilization (0.0-1.0)"),
 ):
-    """Probe limits + benchmark a model."""
-    import subprocess
-    from datetime import datetime
-    from vlx.gpu import get_gpu_info, compute_gpu_memory_utilization
-    from vlx.config import BENCHMARKS_DIR, VLLM_BIN, write_limits, write_profile_yaml
-    from vlx.probe import probe_model
-    from vlx.tune import generate_sweep_params, pick_winner, PROFILES
-    from vlx.models import quant_flag as get_quant_flag
+    """Calculate context and concurrency limits for a model."""
+    from vlx.gpu import get_gpu_info
+    from vlx.probe import calculate_limits
+    from vlx.config import write_limits
 
     # Resolve which models to tune
     if all_models:
         models_to_tune = scan_models(MODELS_DIR)
-        if not profile:
-            profile = "all"
     elif model:
         m = _resolve_model(model)
         models_to_tune = [m]
     else:
         all_m = scan_models(MODELS_DIR)
         if not all_m:
-            console.print("[red]No models found.[/red]")
+            console.print("[red]No models found.[/red] Run: vlx download")
             raise typer.Exit(1)
         for i, m in enumerate(all_m):
             console.print(f"  {i + 1}) {m.full_name}")
@@ -358,387 +397,65 @@ def tune(
         else:
             models_to_tune = [all_m[idx]]
 
-    # Resolve which profiles to run
-    if not profile:
-        choices = list(PROFILES.keys()) + ["all", "skip"]
-        labels = {
-            "interactive": "Interactive (chat, coding, RAG)",
-            "batch": "Batch processing",
-            "agentic": "Agentic workflows",
-            "creative": "Creative writing",
-            "all": "All profiles",
-            "skip": "Skip benchmarks (probe only)",
-        }
-        console.print("\n[bold]What's this model for?[/bold]")
-        for i, c in enumerate(choices):
-            console.print(f"  {i + 1}) {labels.get(c, c)}")
-        idx = typer.prompt("Choice", type=int) - 1
-        profile = choices[idx]
-
-    profiles_to_run = list(PROFILES.keys()) if profile == "all" else ([] if profile == "skip" else [profile])
-
-    # Clear the interactive menu noise — from here on it's just progress
-    console.clear()
-
     gpu = get_gpu_info()
-    gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
 
-    # Build job list: (model, phase) pairs for progress tracking
-    import time as _time
-    jobs: list[tuple[ModelInfo, str]] = []  # (model, "probe" | profile_name)
+    console.print(f"\n[bold]vlx tune[/bold]  [dim]{gpu.name} ({gpu.vram_total_gb:.0f} GB, util {gpu_util:.0%})[/dim]\n")
+
     for m in models_to_tune:
-        lim_path_check = limits_path(m.provider, m.model_name)
-        existing_check = read_limits(lim_path_check)
-        if not existing_check or reprobe:
-            if not no_probe:
-                jobs.append((m, "probe"))
-        for prof in profiles_to_run:
-            jobs.append((m, prof))
-
-    total_jobs = len(jobs)
-    completed_jobs = 0
-    start_time = _time.monotonic()
-    passed = 0
-    failed = 0
-
-    def _fmt_duration(seconds: float) -> str:
-        s = int(seconds)
-        if s < 60:
-            return f"{s}s"
-        elif s < 3600:
-            return f"{s // 60}m {s % 60}s"
-        elif s < 86400:
-            h = s // 3600
-            m = (s % 3600) // 60
-            return f"{h}h {m}m {s % 60}s"
-        else:
-            d = s // 86400
-            h = (s % 86400) // 3600
-            m = (s % 3600) // 60
-            return f"{d}d {h}h {m}m"
-
-    def _eta() -> str:
-        if completed_jobs == 0:
-            return "estimating..."
-        elapsed = _time.monotonic() - start_time
-        avg = elapsed / completed_jobs
-        remaining = avg * (total_jobs - completed_jobs)
-        return _fmt_duration(remaining)
-
-    def _elapsed() -> str:
-        return _fmt_duration(_time.monotonic() - start_time)
-
-    def _status_line(label: str) -> str:
-        return f"[{completed_jobs}/{total_jobs}]  {label}  |  elapsed {_elapsed()}  |  ETA {_eta()}"
-
-    if total_jobs == 0:
-        console.print("[dim]Nothing to do.[/dim]")
-        return
-
-    from rich.live import Live
-    from rich.text import Text
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-    import json as _json
-    import threading
-
-    current_model_limits: dict[str, dict] = {}
-    current_job_label = ""
-    Text("")
-
-    def _render_header() -> Text:
-        header = Text()
-        header.append(f"[{completed_jobs}/{total_jobs}]", style="bold")
-        header.append(f"  {current_job_label}", style="cyan")
-        header.append(f"  |  elapsed {_elapsed()}  |  ETA {_eta()}", style="dim")
-        return header
-
-    if total_jobs == 0:
-        console.print("[dim]Nothing to do.[/dim]")
-        return
-
-    # Show time estimate from historical data
-    all_timings = [read_timing(m.provider, m.model_name) for m, _ in jobs]
-    has_history = any(t for t in all_timings)
-    if has_history:
-        est_total = 0.0
-        for (m, job_type), timing in zip(jobs, all_timings):
-            if job_type in timing:
-                est_total += timing[job_type]
-            elif timing:
-                # Use average of known phases as fallback
-                avg = sum(timing.values()) / len(timing)
-                est_total += avg
-        if est_total > 0:
-            console.print(
-                f"\n[bold]Jobs: {total_jobs}[/bold]  ({len(models_to_tune)} models)"
-                f"  [dim]— estimated {_fmt_duration(est_total)} based on previous runs[/dim]\n"
-            )
-        else:
-            console.print(f"\n[bold]Jobs: {total_jobs}[/bold]  ({len(models_to_tune)} models)\n")
-    else:
-        console.print(f"\n[bold]Jobs: {total_jobs}[/bold]  ({len(models_to_tune)} models)\n")
-
-    for m, job_type in jobs:
-        model_key = str(m.path)
-        job_t0 = _time.monotonic()
-
-        if job_type == "probe":
-            current_job_label = f"{m.model_name} → probe"
-
-            if dry_run:
-                console.print(f"[bold cyan]{_render_header()}[/bold cyan]")
-                console.print("  [dim]DRY RUN: would probe[/dim]\n")
-                current_model_limits[model_key] = {"limits": {}, "gpu_memory_utilization": gpu_mem_util}
-            else:
-                probe_detail = Text("  Starting probe...", style="dim")
-
-                class _ProbeDisplay:
-                    """Renderable that recomputes header (with live elapsed) on every refresh."""
-                    def __rich_console__(self, console_obj: object, options: object):  # type: ignore[override]
-                        from rich.console import Group
-                        yield from Group(_render_header(), probe_detail).__rich_console__(console_obj, options)  # type: ignore[arg-type]
-
-                def _on_probe_step(ctx: int, kv_dtype: str, phase: str, result: object) -> None:
-                    ctx_k = f"{ctx // 1024}k"
-                    probe_detail.truncate(0)
-                    if phase == "context" and result is None:
-                        probe_detail.append(f"  Testing {ctx_k} kv={kv_dtype}...", style="dim")
-                    elif phase == "context" and result is True:
-                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
-                        probe_detail.append("✓ fits", style="green")
-                    elif phase == "context" and result is False:
-                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} ", style="dim")
-                        probe_detail.append("✗ OOM", style="red")
-                    elif phase == "concurrency" and result is None:
-                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} → testing concurrency...", style="dim")
-                    elif phase == "concurrency":
-                        probe_detail.append(f"  {ctx_k} kv={kv_dtype} → ", style="dim")
-                        probe_detail.append(f"{result} slots", style="bold green" if result else "red")
-
-                with Live(_ProbeDisplay(), console=console, refresh_per_second=1) as live:
-                    def _refresh_live(*a: object) -> None:
-                        _on_probe_step(*a)  # type: ignore[arg-type]
-                        live.refresh()
-
-                    limits_data = probe_model(
-                        model_info=m, gpu_mem_util=gpu_mem_util, vram_total_gb=gpu.vram_total_gb,
-                        on_step=_refresh_live,
-                    )
-
-                lim_path_w = limits_path(m.provider, m.model_name)
-                has_working = any(
-                    v is not None
-                    for entry in limits_data.get("limits", {}).values()
-                    for v in entry.values()
-                )
-                job_dur = _time.monotonic() - job_t0
-                if has_working:
-                    write_limits(lim_path_w, limits_data)
-                    current_model_limits[model_key] = limits_data
-                    write_timing(m.provider, m.model_name, "probe", job_dur)
-                    console.print(f"  [green]✓ Limits saved[/green] ({_fmt_duration(job_dur)} elapsed)")
-
-                    # Preheat flashinfer JIT cache for the service user
-                    from vlx.probe import preheat_jit
-                    console.print("  [dim]Preheating JIT cache for service user...[/dim]")
-                    for kv in ("auto", "fp8"):
-                        ok = preheat_jit(model_info=m, gpu_mem_util=gpu_mem_util, kv_dtype=kv)
-                        tag = "[green]✓[/green]" if ok else "[red]✗[/red]"
-                        console.print(f"    kv={kv} {tag}")
-                    console.print()
-                else:
-                    current_model_limits[model_key] = limits_data
-                    console.print(f"  [yellow]⚠ No working configs found — limits not cached[/yellow] ({_fmt_duration(job_dur)} elapsed)\n")
-
-            completed_jobs += 1
-            passed += 1
-            continue
-
-        # Benchmark job — need limits data
-        if model_key not in current_model_limits:
-            lim_path_r = limits_path(m.provider, m.model_name)
-            existing_lim = read_limits(lim_path_r)
-            if existing_lim:
-                current_model_limits[model_key] = existing_lim
-            else:
-                console.print(f"  [red]No probe data for {m.model_name}, skipping {job_type}[/red]\n")
-                completed_jobs += 1
-                failed += 1
+        # Check cached limits (invalidate if gpu_util changed)
+        lim_path = limits_path(m.provider, m.model_name)
+        if not recalc:
+            existing = read_limits(lim_path)
+            if existing and existing.get("gpu_memory_utilization") == gpu_util:
+                console.print(f"[bold]{m.full_name}[/bold]  [dim](cached — use --recalc to refresh)[/dim]")
+                _print_limits_table(existing, m)
                 continue
 
-        # Check if model has any working configs at all
-        limits_data = current_model_limits[model_key]
-        has_any = any(
-            v is not None
-            for entry in limits_data.get("limits", {}).values()
-            for v in entry.values()
-        )
-        if not has_any:
-            console.print(
-                f"[yellow]  [{completed_jobs}/{total_jobs}] {m.model_name} → {job_type}  |  elapsed {_elapsed()}[/yellow]"
-            )
-            console.print("  [red]✗ Skipped — model has no working configs (all OOM during probe)[/red]\n")
-            completed_jobs += 1
-            failed += 1
+        # Check architecture fields
+        if m.num_kv_heads is None or m.head_dim is None or m.num_layers is None:
+            console.print(f"[bold]{m.full_name}[/bold]")
+            console.print("  [red]Missing architecture fields in config.json[/red]")
+            console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
             continue
 
-        prof = job_type
-        current_job_label = f"{m.model_name} → {prof}"
-
-        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        exp_name = f"{prof}-{timestamp}"
-        exp_dir = BENCHMARKS_DIR / m.model_name / exp_name
-        # Write params to a temp dir — vllm bench sweep creates exp_dir itself
-        import tempfile as _tmpmod
-        from pathlib import Path as _Path
-        _params_dir = _Path(_tmpmod.mkdtemp(prefix="vx-params-"))
-
-        serve_p, bench_p, subcommand = generate_sweep_params(
-            profile=prof, limits=limits_data, output_dir=_params_dir,
+        limits_data = calculate_limits(
+            model_info=m,
+            vram_total_gb=gpu.vram_total_gb,
+            gpu_mem_util=gpu_util,
         )
-        (BENCHMARKS_DIR / m.model_name).mkdir(parents=True, exist_ok=True)
 
-        base_serve = f"{VLLM_BIN} serve {m.path} --dtype bfloat16 --trust-remote-code"
-        qf = get_quant_flag(m.quant_method)
-        if qf:
-            base_serve += f" {qf}"
+        write_limits(lim_path, limits_data)
+        console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {m.quant_method or 'none'})[/dim]")
+        _print_limits_table(limits_data, m)
+        console.print(f"  [green]Saved to {lim_path}[/green]\n")
 
-        sweep_cmd = [
-            str(VLLM_BIN), "bench", "sweep", subcommand,
-            "--serve-cmd", base_serve,
-            "--bench-cmd", f"{VLLM_BIN} bench serve --dataset-name random",
-            "--serve-params", str(serve_p),
-            "--bench-params", str(bench_p),
-            "--num-runs", "3",
-            "--server-ready-timeout", "600",
-            "--output-dir", str(BENCHMARKS_DIR / m.model_name),
-            "--experiment-name", exp_name,
-        ]
 
-        if dry_run:
-            console.print(f"[bold cyan]{_render_header()}[/bold cyan]")
-            console.print(f"  [dim]DRY RUN: {' '.join(sweep_cmd)}[/dim]\n")
-            completed_jobs += 1
-            passed += 1
-            continue
+def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
+    """Print the context × concurrency limit table."""
+    avail = limits_data.get("available_kv_gb")
+    if avail is not None:
+        console.print(f"  [dim]KV cache: {avail} GB available[/dim]")
 
-        serve_count = len(_json.loads(serve_p.read_text()))
-        bench_count = len(_json.loads(bench_p.read_text()))
-        total_combos = serve_count * bench_count
-        num_runs = 3
-        total_results = total_combos * num_runs
+    table = Table(show_header=True, box=None, padding=(0, 2))
+    table.add_column("Context", style="bold")
+    table.add_column("Auto KV", justify="right")
+    table.add_column("FP8 KV", justify="right")
 
-        for attempt in range(3):
-            cmd = sweep_cmd + (["--resume"] if attempt > 0 else [])
-            import tempfile as _tmpfile
-            _stderr_f = _tmpfile.NamedTemporaryFile(
-                prefix="vx-bench-", suffix=".stderr", delete=False,
-            )
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=_stderr_f)
+    for ctx_str in sorted(limits_data.get("limits", {}), key=int):
+        entry = limits_data["limits"][ctx_str]
+        ctx_val = int(ctx_str)
+        ctx_label = f"{ctx_val:,}"
 
-            from rich.progress import TimeElapsedColumn
+        auto_val = entry.get("auto")
+        fp8_val = entry.get("fp8")
 
-            bench_t0 = _time.monotonic()
+        auto_str = f"{auto_val} slots" if auto_val else "[dim]OOM[/dim]"
+        fp8_str = f"{fp8_val} slots" if fp8_val else "[dim]OOM[/dim]"
 
-            def _fmt_eta() -> str:
-                elapsed = _time.monotonic() - bench_t0
-                n = len(list(exp_dir.glob("**/run=*.json"))) if exp_dir.exists() else 0
-                if n < 1 or elapsed < 5:
-                    return "ETA -:--:--"
-                remaining = elapsed / n * (total_results - n)
-                return f"ETA {_fmt_duration(remaining)}"
+        table.add_row(ctx_label, auto_str, fp8_str)
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("{task.completed}/{task.total}"),
-                TimeElapsedColumn(),
-                TextColumn("{task.fields[eta]}"),
-                TextColumn("[dim]{task.fields[detail]}[/dim]"),
-                console=console,
-                refresh_per_second=1,
-            ) as progress:
-                header_task = progress.add_task(
-                    f"[{completed_jobs}/{total_jobs}] {m.model_name} → {prof}",
-                    total=total_results,
-                    detail="starting...",
-                    eta="ETA -:--:--",
-                )
-
-                def _poll_results(tid: object = header_task) -> None:
-                    while proc.poll() is None:
-                        result_files = list(exp_dir.glob("**/run=*.json"))
-                        count = len(result_files)
-                        last = result_files[-1].parent.name if result_files else "waiting..."
-                        progress.update(
-                            tid,  # type: ignore[arg-type]
-                            completed=count,
-                            detail=last,
-                            eta=_fmt_eta(),
-                        )
-                        _time.sleep(3)
-                    result_files = list(exp_dir.glob("**/run=*.json"))
-                    progress.update(tid, completed=len(result_files), detail="done", eta=_fmt_eta())  # type: ignore[arg-type]
-
-                poller = threading.Thread(target=_poll_results, daemon=True)
-                poller.start()
-                proc.wait()
-                poller.join(timeout=5)
-
-            # Log stderr on failure
-            try:
-                with open(_stderr_f.name) as _sf:
-                    _bench_stderr = _sf.read()
-                if proc.returncode != 0 and _bench_stderr.strip():
-                    _stderr_tail = _bench_stderr[-2000:]
-                    from vlx.config import LOGS_DIR
-                    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-                    _log_name = LOGS_DIR / f"bench-{m.model_name}-{prof}-{attempt}.log"
-                    _log_name.write_text(_bench_stderr)
-                    console.print(f"  [dim]stderr saved to {_log_name}[/dim]")
-            except OSError:
-                pass
-            finally:
-                try:
-                    import os as _os2
-                    _os2.unlink(_stderr_f.name)
-                except OSError:
-                    pass
-
-            if proc.returncode == 0:
-                break
-            if attempt < 2:
-                console.print("  [yellow]Retrying with --resume...[/yellow]")
-
-        job_dur = _time.monotonic() - job_t0
-        try:
-            winner, top3 = pick_winner(exp_dir, profile=prof)
-            config_data = {
-                "model": str(m.path),
-                "host": "0.0.0.0",
-                "port": 8888,
-                "dtype": "bfloat16",
-                "trust-remote-code": True,
-                "gpu-memory-utilization": gpu_mem_util,
-            }
-            for key in ["kv_cache_dtype", "enable_prefix_caching", "max_model_len", "max_num_seqs", "max_num_batched_tokens"]:
-                val = winner["params"].get(key)
-                if val is not None:
-                    config_data[key.replace("_", "-")] = val
-
-            cfg_path = profile_path(m.provider, m.model_name, prof)
-            write_profile_yaml(cfg_path, config_data, comment=f"vlx tune — {prof} profile\nBenchmark: {exp_dir}")
-            write_timing(m.provider, m.model_name, prof, job_dur)
-            console.print(f"  [green]✓ {prof} config written[/green]\n")
-            passed += 1
-        except SystemExit:
-            console.print(f"  [yellow]✗ No results for {prof}[/yellow]\n")
-            failed += 1
-
-        completed_jobs += 1
-
-    console.print(f"[bold green]Done.[/bold green]  {passed} passed, {failed} failed, {_elapsed()} elapsed")
+    console.print(table)
+    console.print()
 
 
 def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
@@ -747,52 +464,59 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
     from vlx.serve import start_vllm, stop_vllm, is_vllm_running
     import time
 
+    lock = _lock_or_exit("gpu", f"starting vLLM ({label})")
     cfg = read_profile_yaml(cfg_path) or {}
 
-    if is_vllm_running():
-        console.print("[yellow]vLLM is already running. Stopping first...[/yellow]")
-        stop_vllm()
-        time.sleep(2)
+    try:
+        if is_vllm_running():
+            console.print("[yellow]vLLM is already running. Stopping first...[/yellow]")
+            stop_vllm()
+            time.sleep(2)
 
-    ctx = cfg.get("max-model-len", "?")
-    ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-    console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan]")
-    console.print(f"  context: {ctx_d}  kv: {cfg.get('kv-cache-dtype', 'auto')}"
-                  f"  seqs: {cfg.get('max-num-seqs', '?')}")
+        ctx = cfg.get("max-model-len", "?")
+        ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
+        console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan]")
+        console.print(f"  context: {ctx_d}  kv: {cfg.get('kv-cache-dtype', 'auto')}"
+                      f"  seqs: {cfg.get('max-num-seqs', '?')}")
 
-    start_vllm(cfg_path)
+        start_vllm(cfg_path)
 
-    from urllib.request import urlopen
-    port = cfg.get("port", 8888)
-    health_url = f"http://localhost:{port}/health"
+        from urllib.request import urlopen
+        port = cfg.get("port", 8888)
+        health_url = f"http://localhost:{port}/health"
 
-    console.print(f"  [dim]Waiting for {health_url} ...[/dim]")
-    for i in range(150):  # 300s max
-        time.sleep(2)
-        # Check health endpoint directly — the only reliable signal
-        try:
-            resp = urlopen(health_url, timeout=2)
-            if resp.status == 200:
-                console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
-                console.print(f"  Config: {cfg_path}")
+        from vlx.config import cfg as _cfg
+        fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
+        if not fi_cache.is_dir() or not list(fi_cache.glob("*.so")):
+            console.print("  [yellow]First run — compiling kernels (~5-10 min). Subsequent starts will be fast.[/yellow]")
+
+        console.print(f"  [dim]Waiting for {health_url} ...[/dim]")
+        for i in range(150):  # 300s max
+            time.sleep(2)
+            try:
+                resp = urlopen(health_url, timeout=2)
+                if resp.status == 200:
+                    console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
+                    console.print(f"  Config: {cfg_path}")
+                    from vlx.config import cfg as _cfg
+                    svc = _cfg().service_name
+                    console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
+                    return
+            except Exception:
+                pass
+            if i > 5 and not is_vllm_running():
                 from vlx.config import cfg as _cfg
                 svc = _cfg().service_name
-                console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
-                return
-        except Exception:
-            pass
-        # Detect crash-loop early — if systemd gave up, no point waiting
-        if i > 5 and not is_vllm_running():
-            from vlx.config import cfg as _cfg
-            svc = _cfg().service_name
-            console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
-            raise typer.Exit(1)
-        if i > 0 and i % 15 == 0:
-            console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-    from vlx.config import cfg as _cfg
-    svc = _cfg().service_name
-    console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
-    raise typer.Exit(1)
+                console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
+                raise typer.Exit(1)
+            if i > 0 and i % 15 == 0:
+                console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
+        from vlx.config import cfg as _cfg
+        svc = _cfg().service_name
+        console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
+        raise typer.Exit(1)
+    finally:
+        lock.release()
 
 
 def _pick_number(prompt: str, max_val: int) -> int:
@@ -912,11 +636,9 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
 @app.command()
 def start(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
-    profile: str = typer.Argument(None, help="Profile: interactive, batch, agentic, creative, custom"),
 ):
-    """Start serving a model with a tuned profile."""
+    """Start serving a model — interactive config picker."""
     if model is None:
-        # Interactive model picker
         all_models = scan_models(MODELS_DIR)
         if not all_models:
             console.print("[red]No models found.[/red] Run: vlx download")
@@ -924,52 +646,17 @@ def start(
 
         console.print("\n[bold]Select a model:[/bold]")
         for i, m in enumerate(all_models, 1):
-            tuned = [p for p in PROFILE_NAMES if profile_path(m.provider, m.model_name, p).exists()]
-            status = f"[green]{', '.join(tuned)}[/green]" if tuned else "[dim]not tuned[/dim]"
+            has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
+            status = "[green]limits calculated[/green]" if has_limits else "[dim]run vlx tune first[/dim]"
             console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
 
         choice = _pick_number("\nModel number", len(all_models))
         m = all_models[choice - 1]
-
-        # Profile picker — show tuned profiles + custom option
-        tuned = [p for p in PROFILE_NAMES if profile_path(m.provider, m.model_name, p).exists()]
-        has_probe = read_limits(limits_path(m.provider, m.model_name)) is not None
-        options = list(tuned)
-        if has_probe:
-            options.append("custom")
-
-        if not options:
-            console.print(f"\n[red]No tuned profiles for {m.model_name}.[/red] Run: vlx tune {m.model_name}")
-            raise typer.Exit(1)
-
-        console.print("\n[bold]Select a profile:[/bold]")
-        for i, p in enumerate(options, 1):
-            desc = PROFILE_DESCRIPTIONS.get(p, "configure each parameter manually")
-            console.print(f"  {i}) {p}  — {desc}")
-
-        pchoice = _pick_number("\nProfile number", len(options))
-        profile = options[pchoice - 1]
-        console.clear()
     else:
         m = _resolve_model(model)
-        if profile is None:
-            profile = "interactive"
 
-    if profile == "custom":
-        cfg_path = _custom_config(m)
-        _launch_vllm(cfg_path, "custom config")
-        return
-
-    if profile not in PROFILE_NAMES:
-        console.print(f"[red]Unknown profile '{profile}'.[/red] Choose: {', '.join(PROFILE_NAMES + ['custom'])}")
-        raise typer.Exit(1)
-
-    cfg_path = profile_path(m.provider, m.model_name, profile)
-    if not cfg_path.exists():
-        console.print(f"[red]No {profile} profile for {m.model_name}.[/red] Run: vlx tune {m.model_name} {profile}")
-        raise typer.Exit(1)
-
-    _launch_vllm(cfg_path, f"{profile} profile")
+    cfg_path = _custom_config(m)
+    _launch_vllm(cfg_path, m.model_name)
 
 
 @app.command()
@@ -977,12 +664,16 @@ def stop():
     """Stop the vLLM service."""
     from vlx.serve import stop_vllm, is_vllm_running
 
-    if not is_vllm_running():
-        console.print("[dim]vLLM is not running.[/dim]")
-        return
+    lock = _lock_or_exit("gpu", "stopping vLLM")
+    try:
+        if not is_vllm_running():
+            console.print("[dim]vLLM is not running.[/dim]")
+            return
 
-    stop_vllm()
-    console.print("[green]vLLM stopped.[/green]")
+        stop_vllm()
+        console.print("[green]vLLM stopped.[/green]")
+    finally:
+        lock.release()
 
 
 @app.command()
@@ -1038,6 +729,11 @@ def fan(
 
     def _start_daemon(qs: int, qe: int, qm: int) -> None:
         _stop_daemon()
+        # Wait for old daemon to release its fan lock (cleanup in finally block)
+        from vlx.lock import wait_for_release
+        if not wait_for_release("fan", timeout=5.0):
+            console.print("[red]Old fan daemon did not release lock in time.[/red]")
+            raise typer.Exit(1)
         import subprocess
         import sys
         proc = subprocess.Popen(
@@ -1100,7 +796,9 @@ def fan(
             console.print("[red]Fan speed must be 30-100.[/red]")
             raise typer.Exit(1)
         _stop_daemon()
+        lock = _lock_or_exit("fan", f"setting fan to {percent}%")
         set_fan_speed(percent)
+        lock.release()
         actual = get_fan_speed()
         console.print(f"[green]Fan set to {percent}%[/green] (reading: {actual}%)")
         return
@@ -1138,7 +836,9 @@ def fan(
             console.print(f"[red]Fan speed must be 30-100, got {val}.[/red]")
             raise typer.Exit(1)
         _stop_daemon()
+        lock = _lock_or_exit("fan", f"setting fan to {val}%")
         set_fan_speed(val)
+        lock.release()
         console.print(f"[green]Fan set to {val}%[/green]")
         return
 
@@ -1167,14 +867,6 @@ def fan(
     console.print(f"  Quiet {qs:02d}:00-{qe:02d}:00 (max {qm}%), otherwise 100%")
 
 
-PROFILE_DESCRIPTIONS = {
-    "interactive": "Low-latency single-user chat — optimized for fastest time-to-first-token (TTFT)",
-    "batch": "Maximum throughput for many requests — optimized for tokens/sec across concurrent users",
-    "agentic": "Long-context tool-use / RAG — optimized for TTFT with large input contexts",
-    "creative": "Long-form generation (stories, code) — optimized for smooth token-by-token output (TPOT)",
-}
-
-
 @app.command()
 def status():
     """Show current vLLM serving status."""
@@ -1195,23 +887,6 @@ def status():
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
 
-    # Detect profile from config filename
-    profile_name = "unknown"
-    for p in PROFILE_NAMES + ["custom"]:
-        if f".{p}.yaml" in target.name:
-            profile_name = p
-            break
-
-    # Look up model info for max context window
-    model_max_ctx = "?"
-    try:
-        models = scan_models(MODELS_DIR)
-        matched = [m for m in models if m.model_name == model_name]
-        if matched:
-            model_max_ctx = f"{matched[0].max_position_embeddings // 1024}k"
-    except Exception:
-        pass
-
     ctx = cfg.get("max-model-len", "?")
     ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
     seqs = cfg.get("max-num-seqs", "?")
@@ -1223,22 +898,12 @@ def status():
     gpu_str = f"{gpu_util:.1%}" if isinstance(gpu_util, float) else str(gpu_util)
 
     console.print("\n[bold green]vLLM is running[/bold green]")
-    from rich.text import Text as _Text
-    _model_line = _Text("  ")
-    _model_line.append("Model", style="bold")
-    _model_line.append(f"      {model_name}  (supports up to {model_max_ctx} context)")
-    console.print(_model_line)
-    console.print(f"  [bold]Profile[/bold]    {profile_name}")
+    console.print(f"  [bold]Model[/bold]      {model_name}")
     console.print(f"  [bold]Endpoint[/bold]   http://localhost:{port}/v1")
     console.print()
 
-    desc = PROFILE_DESCRIPTIONS.get(profile_name, "")
-    if desc:
-        console.print(f"  [cyan]{desc}[/cyan]")
-        console.print()
-
     console.print("  [bold]Serving config[/bold]")
-    console.print(f"    Context window:    {ctx_display}  (max tokens per request, model supports {model_max_ctx})")
+    console.print(f"    Context window:    {ctx_display}")
     console.print(f"    Concurrent slots:  {seqs}  (max in-flight requests)")
     console.print(f"    KV cache dtype:    {kv}")
     if prefix:
@@ -1283,6 +948,8 @@ def init():
         _ok(f"CUDA        {gpu.cuda}")
     except Exception:
         _fail("GPU         nvidia-smi not found or no GPU detected")
+        _fail("            vlx requires an NVIDIA GPU with drivers installed")
+        _fail("            Install drivers: https://www.nvidia.com/drivers")
 
     # ── CUDA toolkit ──
     cuda = _discover_cuda_home()
@@ -1290,7 +957,9 @@ def init():
     if nvcc:
         _ok(f"nvcc        {cuda}")
     else:
-        _warn(f"nvcc        not on PATH (using {cuda})")
+        _fail("nvcc        not on PATH — needed for first-run JIT compilation")
+        _fail("            Install: sudo apt install nvidia-cuda-toolkit")
+        _warn(f"            using fallback: {cuda}")
 
     # ── vLLM ──
     root = _discover_vllm_root()
@@ -1309,7 +978,8 @@ def init():
         except Exception:
             _ok(f"vLLM        found at {root}")
     else:
-        _fail("vLLM        not found")
+        _fail("vLLM        not found. Install it first: pip install vllm")
+        _fail("            See: https://docs.vllm.ai/en/latest/getting_started/installation.html")
         root_input = typer.prompt("  vLLM root path", default="/opt/vllm")
         root = _Path(root_input)
 
@@ -1327,7 +997,9 @@ def init():
     if svc_path.exists():
         _ok(f"systemd     {svc_name}.service (user: {svc_user})")
     else:
-        _warn(f"systemd     no {svc_name}.service found")
+        _fail("systemd     no vLLM systemd service found (required for vlx start/stop)")
+        _fail(f"            Create /etc/systemd/system/{svc_name}.service with:")
+        _fail("            [Service] ExecStart=/opt/vllm/venv/bin/vllm serve ...")
 
     # ── Port ──
     port = _discover_port(root)
@@ -1364,29 +1036,42 @@ def init():
         _ok(f"Config written to {CONFIG_FILE}")
 
     # ── Welcome banner ──
-    banner_path = _Path("/etc/profile.d/vlx-welcome.sh")
     banner_src = _Path(__file__).parent / "welcome.sh"
-    has_banner = banner_path.exists()
+    banner_dest = CONFIG_FILE.parent / "welcome.sh"
+    _marker = "# vlx login banner"
+
+    # Detect shell rc file
+    import os
+    _shell = _Path(os.environ.get("SHELL", "/bin/bash")).name
+    if _shell == "zsh":
+        _rc = _Path.home() / ".zshrc"
+    elif _shell == "fish":
+        _rc = _Path.home() / ".config" / "fish" / "config.fish"
+    else:
+        _rc = _Path.home() / ".bashrc"
+
+    _source_line = f'[ -f "{banner_dest}" ] && source "{banner_dest}"'
+    _rc_has_marker = _rc.exists() and _marker in _rc.read_text()
+    has_banner = banner_dest.exists() and _rc_has_marker
 
     if has_banner:
-        console.print(f"  [dim]Login banner already installed at {banner_path}[/dim]")
+        console.print(f"  [dim]Login banner already installed ({_rc.name} → {banner_dest})[/dim]")
         if typer.confirm("  Reinstall login banner?", default=False):
-            subprocess.run(
-                ["sudo", "cp", str(banner_src), str(banner_path)],
-                check=True,
-            )
-            _ok(f"Banner updated at {banner_path}")
+            import shutil
+            shutil.copy2(banner_src, banner_dest)
+            _ok(f"Banner updated at {banner_dest}")
     else:
         console.print()
         console.print("  [bold]Login banner[/bold]")
         console.print("  Shows GPU status, model, and commands on every SSH login.")
         console.print("  Requires: gum")
         if typer.confirm("  Install login banner?", default=True):
-            subprocess.run(
-                ["sudo", "cp", str(banner_src), str(banner_path)],
-                check=True,
-            )
-            _ok(f"Banner installed at {banner_path}")
+            import shutil
+            shutil.copy2(banner_src, banner_dest)
+            if not _rc_has_marker:
+                with open(_rc, "a") as f:
+                    f.write(f"\n{_marker}\n{_source_line}\n")
+            _ok(f"Banner installed ({_rc.name} → {banner_dest})")
         else:
             console.print("  [dim]Skipped.[/dim]")
 
@@ -1444,7 +1129,7 @@ def doctor():
         else:
             _fail("nvcc not working", "Install CUDA toolkit or check /usr/local/cuda/bin/nvcc")
     except Exception:
-        _fail("nvcc not found", "Install CUDA toolkit")
+        _fail("nvcc not found", "Install: sudo apt install nvidia-cuda-toolkit  OR  https://developer.nvidia.com/cuda-downloads")
 
     # vLLM
     try:
@@ -1466,7 +1151,7 @@ def doctor():
             pass
         _ok(f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, {mem_used} MiB used)")
     except Exception:
-        _fail("GPU not accessible", "Check nvidia-smi")
+        _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
 
     # Service user
     from vlx.config import cfg as _cfg
@@ -1493,7 +1178,8 @@ def doctor():
         else:
             _ok("systemd unit configured correctly")
     else:
-        _fail(f"No systemd unit at {svc_path}")
+        _fail(f"No systemd unit at {svc_path}",
+              "Create one: https://docs.vllm.ai  or see vlx docs/troubleshooting.md")
 
     # .env
     env_path = VLLM_ROOT / "configs" / ".env"
@@ -1565,7 +1251,8 @@ def doctor():
     if is_vllm_running():
         _ok(f"vLLM serving on port {_port}")
     elif port_in_use:
-        _fail(f"Port {_port} in use but vLLM not running — something else is bound")
+        _fail(f"Port {_port} in use but vLLM not running — something else is bound",
+              f"Check: sudo lsof -i :{_port}  then stop the other service or change port in ~/.config/vx/config.yaml")
     else:
         _ok(f"Port {_port} available")
 
@@ -1577,6 +1264,20 @@ def doctor():
             _warn(f"vllm.log is {size_mb:.0f} MB", "Consider truncating or adding log rotation")
         else:
             _ok(f"vllm.log ({size_mb:.0f} MB)")
+
+    # Multi-user messaging
+    import grp
+    try:
+        tty_members = grp.getgrnam("tty").gr_mem
+        import os
+        me = os.environ.get("USER", "")
+        if me in tty_members:
+            _ok("tty group (terminal messaging between users)")
+        else:
+            _warn(f"'{me}' not in tty group — vlx can't DM other users",
+                  f"sudo usermod -aG tty {me}  (then re-login)")
+    except KeyError:
+        _warn("tty group not found")
 
     # Models
     all_models = scan_models(MODELS_DIR)

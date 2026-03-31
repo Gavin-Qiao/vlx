@@ -1,7 +1,7 @@
 #!/bin/bash
 # vlx login banner — reads from vlx config (single source of truth)
-# Installed by: vlx init
-# Remove with:  sudo rm /etc/profile.d/vlx-welcome.sh
+# Installed by: vlx init → ~/.config/vx/welcome.sh
+# Remove with:  rm ~/.config/vx/welcome.sh  (and delete the source line from your shell rc)
 
 [ -z "$BASH_VERSION" ] && [ -z "$ZSH_VERSION" ] && return 0
 command -v gum &>/dev/null || return 0
@@ -122,7 +122,7 @@ _sep="$(gum style --foreground 238 '──────────────�
 
 _sec_cmds="$(gum join --vertical \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx download [model]')"    "$(gum style --foreground 240 'search & download from HuggingFace')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx start [model] [prof]')" "$(gum style --foreground 240 'start serving (interactive picker)')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx start [model]')"        "$(gum style --foreground 240 'start serving (interactive config)')")" \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx stop')"              "$(gum style --foreground 240 'stop the vLLM service')")" \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx status')"            "$(gum style --foreground 240 'show what is currently serving')")" \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vlx models')"            "$(gum style --foreground 240 'list models with limits & profiles')")" \

@@ -36,7 +36,7 @@ def test_fan_module_imports():
     import vlx.fan as _fan
     from vlx.fan import read_state, compute_fan_speed  # noqa: F401
     from vlx.fan import (  # noqa: F401
-        EMERGENCY_TEMP, MIN_FAN, TEMP_LOW, TEMP_HIGH,
+        EMERGENCY_TEMP, MIN_FAN, HYSTERESIS, MAX_RAMP_PER_CYCLE,
         MAX_CONSECUTIVE_FAILURES, FAILURE_RESET_THRESHOLD,
         POLL_INTERVAL, SUBPROCESS_TIMEOUT,
     )

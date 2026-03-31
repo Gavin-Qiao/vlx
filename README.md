@@ -10,7 +10,7 @@ Probe limits. Benchmark profiles. Tune configs. Serve models. Control fans.
 ![vLLM 0.18+](https://img.shields.io/badge/vLLM-0.18+-ff6f00?style=flat-square)
 ![Ruff](https://img.shields.io/badge/code%20style-ruff-d4aa00?style=flat-square&logo=ruff&logoColor=white)
 ![mypy](https://img.shields.io/badge/type%20checked-mypy-blue?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-112%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-126%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
@@ -33,7 +33,7 @@ vlx init                  # auto-discover vLLM installation
 vlx                       # dashboard
 vlx download <model>      # download from HuggingFace
 vlx tune <model>          # probe limits + benchmark
-vlx start <model>         # serve with a tuned profile
+vlx start <model>         # configure & serve
 ```
 
 ---
@@ -47,7 +47,7 @@ vlx start <model>         # serve with a tuned profile
 | `vlx download [model]` | Search and download a model from HuggingFace |
 | `vlx models [name]` | List models or show detail (fuzzy match) |
 | `vlx tune <model> [profile]` | Probe context/concurrency limits, then benchmark |
-| `vlx start [model] [profile]` | Start serving — interactive picker if no args |
+| `vlx start [model]` | Configure and start serving — interactive picker if no args |
 | `vlx stop` | Stop the vLLM service |
 | `vlx status` | Show current serving config |
 | `vlx fan [auto\|off\|30-100]` | GPU fan control with temp-based curve |
@@ -70,19 +70,6 @@ port: 8888
 ```
 
 Run `vlx init` to regenerate from auto-discovery.
-
----
-
-## Benchmark Profiles
-
-vlx benchmarks each model across four workload profiles using `vllm bench sweep`:
-
-| Profile | Optimizes | Use Case |
-|:--------|:----------|:---------|
-| **interactive** | TTFT | Single-user chat — fastest first token |
-| **batch** | Throughput | Many concurrent requests — max tokens/sec |
-| **agentic** | TTFT @ max context | Tool-use and RAG — fast response with large inputs |
-| **creative** | TPOT | Long-form generation — smooth token-by-token output |
 
 ---
 
@@ -114,27 +101,55 @@ Requires [Coolbits](docs/troubleshooting.md#coolbits-setup) enabled in X11 confi
 ## How It Works
 
 ```
-vlx tune <model>
+vlx tune <model>           # calculate limits (instant, no GPU needed)
    |
-   +-- 1. Probe: binary search for max context x concurrency x kv-dtype
-   |        (tries each combination against the real GPU)
+   +-- Read model architecture (config.json: kv_heads, head_dim, layers)
+   +-- Read GPU info (nvidia-smi: total VRAM)
+   +-- KV formula: available_kv = VRAM × util − model_weights − overhead
+   +-- Output: context × concurrency table for auto and fp8 KV dtypes
+
+vlx start <model>          # interactive config picker → serve
    |
-   +-- 2. Benchmark: sweep across the viable parameter space
-   |        (vllm bench sweep, measures TTFT/TPOT/throughput)
-   |
-   +-- 3. Config: pick the best params per profile, write YAML
-            (ready for vlx start)
+   +-- Pick context window, KV dtype, concurrent slots from limits
+   +-- Write config YAML, start vLLM via systemd
 ```
 
 ---
 
-## Requirements
+## Prerequisites
 
-- Python 3.12+
-- NVIDIA GPU with `nvidia-smi`
-- vLLM 0.18+ installed (pip, conda, or custom venv)
-- systemd (for service management)
-- `sudo` access (for systemctl, fan control)
+You need these before installing vlx:
+
+**1. NVIDIA GPU + drivers**
+
+```bash
+nvidia-smi                        # should show your GPU
+```
+
+No output? Install drivers from [nvidia.com/drivers](https://www.nvidia.com/drivers).
+
+**2. CUDA toolkit** (needed for first-run JIT compilation)
+
+```bash
+nvcc --version                    # should show CUDA version
+# If missing:
+sudo apt install nvidia-cuda-toolkit
+```
+
+**3. vLLM 0.18+**
+
+```bash
+pip install vllm                  # or: conda install -c conda-forge vllm
+vllm --version
+```
+
+See [vLLM installation guide](https://docs.vllm.ai/en/latest/getting_started/installation.html) for detailed options.
+
+**4. systemd** (for service management)
+
+vlx uses systemd to manage the vLLM service. Most Linux servers have it. You'll need a service unit — `vlx init` will detect an existing one, or see [troubleshooting](docs/troubleshooting.md) for setup.
+
+**5. sudo access** (for systemctl, fan control)
 
 ---
 
@@ -142,7 +157,8 @@ vlx tune <model>
 
 ```bash
 pip install vlx
-vlx init
+vlx init                          # scans GPU, vLLM, CUDA, systemd — writes config
+vlx doctor                        # verify everything is ready
 ```
 
 Or from source:
@@ -155,10 +171,19 @@ sudo ln -sf ~/vlx/.venv/bin/vlx /usr/local/bin/vlx
 vlx init
 ```
 
+**Multi-user:** Install to a shared venv so all users can run vlx:
+
+```bash
+sudo uv venv /opt/vlx-app --python 3.12
+sudo uv pip install --python /opt/vlx-app/bin/python vlx
+sudo ln -sf /opt/vlx-app/bin/vlx /usr/local/bin/vlx
+# Each user runs: vlx init
+```
+
 **Development:**
 
 ```bash
-uv run pytest tests/              # 112 tests
+uv run pytest tests/              # 126 tests
 uv run ruff check src/ tests/     # linting
 uv run mypy src/vlx/              # type checking
 ```

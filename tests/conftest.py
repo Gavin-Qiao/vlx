@@ -17,6 +17,7 @@ def fake_model_dir(tmp_path: Path) -> Path:
         "text_config": {
             "max_position_embeddings": 131072,
             "num_key_value_heads": 4,
+            "num_attention_heads": 32,
             "hidden_size": 4096,
             "num_hidden_layers": 32,
         },
@@ -40,6 +41,10 @@ def fake_moe_model_dir(tmp_path: Path) -> Path:
         "text_config": {
             "max_position_embeddings": 262144,
             "num_experts": 256,
+            "num_key_value_heads": 8,
+            "num_attention_heads": 32,
+            "hidden_size": 4096,
+            "num_hidden_layers": 64,
         },
     }
     (model_dir / "config.json").write_text(json.dumps(config))
@@ -53,9 +58,10 @@ def fake_limits() -> dict:
     """Sample limits.json data."""
     return {
         "model_path": "/opt/vllm/models/testprovider/TestModel-7B-FP8",
-        "probed_at": "2026-03-27T10:00:00",
+        "calculated_at": "2026-03-27T10:00:00",
         "vram_total_gb": 47.8,
-        "gpu_memory_utilization": 0.958,
+        "gpu_memory_utilization": 0.90,
+        "available_kv_gb": 12.3,
         "model_size_gb": 7.2,
         "quant_method": "fp8",
         "architecture": "TestForCausalLM",
