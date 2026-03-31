@@ -8,15 +8,15 @@ command -v gum &>/dev/null || return 0
 
 # ── Read vserve config ──────────────────────────────────
 
-_vlx_cfg="$HOME/.config/vserve/config.yaml"
+_vserve_cfg="$HOME/.config/vserve/config.yaml"
 _vllm_root="/opt/vllm"
 _svc_name="vllm"
 _port="8888"
 
-if [ -f "$_vlx_cfg" ]; then
-    _vllm_root="$(grep '^vllm_root:' "$_vlx_cfg" 2>/dev/null | sed 's/vllm_root: *//')" || _vllm_root="/opt/vllm"
-    _svc_name="$(grep '^service_name:' "$_vlx_cfg" 2>/dev/null | sed 's/service_name: *//')" || _svc_name="vllm"
-    _port="$(grep '^port:' "$_vlx_cfg" 2>/dev/null | sed 's/port: *//')" || _port="8888"
+if [ -f "$_vserve_cfg" ]; then
+    _vllm_root="$(grep '^vllm_root:' "$_vserve_cfg" 2>/dev/null | sed 's/vllm_root: *//')" || _vllm_root="/opt/vllm"
+    _svc_name="$(grep '^service_name:' "$_vserve_cfg" 2>/dev/null | sed 's/service_name: *//')" || _svc_name="vllm"
+    _port="$(grep '^port:' "$_vserve_cfg" 2>/dev/null | sed 's/port: *//')" || _port="8888"
 fi
 
 # ── Gather data ──────────────────────────────────────
@@ -139,7 +139,7 @@ _body="$(gum join --vertical \
 gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2" "$_body"
 
 unset -f _lbl _mkbar
-unset _vlx_cfg _vllm_root _svc_name _port
+unset _vserve_cfg _vllm_root _svc_name _port
 unset _s _m _mc _active _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
 unset _proc_data _ph _prows _row

@@ -13,7 +13,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.13
       - run: uv sync --dev
-      - run: uvx ruff check src/ tests/
+      - run: uv run ruff check src/ tests/
       - run: uv run mypy src/vserve/ --ignore-missing-imports
       - run: uv run pytest tests/ -q --tb=short
 

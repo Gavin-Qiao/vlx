@@ -25,7 +25,7 @@ dependencies = [
     "nvidia-ml-py>=13.595.45",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["pytest>=8", "pytest-mock>=3", "ruff>=0.15", "mypy>=1.15", "types-PyYAML>=6", "types-requests>=2.33"]
 
 [project.urls]
