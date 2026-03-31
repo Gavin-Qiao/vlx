@@ -231,34 +231,39 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
     models_dir = _cfg().models_dir
     api = HfApi()
 
-    # Direct download if full model ID provided
+    # Check if argument is an existing repo
     if model_id and "/" in model_id:
-        _download_model(model_id, models_dir, snapshot_download)
-        return
+        if api.repo_exists(model_id, repo_type="model"):
+            _download_model(model_id, models_dir, snapshot_download, api)
+            return
+        # Not found — fall through to keyword search
 
     use_gum = _has_gum()
 
     # Search loop
     query = model_id or ""
+    results: list = []
     while True:
         if not query:
             if use_gum:
                 query = _gum_input("Search HuggingFace (e.g. qwen 27b fp8)") or ""
             else:
-                query = typer.prompt("\nSearch HuggingFace")
+                query = typer.prompt("\nSearch HuggingFace (Ctrl-C to quit)")
             if not query:
+                # Esc/Ctrl-C in gum input — exit
+                return
+
+        # Only re-search if we don't already have results for this query
+        if not results:
+            console.print(f"[dim]Searching '{query}'...[/dim]")
+            results = list(api.list_models(search=query, sort="downloads", limit=20))
+
+            if not results:
+                console.print(f"[yellow]No results for '{query}'.[/yellow]")
+                query = ""
                 continue
 
-        console.print(f"[dim]Searching '{query}'...[/dim]")
-        results = list(api.list_models(search=query, sort="downloads", limit=20))
-
-        if not results:
-            console.print(f"[yellow]No results for '{query}'.[/yellow]")
-            query = ""
-            continue
-
         if use_gum:
-            # Build display lines for gum filter
             lines = []
             for m in results:
                 dl = f"{m.downloads:,}" if m.downloads else "?"
@@ -267,13 +272,16 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
             selected = _gum_filter(lines, header=f"Results for '{query}' — Esc to search again")
             if selected is None:
                 query = ""
+                results = []
                 continue
 
             picked_id = selected.split("  (")[0]
-            _download_model(picked_id, models_dir, snapshot_download)
-            return
+            if _download_model(picked_id, models_dir, snapshot_download, api):
+                return
+            # User backed out of variant picker — re-show same results
+            console.clear()
+            continue
         else:
-            # Fallback: numbered list
             console.print()
             for i, m in enumerate(results, 1):
                 dl = f"{m.downloads:,}" if m.downloads else "?"
@@ -286,15 +294,60 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
             try:
                 idx = int(answer)
                 if 1 <= idx <= len(results):
-                    _download_model(results[idx - 1].id, models_dir, snapshot_download)
-                    return
+                    if _download_model(results[idx - 1].id, models_dir, snapshot_download, api):
+                        return
+                    # User backed out — re-show same results
+                    console.clear()
+                    continue
             except ValueError:
                 pass
             query = answer
+            results = []
 
 
-def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object) -> None:
-    """Download a single model by its HuggingFace ID."""
+def _pick_variants(variants: list) -> list:
+    """Interactive variant selection. Returns list of selected Variant objects."""
+    import subprocess
+
+    if _has_gum():
+        from vlx.variants import format_variant_line
+        lines = [format_variant_line(v, index=i) for i, v in enumerate(variants, 1)]
+        cmd = [
+            "gum", "choose", "--no-limit",
+            "--header", "Select variant(s) — space to toggle, enter to confirm:",
+            *lines,
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+        selected_lines = r.stdout.strip().split("\n")
+        selected = []
+        for line in selected_lines:
+            for i, v in enumerate(variants, 1):
+                if f"{i})" in line:
+                    selected.append(v)
+                    break
+        return selected
+    else:
+        prompt = "Select variant(s) (e.g. 1 or 1,2)"
+        answer = typer.prompt(prompt, default="")
+        if not answer:
+            return []
+        indices: list[int] = []
+        for part in answer.replace(",", " ").split():
+            try:
+                idx = int(part)
+                if 1 <= idx <= len(variants):
+                    indices.append(idx)
+            except ValueError:
+                pass
+        return [variants[i - 1] for i in indices]
+
+
+def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
+    """Download a single model by its HuggingFace ID. Returns True if download happened."""
+    from vlx.variants import fetch_repo_variants, format_variant_line, _format_bytes
+
     parts = model_id.split("/")
     if len(parts) != 2:
         console.print(f"[red]Invalid model ID '{model_id}'.[/red] Expected: provider/model-name")
@@ -306,7 +359,46 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     if local_dir.exists() and any(local_dir.iterdir()):
         console.print(f"[yellow]{model_id} already exists at {local_dir}[/yellow]")
         if not typer.confirm("Re-download?", default=False):
-            return
+            return True  # not a back-navigation, user chose to keep existing
+
+    # --- Variant picker ---
+    console.print(f"\n[bold]{model_id}[/bold]\n")
+    console.print("[dim]Fetching file list...[/dim]")
+
+    variants, shared = fetch_repo_variants(model_id, api)
+
+    if not variants:
+        console.print("[yellow]No weight files found in this repo.[/yellow]")
+        raise typer.Exit(1)
+
+    # Show shared files summary
+    shared_size = sum(shared.values())
+    shared_names = ", ".join(list(shared.keys())[:3])
+    if len(shared) > 3:
+        shared_names += ", ..."
+    console.print(f"  Shared: {shared_names} ({_format_bytes(shared_size)}, {len(shared)} files)\n")
+
+    # Show variants
+    for i, v in enumerate(variants, 1):
+        console.print(format_variant_line(v, index=i))
+
+    console.print()
+
+    # Selection
+    selected_variants = _pick_variants(variants)
+    if not selected_variants:
+        return False  # user backed out — navigate back
+
+    # Confirmation
+    total = sum(v.total_bytes for v in selected_variants) + shared_size
+    console.print(f"\n  Total download: [bold]{_format_bytes(total)}[/bold]")
+    if not typer.confirm("  Download?", default=True):
+        return False  # user declined — navigate back
+
+    # Build allow_patterns
+    allow_files: list[str] = list(shared.keys())
+    for v in selected_variants:
+        allow_files.extend(v.files.keys())
 
     console.print(f"\n[bold]Downloading[/bold] {model_id}")
     console.print(f"  To: {local_dir}\n")
@@ -316,7 +408,6 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     try:
         lock.acquire()
     except LockHeld as exc:
-        # Same model is being downloaded — wait for it instead of failing
         import os
         me = os.environ.get("USER", "?")
         if exc.info and exc.info.user != me:
@@ -330,7 +421,6 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         if not wait_for_release(lock_name, timeout=7200):
             console.print("[red]Timed out waiting for download.[/red]")
             raise typer.Exit(1)
-        # Check if model landed successfully
         if local_dir.exists() and any(local_dir.iterdir()):
             from vlx.models import detect_model
             info = detect_model(local_dir)
@@ -338,14 +428,14 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
                 console.print(f"\n[green]{info.full_name} is ready[/green] (downloaded by {exc.info.user if exc.info else 'another user'})")
             else:
                 console.print(f"\n[green]{model_id} is ready.[/green]")
-            return
+            return True
         console.print("[yellow]Download seems to have failed. Retrying...[/yellow]")
-        # Fall through to download it ourselves
 
     try:
         snapshot_download(  # type: ignore[operator]
             repo_id=model_id,
             local_dir=local_dir,
+            allow_patterns=allow_files,
         )
     except Exception as e:
         console.print(f"[red]Download failed:[/red] {e}")
@@ -363,6 +453,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         console.print(f"\nNext: vlx tune {model_name}")
     else:
         console.print(f"\n[green]Downloaded to {local_dir}[/green]")
+    return True
 
 
 @app.command()
