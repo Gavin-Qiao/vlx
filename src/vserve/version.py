@@ -7,7 +7,6 @@ once every 24 hours via a daemon thread — zero latency impact on CLI commands.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import urllib.error
