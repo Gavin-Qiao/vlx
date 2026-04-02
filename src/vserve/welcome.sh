@@ -131,9 +131,26 @@ _sec_cmds="$(gum join --vertical \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve doctor')"            "$(gum style --foreground 240 'check system readiness')")" \
 )"
 
+# ── Update check ────────────────────────────────────
+_update_cache="$HOME/.cache/vserve/update-check.json"
+_sec_update=""
+if [ -f "$_update_cache" ]; then
+    _uc_current="$(grep -o '"current" *: *"[^"]*"' "$_update_cache" | sed 's/.*: *"//;s/"//')"
+    _uc_latest="$(grep -o '"latest" *: *"[^"]*"' "$_update_cache" | sed 's/.*: *"//;s/"//')"
+    if [ -n "$_uc_current" ] && [ -n "$_uc_latest" ] && [ "$_uc_current" != "$_uc_latest" ]; then
+        _sec_update="$(gum join --vertical \
+            "" \
+            "$(gum join --horizontal \
+                "$(gum style --foreground 220 --bold "  Update available:")" \
+                "$(gum style --foreground 252 " $_uc_current →")" \
+                "$(gum style --foreground 78 --bold " $_uc_latest")")" \
+            "$(gum style --foreground 243 "  Run: vserve update")")"
+    fi
+fi
+
 _body="$(gum join --vertical \
     "" "$_header" "" "$_sec_server" "" "$_sep" "" "$_sec_gpu" "" \
-    "$_sec_proc" "" "$_sep" "" "$_sec_cmds" "" \
+    "$_sec_proc" "" "$_sep" "" "$_sec_cmds" "$_sec_update" "" \
 )"
 
 gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2" "$_body"
@@ -143,4 +160,5 @@ unset _vserve_cfg _vllm_root _svc_name _port
 unset _s _m _mc _active _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
 unset _proc_data _ph _prows _row
-unset _header _status _sec_server _sec_gpu _sec_proc _sec_cmds _sep _body
+unset _update_cache _uc_current _uc_latest
+unset _header _status _sec_server _sec_gpu _sec_proc _sec_cmds _sep _sec_update _body

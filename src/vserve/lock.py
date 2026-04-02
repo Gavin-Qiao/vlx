@@ -64,6 +64,12 @@ class VserveLock:
 
     def acquire(self) -> None:
         LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
+        # mkdir mode is masked by umask, and exist_ok skips existing dirs.
+        # Ensure sticky + world-writable so any user can create lock files.
+        try:
+            os.chmod(str(LOCK_DIR), 0o1777)
+        except PermissionError:
+            pass
         # A prior sudo run may have left a root-owned lock file.
         # Try to fix permissions, or delete and recreate if stale.
         if self._path.exists():
@@ -82,7 +88,13 @@ class VserveLock:
                         f"Cannot acquire lock: {self._path} is owned by another user. "
                         f"Run: sudo rm {self._path}"
                     )
-        self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT, 0o666)
+        try:
+            self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT, 0o666)
+        except PermissionError:
+            raise PermissionError(
+                f"Cannot create lock file: {self._path}\n"
+                f"Run: sudo chmod 1777 {LOCK_DIR}"
+            ) from None
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError):
@@ -152,7 +164,7 @@ def wait_for_release(name: str, timeout: float = 5.0) -> bool:
             lock.acquire()
             lock.release()
             return True
-        except LockHeld:
+        except (LockHeld, PermissionError):
             time.sleep(0.2)
     return False
 

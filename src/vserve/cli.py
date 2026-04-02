@@ -42,6 +42,13 @@ def _lock_or_exit(name: str, description: str) -> VserveLock:
                 f"{me} is waiting for {name} (you: {exc.info.command})",
             )
         raise typer.Exit(1) from None
+    except PermissionError as exc:
+        console.print(Panel(
+            f"[bold]{exc}[/bold]",
+            title="[red]vserve: permission denied[/red]",
+            border_style="red",
+        ))
+        raise typer.Exit(1) from None
     return lock
 
 
@@ -64,10 +71,26 @@ def _resolve_model(query: str) -> ModelInfo:
     return matches[0]
 
 
+def _show_update_notice() -> None:
+    """Print Wrangler-style update box if a newer version is available."""
+    from vserve.version import update_available
+    info = update_available()
+    if info:
+        console.print(Panel(
+            f"  vserve [bold]{info.current}[/bold] → [bold green]{info.latest}[/bold green]\n"
+            f"  Run [cyan]vserve update[/cyan] to upgrade",
+            border_style="yellow",
+        ))
+
+
 @app.callback(invoke_without_command=True)
 def dashboard(ctx: typer.Context):
     """Show status dashboard when called with no subcommand."""
     if ctx.invoked_subcommand is not None:
+        from vserve.version import background_refresh
+        background_refresh()
+        if ctx.invoked_subcommand not in ("version", "update"):
+            ctx.call_on_close(_show_update_notice)
         return
 
     if not CONFIG_FILE.exists():
@@ -134,6 +157,69 @@ def dashboard(ctx: typer.Context):
         cmd_tbl,
     )
     console.print(Panel(body, title="[bold cyan]vserve[/bold cyan]", border_style="cyan"))
+    from vserve.version import background_refresh
+    background_refresh()
+    _show_update_notice()
+
+
+@app.command()
+def version():
+    """Show current version and check for updates."""
+    from vserve import __version__
+    from vserve.version import update_available, background_refresh
+
+    background_refresh()
+    info = update_available()
+
+    if info:
+        body = (
+            f"  vserve [bold]{info.current}[/bold]\n"
+            f"  [yellow]Update available: {info.latest}[/yellow]\n"
+            f"  Run [cyan]vserve update[/cyan] to upgrade"
+        )
+        console.print(Panel(body, border_style="yellow"))
+    else:
+        console.print(Panel(
+            f"  vserve [bold]{__version__}[/bold]",
+            border_style="cyan",
+        ))
+
+
+@app.command()
+def update():
+    """Update vserve to the latest version."""
+    import shutil
+    import subprocess
+
+    from vserve import __version__
+    from vserve.version import check_pypi, write_cache
+
+    console.print(f"[dim]Current version: {__version__}[/dim]")
+
+    latest = check_pypi()
+    if latest:
+        write_cache(latest)
+        if latest == __version__:
+            console.print("[green]Already up to date.[/green]")
+            return
+        console.print(f"[yellow]New version available: {latest}[/yellow]\n")
+
+    uv = shutil.which("uv")
+    if uv:
+        result = subprocess.run([uv, "tool", "list"], capture_output=True, text=True)
+        if "vserve" in result.stdout:
+            console.print("[dim]Upgrading via uv...[/dim]")
+            subprocess.run([uv, "tool", "upgrade", "vserve"])
+            return
+
+    pip = shutil.which("pip") or shutil.which("pip3")
+    if pip:
+        console.print("[dim]Upgrading via pip...[/dim]")
+        subprocess.run([pip, "install", "--upgrade", "vserve"])
+        return
+
+    console.print("[red]Could not find uv or pip to perform upgrade.[/red]")
+    console.print("Run manually: [cyan]uv tool upgrade vserve[/cyan] or [cyan]pip install -U vserve[/cyan]")
 
 
 @app.command()
@@ -421,6 +507,13 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     lock = VserveLock(lock_name, f"downloading {model_id}")
     try:
         lock.acquire()
+    except PermissionError as exc:
+        console.print(Panel(
+            f"[bold]{exc}[/bold]",
+            title="[red]vserve: permission denied[/red]",
+            border_style="red",
+        ))
+        raise typer.Exit(1) from None
     except LockHeld as exc:
         import os
         me = os.environ.get("USER", "?")
@@ -453,6 +546,13 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         except LockHeld:
             console.print("[yellow]Another download started. Exiting.[/yellow]")
             return True
+        except PermissionError as exc:
+            console.print(Panel(
+                f"[bold]{exc}[/bold]",
+                title="[red]vserve: permission denied[/red]",
+                border_style="red",
+            ))
+            raise typer.Exit(1) from None
 
     try:
         snapshot_download(  # type: ignore[operator]

@@ -156,6 +156,9 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
     except LockHeld as exc:
         _log.error("Another fan daemon is running: %s", exc.message())
         return
+    except PermissionError as exc:
+        _log.error("Lock permission denied: %s", exc)
+        return
 
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
@@ -272,6 +275,9 @@ def run_fixed_daemon(speed: int) -> None:
         _fan_lock.acquire()
     except LockHeld as exc:
         _log.error("Another fan daemon is running: %s", exc.message())
+        return
+    except PermissionError as exc:
+        _log.error("Lock permission denied: %s", exc)
         return
 
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
