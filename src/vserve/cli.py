@@ -17,8 +17,11 @@ from vserve.config import (
 from vserve.models import scan_models, fuzzy_match, ModelInfo
 from vserve.lock import VserveLock, LockHeld, notify_user
 
+from vserve import __version__
+
 app = typer.Typer(help="vLLM model manager")
 console = Console()
+_TITLE = f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]"
 
 
 
@@ -31,7 +34,7 @@ def _lock_or_exit(name: str, description: str) -> VserveLock:
     except LockHeld as exc:
         console.print(Panel(
             f"[bold]{exc.message()}[/bold]",
-            title=f"[red]vserve: {name} locked[/red]",
+            title=f"[red]vserve {__version__}: {name} locked[/red]",
             border_style="red",
         ))
         # DM the lock holder
@@ -45,7 +48,7 @@ def _lock_or_exit(name: str, description: str) -> VserveLock:
     except PermissionError as exc:
         console.print(Panel(
             f"[bold]{exc}[/bold]",
-            title="[red]vserve: permission denied[/red]",
+            title=f"[red]vserve {__version__}: permission denied[/red]",
             border_style="red",
         ))
         raise typer.Exit(1) from None
@@ -89,6 +92,7 @@ def dashboard(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         from vserve.version import background_refresh
         background_refresh()
+        console.print(f"[dim] vserve {__version__}[/dim]")
         if ctx.invoked_subcommand not in ("version", "update"):
             ctx.call_on_close(_show_update_notice)
         return
@@ -156,7 +160,7 @@ def dashboard(ctx: typer.Context):
         "\n".join(lines) + "\n  [bold]Commands[/bold]",
         cmd_tbl,
     )
-    console.print(Panel(body, title="[bold cyan]vserve[/bold cyan]", border_style="cyan"))
+    console.print(Panel(body, title=_TITLE, border_style="cyan"))
     from vserve.version import background_refresh
     background_refresh()
     _show_update_notice()
@@ -165,7 +169,6 @@ def dashboard(ctx: typer.Context):
 @app.command()
 def version():
     """Show current version and check for updates."""
-    from vserve import __version__
     from vserve.version import update_available, background_refresh
 
     background_refresh()
@@ -191,15 +194,14 @@ def update():
     import shutil
     import subprocess
 
-    from vserve import __version__
-    from vserve.version import check_pypi, write_cache
+    from vserve.version import check_pypi, write_cache, _compare_versions
 
     console.print(f"[dim]Current version: {__version__}[/dim]")
 
     latest = check_pypi()
     if latest:
         write_cache(latest)
-        if latest == __version__:
+        if _compare_versions(latest, __version__) <= 0:
             console.print("[green]Already up to date.[/green]")
             return
         console.print(f"[yellow]New version available: {latest}[/yellow]\n")
@@ -510,7 +512,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     except PermissionError as exc:
         console.print(Panel(
             f"[bold]{exc}[/bold]",
-            title="[red]vserve: permission denied[/red]",
+            title=f"[red]vserve {__version__}: permission denied[/red]",
             border_style="red",
         ))
         raise typer.Exit(1) from None
@@ -549,7 +551,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         except PermissionError as exc:
             console.print(Panel(
                 f"[bold]{exc}[/bold]",
-                title="[red]vserve: permission denied[/red]",
+                title=f"[red]vserve {__version__}: permission denied[/red]",
                 border_style="red",
             ))
             raise typer.Exit(1) from None
