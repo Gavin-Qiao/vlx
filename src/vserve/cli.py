@@ -15,7 +15,7 @@ from vserve.config import (
     read_limits,
 )
 from vserve.models import scan_models, fuzzy_match, ModelInfo
-from vserve.lock import VserveLock, LockHeld, notify_user
+from vserve.lock import VserveLock, LockHeld, SessionHeld, notify_user, check_session, write_session, clear_session
 
 from vserve import __version__
 
@@ -23,6 +23,20 @@ app = typer.Typer(help="vLLM model manager")
 console = Console()
 _TITLE = f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]"
 
+
+
+def _session_or_exit() -> None:
+    """Block if another user owns the active GPU session."""
+    try:
+        check_session()
+    except SessionHeld as exc:
+        console.print(Panel(
+            f"[bold]{exc.message()}[/bold]"
+            f"\n\nAsk [cyan]{exc.info.user}[/cyan] to run [cyan]vserve stop[/cyan] first.",
+            title=f"[red]vserve {__version__}: session locked[/red]",
+            border_style="red",
+        ))
+        raise typer.Exit(1) from None
 
 
 def _lock_or_exit(name: str, description: str) -> VserveLock:
@@ -82,6 +96,7 @@ def _show_update_notice() -> None:
         console.print(Panel(
             f"  vserve [bold]{info.current}[/bold] → [bold green]{info.latest}[/bold green]\n"
             f"  Run [cyan]vserve update[/cyan] to upgrade",
+            title=f"[yellow]vserve {__version__}: update available[/yellow]",
             border_style="yellow",
         ))
 
@@ -100,6 +115,7 @@ def dashboard(ctx: typer.Context):
     if not CONFIG_FILE.exists():
         console.print(Panel(
             "[bold]First time? Run [cyan]vserve init[/cyan] to set up your system.[/bold]",
+            title=_TITLE,
             border_style="yellow",
         ))
 
@@ -180,10 +196,11 @@ def version():
             f"  [yellow]Update available: {info.latest}[/yellow]\n"
             f"  Run [cyan]vserve update[/cyan] to upgrade"
         )
-        console.print(Panel(body, border_style="yellow"))
+        console.print(Panel(body, title=f"[yellow]vserve {__version__}: update available[/yellow]", border_style="yellow"))
     else:
         console.print(Panel(
             f"  vserve [bold]{__version__}[/bold]",
+            title=_TITLE,
             border_style="cyan",
         ))
 
@@ -589,14 +606,14 @@ def tune(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
     recalc: bool = typer.Option(False, "--recalc", help="Force recalculation even if cached"),
-    gpu_util: float = typer.Option(0.90, "--gpu-util", help="GPU memory utilization (0.5-0.99)"),
+    gpu_util: float = typer.Option(None, "--gpu-util", help="GPU memory utilization (0.5-0.99, auto if omitted)"),
 ):
     """Calculate context and concurrency limits for a model."""
-    if not 0.5 <= gpu_util <= 0.99:
+    if gpu_util is not None and not 0.5 <= gpu_util <= 0.99:
         console.print("[red]--gpu-util must be between 0.5 and 0.99[/red]")
         raise typer.Exit(1)
 
-    from vserve.gpu import get_gpu_info
+    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
     from vserve.probe import calculate_limits
     from vserve.config import write_limits
 
@@ -621,6 +638,8 @@ def tune(
             models_to_tune = [all_m[idx]]
 
     gpu = get_gpu_info()
+    if gpu_util is None:
+        gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
 
     console.print(f"\n[bold]vserve tune[/bold]  [dim]{gpu.name} ({gpu.vram_total_gb:.0f} GB, util {gpu_util:.0%})[/dim]\n")
 
@@ -650,6 +669,22 @@ def tune(
         write_limits(lim_path, limits_data)
         console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {m.quant_method or 'none'})[/dim]")
         _print_limits_table(limits_data, m)
+        tp = limits_data.get("tool_call_parser")
+        rp = limits_data.get("reasoning_parser")
+        if tp or rp:
+            parts = []
+            if tp:
+                parts.append(f"tools=[green]{tp}[/green]")
+            if rp:
+                parts.append(f"reasoning=[green]{rp}[/green]")
+            console.print(f"  Capabilities: {' '.join(parts)}")
+        else:
+            from vserve.tools import supports_tools as _supports_tools
+            if _supports_tools(m.path):
+                console.print("  Capabilities: [yellow]tool markers found but parser unknown[/yellow]")
+                console.print("                use --tools --tool-parser <parser> with vserve start")
+            else:
+                console.print("  Capabilities: [dim]no tool calling detected[/dim]")
         console.print(f"  [green]Saved to {lim_path}[/green]\n")
 
 
@@ -691,11 +726,14 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
     cfg = read_profile_yaml(cfg_path) or {}
 
     try:
+        _session_or_exit()
+
         if is_vllm_running():
             console.print("[yellow]vLLM is already running.[/yellow]")
             if not typer.confirm("Stop and restart?", default=False):
                 lock.release()
                 return
+            clear_session()
             try:
                 stop_vllm()
             except RuntimeError as e:
@@ -723,7 +761,7 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
 
         from vserve.config import cfg as _cfg
         fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
-        if not fi_cache.is_dir() or not list(fi_cache.glob("*.so")):
+        if not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so")):
             console.print("  [yellow]First run — compiling kernels (~5-10 min). Subsequent starts will be fast.[/yellow]")
 
         console.print(f"  [dim]Waiting for {health_url} ...[/dim]")
@@ -732,6 +770,7 @@ def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
             try:
                 resp = urlopen(health_url, timeout=2)
                 if resp.status == 200:
+                    write_session(label)
                     console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
                     console.print(f"  Config: {cfg_path}")
                     from vserve.config import cfg as _cfg
@@ -767,18 +806,27 @@ def _pick_number(prompt: str, max_val: int) -> int:
         console.print(f"[red]Enter a number 1-{max_val}.[/red]")
 
 
-def _custom_config(m: ModelInfo) -> "pathlib.Path":
+def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
     """Guide user through manual parameter selection, write a temp config."""
     from vserve.config import read_limits, write_profile_yaml
     from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
 
-    lim = read_limits(limits_path(m.provider, m.model_name))
-    if not lim:
-        console.print(f"[red]No probe data for {m.model_name}.[/red] Run: vserve tune {m.model_name}")
-        raise typer.Exit(1)
-
     gpu = get_gpu_info()
     gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+
+    lim_path_ = limits_path(m.provider, m.model_name)
+    lim = read_limits(lim_path_)
+    if not lim:
+        console.print(f"[dim]  Auto-tuning {m.model_name}...[/dim]")
+        from vserve.probe import calculate_limits
+        from vserve.config import write_limits
+        if m.num_kv_heads is None or m.head_dim is None or m.num_layers is None:
+            console.print(f"[red]Cannot auto-tune: missing architecture fields in config.json[/red]")
+            console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
+            raise typer.Exit(1)
+        lim = calculate_limits(model_info=m, vram_total_gb=gpu.vram_total_gb, gpu_mem_util=gpu_mem_util)
+        write_limits(lim_path_, lim)
+        console.print(f"[green]  Tuned.[/green]")
     limits = lim.get("limits", {})
 
     # 1. Context window
@@ -851,6 +899,33 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
         if flag:
             cfg["quantization"] = flag.split()[-1]
 
+    # Tool calling & reasoning
+    resolved_parser: str | None = None
+    resolved_reasoning: str | None = None
+    if tools:
+        from vserve.tools import detect_tool_parser, detect_reasoning_parser, supports_tools as _supports_tools
+        if tool_parser:
+            resolved_parser = tool_parser
+        else:
+            # Try cached detection from limits, then live detection
+            resolved_parser = lim.get("tool_call_parser") or detect_tool_parser(m.path)
+            if resolved_parser is None:
+                if _supports_tools(m.path):
+                    console.print("[yellow]  Tool calling markers found but parser unknown.[/yellow]")
+                    console.print("  Specify manually: vserve start <model> --tools --tool-parser <parser>")
+                    console.print("  Available parsers: hermes, mistral, llama3_json, qwen3_coder, gemma4, ...")
+                    raise typer.Exit(1)
+                else:
+                    console.print("[red]  This model does not support tool calling.[/red]")
+                    raise typer.Exit(1)
+        cfg["enable-auto-tool-choice"] = True
+        cfg["tool-call-parser"] = resolved_parser
+
+        # Reasoning — cached from limits or live detection
+        resolved_reasoning = lim.get("reasoning_parser") or detect_reasoning_parser(m.path)
+        if resolved_reasoning:
+            cfg["reasoning-parser"] = resolved_reasoning
+
     # Summary
     console.print("\n  [bold]Summary[/bold]")
     console.print(f"    Context:        {chosen_ctx // 1024}k")
@@ -858,6 +933,11 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
     console.print(f"    Slots:          {chosen_seqs}")
     console.print(f"    Batched tokens: {chosen_bt or 'auto'}")
     console.print("    Prefix:         always on")
+    if resolved_parser:
+        cap_parts = [f"tools=[green]{resolved_parser}[/green]"]
+        if resolved_reasoning:
+            cap_parts.append(f"reasoning=[green]{resolved_reasoning}[/green]")
+        console.print(f"    Tool calling:   {' '.join(cap_parts)}")
 
     confirm = typer.prompt("\n  Start? [Y/n]", default="Y")
     if confirm.strip().lower() == "n":
@@ -872,6 +952,8 @@ def _custom_config(m: ModelInfo) -> "pathlib.Path":
 @app.command()
 def start(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    tools: bool = typer.Option(False, "--tools", help="Enable tool/function calling"),
+    tool_parser: str | None = typer.Option(None, "--tool-parser", help="Override tool-call parser (e.g. hermes, qwen3_coder)"),
 ):
     """Start serving a model — interactive config picker."""
     if model is None:
@@ -895,7 +977,9 @@ def start(
     else:
         m = _resolve_model(model)
 
-    cfg_path = _custom_config(m)
+    if tool_parser and not tools:
+        tools = True
+    cfg_path = _custom_config(m, tools=tools, tool_parser=tool_parser)
     _launch_vllm(cfg_path, m.model_name)
 
 
@@ -906,15 +990,20 @@ def stop():
 
     lock = _lock_or_exit("gpu", "stopping vLLM")
     try:
+        _session_or_exit()
+
         if not is_vllm_running():
+            clear_session()
             console.print("[dim]vLLM is not running.[/dim]")
             return
 
         try:
             stop_vllm()
         except RuntimeError as e:
+            clear_session()
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(1)
+        clear_session()
         console.print("[green]vLLM stopped.[/green]")
     finally:
         lock.release()

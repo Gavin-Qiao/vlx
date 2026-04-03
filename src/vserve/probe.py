@@ -11,11 +11,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from vserve.models import ModelInfo
+from vserve.tools import detect_tool_parser, detect_reasoning_parser
 
 CONTEXT_STEPS = [4096, 8192, 16384, 32768, 65536, 131072]
-
-# Conservative overhead for CUDA context + activations + allocator fragmentation
-_OVERHEAD_GB = 2.0
 
 # Bytes per element by KV cache dtype
 _DTYPE_BYTES = {"auto": 2, "fp8": 1}
@@ -46,7 +44,7 @@ def calculate_limits(
         )
 
     usable_gb = vram_total_gb * gpu_mem_util
-    available_kv_gb = usable_gb - model_info.model_size_gb - _OVERHEAD_GB
+    available_kv_gb = usable_gb - model_info.model_size_gb
     if available_kv_gb <= 0:
         available_kv_gb = 0
 
@@ -71,6 +69,10 @@ def calculate_limits(
             max_users = total_tokens // ctx
             limits[key][dtype] = max_users if max_users >= 1 else None
 
+    # Detect tool calling and reasoning capabilities
+    tool_parser = detect_tool_parser(model_info.path)
+    reasoning_parser = detect_reasoning_parser(model_info.path)
+
     return {
         "model_path": str(model_info.path),
         "calculated_at": datetime.now(timezone.utc).isoformat(),
@@ -82,5 +84,7 @@ def calculate_limits(
         "architecture": model_info.architecture,
         "is_moe": model_info.is_moe,
         "max_position_embeddings": model_info.max_position_embeddings,
+        "tool_call_parser": tool_parser,
+        "reasoning_parser": reasoning_parser,
         "limits": limits,
     }

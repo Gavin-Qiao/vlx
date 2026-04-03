@@ -195,6 +195,112 @@ def notify_user(username: str, message: str) -> bool:
     return sent
 
 
+SESSION_PATH = LOCK_DIR / "vserve-session.json"
+
+
+@dataclass
+class SessionInfo:
+    user: str
+    since: str
+    model: str
+
+
+class SessionHeld(Exception):
+    """Raised when another user owns the active session."""
+
+    def __init__(self, info: SessionInfo) -> None:
+        self.info = info
+        super().__init__(self.message())
+
+    def message(self) -> str:
+        elapsed = _format_elapsed(self.info.since)
+        return (
+            f"GPU session owned by {self.info.user}"
+            f" since {self.info.since} ({elapsed} ago)"
+            f"\n  Model: {self.info.model}"
+        )
+
+
+def write_session(model: str) -> None:
+    """Record current user as the GPU session owner.
+
+    Uses open+write on a world-writable file (not atomic rename) so that
+    any user can overwrite the session in a sticky-bit directory.
+    """
+    LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
+    try:
+        os.chmod(str(LOCK_DIR), 0o1777)
+    except PermissionError:
+        pass
+    info = SessionInfo(
+        user=os.environ.get("USER", "?"),
+        since=time.strftime("%Y-%m-%d %H:%M:%S"),
+        model=model,
+    )
+    payload = json.dumps(asdict(info)).encode() + b"\n"
+    # Create or overwrite with world-writable permissions so any user
+    # can update the session in a sticky-bit directory.
+    fd = os.open(str(SESSION_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(str(SESSION_PATH), 0o666)
+    except PermissionError:
+        pass
+
+
+def read_session() -> SessionInfo | None:
+    try:
+        text = SESSION_PATH.read_text().strip()
+        if not text:
+            return None  # truncated (cleared by another user)
+        data = json.loads(text)
+        return SessionInfo(**data)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # Corrupt or partially-written session file
+        import sys
+        print(f"[vserve] warning: corrupt session file {SESSION_PATH}", file=sys.stderr)
+        return None
+
+
+def clear_session() -> None:
+    try:
+        SESSION_PATH.unlink(missing_ok=True)
+    except PermissionError:
+        # Sticky-bit dir: can't unlink another user's file. Truncate instead.
+        try:
+            fd = os.open(str(SESSION_PATH), os.O_WRONLY | os.O_TRUNC)
+            os.close(fd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def check_session() -> None:
+    """Raise SessionHeld if another user owns an active session.
+
+    Clears stale sessions (vLLM not running).  No-op if the current
+    user owns the session (they can restart their own model).
+    """
+    from vserve.serve import is_vllm_running
+
+    info = read_session()
+    if info is None:
+        return
+    if not is_vllm_running():
+        clear_session()
+        return
+    current_user = os.environ.get("USER", "?")
+    if info.user == current_user:
+        return
+    raise SessionHeld(info)
+
+
 def _format_elapsed(since: str) -> str:
     try:
         t = time.mktime(time.strptime(since, "%Y-%m-%d %H:%M:%S"))

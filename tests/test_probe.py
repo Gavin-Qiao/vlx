@@ -106,7 +106,8 @@ def test_calculate_limits_output_format(fake_model_dir):
 
     for key in ["model_path", "calculated_at", "vram_total_gb", "gpu_memory_utilization",
                 "model_size_gb", "quant_method", "architecture", "is_moe",
-                "max_position_embeddings", "limits"]:
+                "max_position_embeddings", "tool_call_parser", "reasoning_parser",
+                "limits"]:
         assert key in result
 
     for entry in result["limits"].values():
@@ -143,10 +144,11 @@ def test_sanity_qwen3_27b_on_rtx_pro_5000():
     bpt_auto = kv_bytes_per_token(num_kv_heads=4, head_dim=128, num_layers=28, dtype="auto")
     assert bpt_auto == 57344
 
-    # Available KV: 47.8 * 0.90 - 28.7 - 2.0 = 12.32 GB
-    assert 11 < result["available_kv_gb"] < 14
+    # Available KV: 47.8 * 0.90 - 28.7 = 14.32 GB
+    # (overhead is in gpu_mem_util, not subtracted again here)
+    assert 13 < result["available_kv_gb"] < 16
 
-    # At 8K context, auto: ~12.3 GB / (57344 * 8192) = ~27 users
+    # At 8K context, auto: ~14.3 GB / (57344 * 8192) = ~32 users
     ctx_8k = result["limits"]["8192"]
     assert ctx_8k["auto"] is not None
     assert 20 < ctx_8k["auto"] < 40  # reasonable range
@@ -159,7 +161,7 @@ def test_sanity_qwen3_27b_on_rtx_pro_5000():
     ctx_128k = result["limits"].get("131072")
     if ctx_128k:
         auto_128k = ctx_128k.get("auto")
-        # At 128K with auto: 12.3 GB / (57344 * 131072) = ~1.6 → 1 user
+        # At 128K with auto: 14.3 GB / (57344 * 131072) = ~2 users
         assert auto_128k is None or auto_128k <= 2
 
 

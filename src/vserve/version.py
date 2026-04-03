@@ -77,10 +77,12 @@ def update_available() -> UpdateInfo | None:
         return None
     try:
         latest = cache["latest"]
-        current = cache.get("current", __version__)
     except (KeyError, TypeError):
         return None
-    if _compare_versions(latest, current) > 0:
+    # Only trust cache written by the currently installed version.
+    if cache.get("current") != __version__:
+        return None
+    if _compare_versions(latest, __version__) > 0:
         return UpdateInfo(current=__version__, latest=latest)
     return None
 

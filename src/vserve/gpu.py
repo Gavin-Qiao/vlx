@@ -72,8 +72,9 @@ def get_gpu_info() -> GpuInfo:
 
 
 def compute_gpu_memory_utilization(
-    vram_total_gb: float, overhead_gb: float = 2.0
+    vram_total_gb: float, overhead_gb: float = 3.5
 ) -> float:
+    """Reserve overhead for CUDA context, activations, CUDA graphs, and sampler."""
     if vram_total_gb <= 0:
         return 0.90
     return (vram_total_gb - overhead_gb) / vram_total_gb
