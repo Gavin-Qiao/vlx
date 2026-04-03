@@ -821,12 +821,12 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
         from vserve.probe import calculate_limits
         from vserve.config import write_limits
         if m.num_kv_heads is None or m.head_dim is None or m.num_layers is None:
-            console.print(f"[red]Cannot auto-tune: missing architecture fields in config.json[/red]")
+            console.print("[red]Cannot auto-tune: missing architecture fields in config.json[/red]")
             console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
             raise typer.Exit(1)
         lim = calculate_limits(model_info=m, vram_total_gb=gpu.vram_total_gb, gpu_mem_util=gpu_mem_util)
         write_limits(lim_path_, lim)
-        console.print(f"[green]  Tuned.[/green]")
+        console.print("[green]  Tuned.[/green]")
     limits = lim.get("limits", {})
 
     # 1. Context window
@@ -1674,3 +1674,4 @@ def doctor():
                   f"({ok_count} ok, {fail_count} fail)\n")
 
 
+# ruff-test
