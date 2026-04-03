@@ -13,7 +13,17 @@ from datetime import datetime, timezone
 from vserve.models import ModelInfo
 from vserve.tools import detect_tool_parser, detect_reasoning_parser
 
-CONTEXT_STEPS = [4096, 8192, 16384, 32768, 65536, 131072]
+_MIN_CTX = 4096
+
+
+def _context_steps(max_pos: int) -> list[int]:
+    """Generate context steps as powers of 2 from 4k up to the model's max."""
+    ctx = _MIN_CTX
+    steps = []
+    while ctx <= max_pos:
+        steps.append(ctx)
+        ctx *= 2
+    return steps
 
 # Bytes per element by KV cache dtype
 _DTYPE_BYTES = {"auto": 2, "fp8": 1}
@@ -51,7 +61,7 @@ def calculate_limits(
     available_kv_bytes = available_kv_gb * (1024**3)
 
     max_pos = model_info.max_position_embeddings
-    steps = [s for s in CONTEXT_STEPS if s <= max_pos]
+    steps = _context_steps(max_pos)
 
     limits: dict[str, dict[str, int | None]] = {}
 

@@ -2,11 +2,11 @@
 
 import pytest
 
-from vserve.probe import CONTEXT_STEPS, calculate_limits, kv_bytes_per_token
+from vserve.probe import _context_steps, calculate_limits, kv_bytes_per_token
 
 
 def test_context_steps_are_powers_of_two():
-    for step in CONTEXT_STEPS:
+    for step in _context_steps(131072):
         assert step & (step - 1) == 0, f"{step} is not a power of two"
 
 

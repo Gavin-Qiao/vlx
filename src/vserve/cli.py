@@ -107,7 +107,7 @@ def dashboard(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         from vserve.version import background_refresh
         background_refresh()
-        console.print(f"[dim] vserve {__version__}[/dim]")
+        console.print(Panel(f"[bold]vserve[/bold] {__version__}", border_style="dim", expand=False))
         if ctx.invoked_subcommand not in ("version", "update"):
             ctx.call_on_close(_show_update_notice)
         return
