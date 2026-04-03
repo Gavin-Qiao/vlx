@@ -28,7 +28,8 @@ _TITLE = f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]"
 
 
 def _session_or_exit() -> None:
-    """Block if another user owns the active GPU session."""
+    """Block if another user owns the active GPU session, DM the holder."""
+    import os
     try:
         check_session()
     except SessionHeld as exc:
@@ -38,6 +39,12 @@ def _session_or_exit() -> None:
             title=f"[red]vserve {__version__}: session locked[/red]",
             border_style="red",
         ))
+        me = os.environ.get("USER", "?")
+        if exc.info.user != me:
+            notify_user(
+                exc.info.user,
+                f"{me} wants the GPU (you: {exc.info.model})",
+            )
         raise typer.Exit(1) from None
 
 
@@ -942,29 +949,42 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
             cfg["quantization"] = flag.split()[-1]
 
     # Tool calling & reasoning
+    from vserve.tools import detect_tool_parser, detect_reasoning_parser, supports_tools as _supports_tools
     resolved_parser: str | None = None
     resolved_reasoning: str | None = None
-    if tools:
-        from vserve.tools import detect_tool_parser, detect_reasoning_parser, supports_tools as _supports_tools
-        if tool_parser:
-            resolved_parser = tool_parser
-        else:
-            # Try cached detection from limits, then live detection
-            resolved_parser = lim.get("tool_call_parser") or detect_tool_parser(m.path)
-            if resolved_parser is None:
-                if _supports_tools(m.path):
-                    console.print("[yellow]  Tool calling markers found but parser unknown.[/yellow]")
-                    console.print("  Specify manually: vserve start <model> --tools --tool-parser <parser>")
-                    console.print("  Available parsers: hermes, mistral, llama3_json, qwen3_coder, gemma4, ...")
-                    raise typer.Exit(1)
-                else:
-                    console.print("[red]  This model does not support tool calling.[/red]")
-                    raise typer.Exit(1)
+
+    if tool_parser:
+        # Explicit override — always enable
+        resolved_parser = tool_parser
+        tools = True
+    else:
+        resolved_parser = lim.get("tool_call_parser") or detect_tool_parser(m.path)
+
+    resolved_reasoning = lim.get("reasoning_parser") or detect_reasoning_parser(m.path)
+
+    if resolved_parser or resolved_reasoning:
+        console.print("\n  [bold]5. Capabilities[/bold]")
+        if resolved_parser:
+            if not tools:
+                enable_tools = typer.confirm(
+                    f"     Enable tool calling? (parser: {resolved_parser})", default=False,
+                )
+                tools = enable_tools
+            else:
+                console.print(f"     Tool calling: [green]{resolved_parser}[/green]")
+        if resolved_reasoning:
+            if not tools:
+                console.print(f"     Reasoning: [dim]{resolved_reasoning} (enable tool calling to activate)[/dim]")
+            else:
+                console.print(f"     Reasoning:    [green]{resolved_reasoning}[/green]")
+    elif _supports_tools(m.path):
+        console.print("\n  [bold]5. Capabilities[/bold]")
+        console.print("     [yellow]Tool markers found but parser unknown[/yellow]")
+        console.print("     Use --tool-parser <name> to enable")
+
+    if tools and resolved_parser:
         cfg["enable-auto-tool-choice"] = True
         cfg["tool-call-parser"] = resolved_parser
-
-        # Reasoning — cached from limits or live detection
-        resolved_reasoning = lim.get("reasoning_parser") or detect_reasoning_parser(m.path)
         if resolved_reasoning:
             cfg["reasoning-parser"] = resolved_reasoning
 
@@ -998,6 +1018,9 @@ def start(
     tool_parser: str | None = typer.Option(None, "--tool-parser", help="Override tool-call parser (e.g. hermes, qwen3_coder)"),
 ):
     """Start serving a model — interactive config picker."""
+    # Check session lock early — before interactive config
+    _session_or_exit()
+
     if model is None:
         all_models = scan_models(MODELS_DIR)
         if not all_models:
@@ -1030,9 +1053,11 @@ def stop():
     """Stop the vLLM service."""
     from vserve.serve import stop_vllm, is_vllm_running
 
+    _session_or_exit()
+
     lock = _lock_or_exit("gpu", "stopping vLLM")
     try:
-        _session_or_exit()
+        _session_or_exit()  # re-check under flock (TOCTOU)
 
         if not is_vllm_running():
             clear_session()
