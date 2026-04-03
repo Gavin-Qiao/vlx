@@ -20,6 +20,8 @@ from vserve.lock import VserveLock, LockHeld, SessionHeld, notify_user, check_se
 from vserve import __version__
 
 app = typer.Typer(help="vLLM model manager")
+cache_app = typer.Typer(help="Cache management")
+app.add_typer(cache_app, name="cache")
 console = Console()
 _TITLE = f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]"
 
@@ -107,9 +109,15 @@ def dashboard(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         from vserve.version import background_refresh
         background_refresh()
-        console.print(Panel(f"[bold]vserve[/bold] {__version__}", border_style="dim", expand=False))
+        from rich.rule import Rule
+        console.print(Rule(title=f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]", style="cyan"))
         if ctx.invoked_subcommand not in ("version", "update"):
-            ctx.call_on_close(_show_update_notice)
+            def _close_border() -> None:
+                _show_update_notice()
+                console.print(Rule(style="cyan"))
+            ctx.call_on_close(_close_border)
+        else:
+            ctx.call_on_close(lambda: console.print(Rule(style="cyan")))
         return
 
     if not CONFIG_FILE.exists():
@@ -191,18 +199,11 @@ def version():
     info = update_available()
 
     if info:
-        body = (
-            f"  vserve [bold]{info.current}[/bold]\n"
-            f"  [yellow]Update available: {info.latest}[/yellow]\n"
-            f"  Run [cyan]vserve update[/cyan] to upgrade"
-        )
-        console.print(Panel(body, title=f"[yellow]vserve {__version__}: update available[/yellow]", border_style="yellow"))
+        console.print(f"  vserve [bold]{info.current}[/bold]")
+        console.print(f"  [yellow]Update available: {info.latest}[/yellow]")
+        console.print("  Run [cyan]vserve update[/cyan] to upgrade")
     else:
-        console.print(Panel(
-            f"  vserve [bold]{__version__}[/bold]",
-            title=_TITLE,
-            border_style="cyan",
-        ))
+        console.print(f"  vserve [bold]{__version__}[/bold] — up to date")
 
 
 @app.command()
@@ -254,11 +255,15 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
         _show_model_detail(m)
         return
 
+    from vserve.tools import detect_tool_parser, detect_reasoning_parser
+
     table = Table(title="Downloaded Models")
     table.add_column("Model", style="bold")
     table.add_column("Size", justify="right")
     table.add_column("Limits")
     table.add_column("Max Context", justify="right")
+    table.add_column("Tools", style="green")
+    table.add_column("Reasoning", style="green")
 
     for m in all_models:
         lim = read_limits(limits_path(m.provider, m.model_name))
@@ -271,7 +276,13 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
                     max_ctx = f"{int(ctx_str) // 1024}k"
                     break
 
-        table.add_row(m.full_name, f"{m.model_size_gb} GB", "\u2713" if lim else "\u2717", max_ctx)
+        tp = (lim or {}).get("tool_call_parser") or detect_tool_parser(m.path) or "\u2014"
+        rp = (lim or {}).get("reasoning_parser") or detect_reasoning_parser(m.path) or "\u2014"
+
+        table.add_row(
+            m.full_name, f"{m.model_size_gb} GB",
+            "\u2713" if lim else "\u2717", max_ctx, tp, rp,
+        )
 
     console.print(table)
 
@@ -639,7 +650,38 @@ def tune(
 
     gpu = get_gpu_info()
     if gpu_util is None:
-        gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+        from vserve.config import cfg as _cfg, save_config, reset_config
+        _c = _cfg()
+        if _c.gpu_memory_utilization is not None:
+            gpu_util = _c.gpu_memory_utilization
+        elif _c.gpu_overhead_gb is not None:
+            gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb, _c.gpu_overhead_gb)
+        else:
+            gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+            # Interactive menu only when user runs bare `vserve tune` (no model arg)
+            if model is None and not all_models:
+                console.print(f"\n[bold]GPU memory reservation[/bold]  [dim]({gpu.vram_total_gb:.0f} GB total, current: {gpu_util:.0%})[/dim]")
+                console.print("  1) Auto (3.5 GB overhead) — use for this run")
+                console.print("  2) Set GPU usage % (save to config)")
+                console.print("  3) Set overhead in GB (save to config)")
+                choice = typer.prompt("\n  Choice", default="1")
+                if choice == "2":
+                    val = typer.prompt("  GPU usage %", default=f"{gpu_util:.2f}")
+                    gpu_util = max(0.5, min(0.99, float(val)))
+                    _c.gpu_memory_utilization = gpu_util
+                    _c.gpu_overhead_gb = None
+                    save_config(_c)
+                    reset_config()
+                    console.print(f"  [green]Saved gpu_memory_utilization={gpu_util:.2%}[/green]")
+                elif choice == "3":
+                    val = typer.prompt("  Overhead GB", default="3.5")
+                    overhead = max(0.5, float(val))
+                    gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb, overhead)
+                    _c.gpu_overhead_gb = overhead
+                    _c.gpu_memory_utilization = None
+                    save_config(_c)
+                    reset_config()
+                    console.print(f"  [green]Saved gpu_overhead_gb={overhead} GB[/green]")
 
     console.print(f"\n[bold]vserve tune[/bold]  [dim]{gpu.name} ({gpu.vram_total_gb:.0f} GB, util {gpu_util:.0%})[/dim]\n")
 
@@ -1606,7 +1648,7 @@ def doctor():
         sockets = list(tmp_dir.glob("*"))
         stale = [s for s in sockets if s.is_socket()]
         if len(stale) > 10:
-            _warn(f"{len(stale)} stale sockets in {tmp_dir}", "vserve cache clean")
+            _warn(f"{len(stale)} stale sockets in {tmp_dir}", f"sudo find {tmp_dir} -type s -delete")
     else:
         _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
 
@@ -1674,4 +1716,66 @@ def doctor():
                   f"({ok_count} ok, {fail_count} fail)\n")
 
 
-# ruff-test
+# ── Cache management ──
+
+@cache_app.command("clean")
+def cache_clean(
+    all_caches: bool = typer.Option(False, "--all", help="Also clean flashinfer, torch, vllm caches"),
+):
+    """Clean stale sockets and optionally JIT caches."""
+    import subprocess
+    from vserve.config import cfg as _cfg
+    _c = _cfg()
+    root = _c.vllm_root
+    total_freed = 0
+
+    # Always: stale sockets in tmp
+    tmp_dir = root / "tmp"
+    if tmp_dir.exists():
+        sockets = [s for s in tmp_dir.iterdir() if s.is_socket()]
+        if sockets:
+            result = subprocess.run(
+                ["sudo", "find", str(tmp_dir), "-type", "s", "-delete"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                console.print(f"  [green]Cleaned {len(sockets)} stale sockets from {tmp_dir}[/green]")
+            else:
+                console.print(f"  [red]Failed to clean sockets: {result.stderr.strip()}[/red]")
+        else:
+            console.print(f"  [dim]No stale sockets in {tmp_dir}[/dim]")
+
+    if all_caches:
+        cache_dirs = [
+            (root / ".cache" / "flashinfer", "FlashInfer JIT"),
+            (root / ".cache" / "torch_extensions", "torch compile"),
+            (root / ".cache" / "vllm", "vLLM"),
+        ]
+        for cache_dir, label in cache_dirs:
+            if cache_dir.exists():
+                # Measure size before deleting
+                result = subprocess.run(
+                    ["sudo", "du", "-sm", str(cache_dir)],
+                    capture_output=True, text=True,
+                )
+                size_mb = 0
+                if result.returncode == 0:
+                    try:
+                        size_mb = int(result.stdout.split()[0])
+                    except (ValueError, IndexError):
+                        pass
+                result = subprocess.run(
+                    ["sudo", "rm", "-rf", str(cache_dir)],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    total_freed += size_mb
+                    console.print(f"  [green]Cleaned {label} cache ({size_mb} MB)[/green]")
+                else:
+                    console.print(f"  [red]Failed to clean {label}: {result.stderr.strip()}[/red]")
+            else:
+                console.print(f"  [dim]{label} cache not found[/dim]")
+
+        if total_freed > 0:
+            console.print(f"\n  [bold]Freed {total_freed} MB total[/bold]")
+        console.print("  [yellow]Next vserve start will recompile kernels (~5-10 min)[/yellow]")
