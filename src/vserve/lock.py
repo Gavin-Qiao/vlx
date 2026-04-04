@@ -287,12 +287,12 @@ def check_session() -> None:
     Clears stale sessions (vLLM not running).  No-op if the current
     user owns the session (they can restart their own model).
     """
-    from vserve.serve import is_vllm_running
+    from vserve.backends import any_backend_running
 
     info = read_session()
     if info is None:
         return
-    if not is_vllm_running():
+    if not any_backend_running():
         clear_session()
         return
     current_user = os.environ.get("USER", "?")

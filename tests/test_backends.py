@@ -190,19 +190,56 @@ class TestVllmBackend:
         assert cfg["reasoning-parser"] == "qwen3"
         assert cfg["max-num-batched-tokens"] == 4096
 
+    def test_find_entrypoint_missing(self, mocker):
+        b = VllmBackend()
+        mock_c = Mock()
+        mock_c.vllm_bin = Path("/nonexistent/vllm")
+        mocker.patch("vserve.config.cfg", return_value=mock_c)
+        assert b.find_entrypoint() is None
+
+    def test_find_entrypoint_exists(self, mocker, tmp_path):
+        b = VllmBackend()
+        vllm_bin = tmp_path / "venv" / "bin" / "vllm"
+        vllm_bin.parent.mkdir(parents=True)
+        vllm_bin.touch()
+        mock_c = Mock()
+        mock_c.vllm_bin = vllm_bin
+        mocker.patch("vserve.config.cfg", return_value=mock_c)
+        assert b.find_entrypoint() == vllm_bin
+
+    def test_doctor_checks_returns_callables(self):
+        b = VllmBackend()
+        checks = b.doctor_checks()
+        assert len(checks) >= 2
+        for desc, fn in checks:
+            assert isinstance(desc, str)
+            assert callable(fn)
+
+    def test_service_identity(self):
+        b = VllmBackend()
+        assert b.service_name == "vllm"
+        assert b.service_user == "vllm"
+
 
 # --- Auto-registration ---
 
 
 def test_default_backends_registered():
-    """Importing backends registers vllm and llamacpp."""
-    import importlib
-    from vserve.backends import _BACKENDS
-    _BACKENDS.clear()
-    import vserve.backends
-    importlib.reload(vserve.backends)
+    """Built-in backends are registered after _register_defaults."""
+    from vserve.backends import _register_defaults
+    _register_defaults()
 
-    from vserve.backends import _BACKENDS as reloaded
-    names = [b.name for b in reloaded]
+    from vserve.backends import _BACKENDS
+    names = [b.name for b in _BACKENDS]
     assert "vllm" in names
     assert "llamacpp" in names
+
+
+def test_duplicate_registration_prevented():
+    """register() with same name is idempotent."""
+    b1 = _make_mock_backend("dedup")
+    b2 = _make_mock_backend("dedup")
+    register(b1)
+    register(b2)
+    from vserve.backends import _BACKENDS
+    assert sum(1 for b in _BACKENDS if b.name == "dedup") == 1

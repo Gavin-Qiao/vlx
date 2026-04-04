@@ -10,14 +10,6 @@ if TYPE_CHECKING:
     from vserve.models import ModelInfo
 
 
-# Quantization flags for vLLM CLI
-_QUANT_FLAGS = {
-    "gptq": "--quantization gptq_marlin",
-    "awq": "--quantization awq_marlin",
-    "fp8": "--quantization fp8",
-    "compressed-tensors": "",
-    "none": "",
-}
 
 
 class VllmBackend:
@@ -89,9 +81,8 @@ class VllmBackend:
         return cfg
 
     def quant_flag(self, method: str | None) -> str:
-        if method is None:
-            return ""
-        return _QUANT_FLAGS.get(method, "")
+        from vserve.models import quant_flag as _qf
+        return _qf(method)
 
     def start(self, config_path: Path) -> None:
         from vserve.serve import start_vllm

@@ -13,7 +13,31 @@ _BACKENDS: list[Backend] = []
 
 def register(backend: Backend) -> None:
     """Register a backend with the registry."""
+    if any(b.name == backend.name for b in _BACKENDS):
+        return
     _BACKENDS.append(backend)
+
+
+def any_backend_running() -> bool:
+    """Check if any registered backend has a running server."""
+    for b in _BACKENDS:
+        try:
+            if b.is_running():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def running_backend() -> Backend | None:
+    """Return the currently running backend, or None."""
+    for b in _BACKENDS:
+        try:
+            if b.is_running():
+                return b
+        except Exception:
+            continue
+    return None
 
 
 def get_backend(model: ModelInfo) -> Backend:

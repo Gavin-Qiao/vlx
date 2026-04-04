@@ -41,10 +41,21 @@ class LlamaCppBackend:
         if not gguf_files:
             raise ValueError(f"No GGUF files in {model.path}")
 
-        model_size_bytes = sum(f.stat().st_size for f in gguf_files)
+        # Detect split shards (e.g., model-00001-of-00003.gguf) vs independent variants
+        import re
+        shard_pattern = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
+        shard_files = [f for f in gguf_files if shard_pattern.search(f.name)]
+        if shard_files:
+            # Split model — sum all shards
+            model_size_bytes = sum(f.stat().st_size for f in shard_files)
+            primary_file = shard_files[0]
+        else:
+            # Pick the largest file (handles multiple quant variants in one dir)
+            primary_file = max(gguf_files, key=lambda f: f.stat().st_size)
+            model_size_bytes = primary_file.stat().st_size
         model_size_gb = model_size_bytes / (1024**3)
 
-        metadata = self._read_gguf_metadata(gguf_files[0])
+        metadata = self._read_gguf_metadata(primary_file)
         num_layers = metadata.get("num_layers", 32)
         max_context = metadata.get("max_context", 4096)
         num_kv_heads = metadata.get("num_kv_heads", 8)
@@ -127,24 +138,32 @@ class LlamaCppBackend:
                 "head_dim": head_dim,
             }
         except ImportError:
-            return {}
+            raise ImportError(
+                "The 'gguf' package is required for llama.cpp tuning. "
+                "Install it with: pip install 'vserve[llamacpp]'"
+            ) from None
         except Exception:
+            import sys
+            print(f"[vserve] warning: failed to read GGUF metadata from {gguf_path}", file=sys.stderr)
             return {}
 
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
         """Build llama-server JSON config."""
         gguf_files = sorted(model.path.glob("*.gguf"))
-        model_file = str(gguf_files[0]) if gguf_files else str(model.path)
+        if gguf_files:
+            # Prefer the largest file (main model or first shard)
+            model_file = str(max(gguf_files, key=lambda f: f.stat().st_size))
+        else:
+            model_file = str(model.path)
 
         cfg: dict = {
             "model": model_file,
             "host": "0.0.0.0",
             "port": choices.get("port", 8888),
-            "ctx-size": choices["context"],
-            "n-gpu-layers": choices["n_gpu_layers"],
+            "ctx_size": choices["context"],
+            "n_gpu_layers": choices["n_gpu_layers"],
             "parallel": choices.get("parallel", 1),
-            "flash-attn": True,
-            "cont-batching": True,
+            "flash_attn": True,
         }
         if choices.get("tools"):
             cfg["jinja"] = True
@@ -162,7 +181,7 @@ class LlamaCppBackend:
 
         result = subprocess.run(
             ["sudo", "systemctl", "start", self.service_name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
             raise RuntimeError(f"systemctl start {self.service_name} failed: {result.stderr}")
@@ -170,15 +189,15 @@ class LlamaCppBackend:
     def stop(self) -> None:
         result = subprocess.run(
             ["sudo", "systemctl", "stop", self.service_name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
             raise RuntimeError(f"systemctl stop {self.service_name} failed: {result.stderr}")
 
     def is_running(self) -> bool:
         result = subprocess.run(
-            ["sudo", "systemctl", "is-active", self.service_name],
-            capture_output=True, text=True,
+            ["systemctl", "is-active", self.service_name],
+            capture_output=True, text=True, timeout=10,
         )
         return result.returncode == 0 and result.stdout.strip() == "active"
 

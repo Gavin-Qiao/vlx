@@ -49,11 +49,12 @@ class TestLlamaCppBuildConfig:
             "tools": False,
         }
         cfg = b.build_config(m, choices)
-        assert cfg["ctx-size"] == 8192
-        assert cfg["n-gpu-layers"] == 35
+        assert cfg["ctx_size"] == 8192
+        assert cfg["n_gpu_layers"] == 35
         assert cfg["parallel"] == 4
-        assert cfg["flash-attn"] is True
-        assert cfg["cont-batching"] is True
+        assert cfg["flash_attn"] is True
+        assert "cont_batching" not in cfg
+        assert "cont-batching" not in cfg
         assert "jinja" not in cfg
 
     def test_config_with_tools(self, fake_gguf_model_dir):
@@ -106,8 +107,21 @@ class TestLlamaCppDetectTools:
 
 
 class TestLlamaCppTune:
-    def test_tune_basic(self, fake_gguf_model_dir):
+    def _mock_metadata(self, mocker):
+        mocker.patch.object(
+            LlamaCppBackend, "_read_gguf_metadata",
+            return_value={
+                "arch": "llama",
+                "num_layers": 32,
+                "max_context": 8192,
+                "num_kv_heads": 8,
+                "head_dim": 128,
+            },
+        )
+
+    def test_tune_basic(self, fake_gguf_model_dir, mocker):
         """Tune produces expected output structure."""
+        self._mock_metadata(mocker)
         b = LlamaCppBackend()
         from vserve.models import detect_model
         m = detect_model(fake_gguf_model_dir)
@@ -122,8 +136,9 @@ class TestLlamaCppTune:
         assert "supports_tools" in result
         assert result["backend"] == "llamacpp"
 
-    def test_tune_full_offload_with_tiny_model(self, fake_gguf_model_dir):
+    def test_tune_full_offload_with_tiny_model(self, fake_gguf_model_dir, mocker):
         """Tiny model fully fits on GPU."""
+        self._mock_metadata(mocker)
         b = LlamaCppBackend()
         from vserve.models import detect_model
         m = detect_model(fake_gguf_model_dir)
@@ -171,3 +186,45 @@ class TestLlamaCppLifecycle:
         mocker.patch("vserve.backends.llamacpp.subprocess.run",
                      return_value=Mock(returncode=3, stdout="inactive", stderr=""))
         assert b.is_running() is False
+
+
+class TestLlamaCppFindEntrypoint:
+    def test_find_on_path(self, mocker):
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.shutil.which", return_value="/usr/bin/llama-server")
+        # Mock root_dir to a nonexistent path
+        mocker.patch.object(type(b), "root_dir", new_callable=lambda: property(lambda self: __import__("pathlib").Path("/nonexistent")))
+        result = b.find_entrypoint()
+        assert result is not None
+
+    def test_not_found(self, mocker):
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.shutil.which", return_value=None)
+        mocker.patch.object(type(b), "root_dir", new_callable=lambda: property(lambda self: __import__("pathlib").Path("/nonexistent")))
+        assert b.find_entrypoint() is None
+
+
+class TestLlamaCppDoctorChecks:
+    def test_returns_callables(self):
+        b = LlamaCppBackend()
+        checks = b.doctor_checks()
+        assert len(checks) >= 2
+        for desc, fn in checks:
+            assert isinstance(desc, str)
+            assert callable(fn)
+
+
+class TestLlamaCppStartFailure:
+    def test_start_raises_on_failure(self, mocker, tmp_path):
+        import pytest
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=1, stdout="", stderr="Unit not found"))
+        mocker.patch("vserve.backends.llamacpp.shutil.copy2")
+        active = tmp_path / "active.json"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text('{}')
+        with pytest.raises(RuntimeError, match="systemctl start"):
+            b.start(cfg_path)
