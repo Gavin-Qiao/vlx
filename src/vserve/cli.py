@@ -860,10 +860,15 @@ def tune(
         console.print(f"  [green]Saved to {lim_path}[/green]")
 
         # Offer pre-caching for vLLM (flashinfer JIT compilation)
-        if backend.name == "vllm":
-            from vserve.config import cfg as _cfg2
-            fi_cache = _cfg2().vllm_root / ".cache" / "flashinfer"
-            if not fi_cache.is_dir() or not any(fi_cache.rglob("*.so")):
+        if backend.name == "vllm" and not model:
+            # Only offer pre-cache in interactive mode (bare `vserve tune`)
+            try:
+                from vserve.config import cfg as _cfg2
+                fi_cache = _cfg2().vllm_root / ".cache" / "flashinfer"
+                needs_precache = not fi_cache.is_dir() or not any(fi_cache.rglob("*.so"))
+            except Exception:
+                needs_precache = False
+            if needs_precache:
                 console.print("  [yellow]First vLLM start will compile flashinfer kernels (~5-10 min).[/yellow]")
                 if typer.confirm("  Pre-cache now? (starts and stops vLLM once)", default=False):
                     console.print("  [dim]Pre-caching — this will take a few minutes...[/dim]")
