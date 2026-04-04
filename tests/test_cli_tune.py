@@ -44,6 +44,11 @@ def test_tune_calculates_limits(mocker, fake_model_dir):
     mocker.patch("vserve.config.write_limits")
 
     result = runner.invoke(app, ["tune", "TestModel"])
+    if result.exit_code != 0:
+        print(f"TUNE OUTPUT:\n{result.output}")
+        if result.exception:
+            import traceback
+            traceback.print_exception(type(result.exception), result.exception, result.exception.__traceback__)
     assert result.exit_code == 0
     assert "slots" in result.output
 
@@ -63,6 +68,11 @@ def test_tune_all_models(mocker, fake_model_dir):
     mocker.patch("vserve.config.write_limits")
 
     result = runner.invoke(app, ["tune", "--all"])
+    if result.exit_code != 0:
+        print(f"TUNE ALL OUTPUT:\n{result.output}")
+        if result.exception:
+            import traceback
+            traceback.print_exception(type(result.exception), result.exception, result.exception.__traceback__)
     assert result.exit_code == 0
 
 
