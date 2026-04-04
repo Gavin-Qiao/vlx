@@ -301,9 +301,11 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
 
         # Detect backend
         backend_name = "\u2014"
+        backend_obj = None
         for b in _BACKENDS:
             if b.can_serve(m):
                 backend_name = b.display_name
+                backend_obj = b
                 break
 
         max_ctx = "\u2014"
@@ -318,14 +320,18 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
                     max_ctx = f"{int(ctx_str) // 1024}k"
                     break
 
-        # Detect tools via backend
-        tool_info = {}
-        for b in _BACKENDS:
-            if b.can_serve(m):
-                tool_info = b.detect_tools(m.path)
-                break
-        tp = tool_info.get("tool_call_parser") or ("\u2713" if tool_info.get("supports_tools") else "\u2014")
-        rp = tool_info.get("reasoning_parser") or ("\u2713" if tool_info.get("supports_reasoning") else "\u2014")
+        # Use cached limits for tool/reasoning info (fast) — only live-detect for untuned models
+        tp = "\u2014"
+        rp = "\u2014"
+        if lim:
+            # vLLM: parser names in limits
+            tp = lim.get("tool_call_parser") or ("jinja" if lim.get("supports_tools") else "\u2014")
+            rp = lim.get("reasoning_parser") or ("jinja" if lim.get("supports_reasoning") else "\u2014")
+        elif backend_obj:
+            # Untuned — live detect (slow for GGUF, but only for untuned models)
+            tool_info = backend_obj.detect_tools(m.path)
+            tp = tool_info.get("tool_call_parser") or ("jinja" if tool_info.get("supports_tools") else "\u2014")
+            rp = tool_info.get("reasoning_parser") or ("jinja" if tool_info.get("supports_reasoning") else "\u2014")
 
         table.add_row(
             m.full_name, backend_name, f"{m.model_size_gb} GB",
