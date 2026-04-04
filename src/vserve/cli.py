@@ -1937,11 +1937,11 @@ def doctor():
         (VLLM_ROOT / ".cache" / "vllm" / "torch_compile_cache", "torch.compile"),
     ]
     for cdir, label in cache_checks:
-        if cdir.exists() and any(cdir.rglob("*.so")):
+        if cdir.exists() and any(f.is_file() for f in cdir.rglob("*")):
             size_mb = sum(f.stat().st_size for f in cdir.rglob("*") if f.is_file()) / (1024 * 1024)
             _ok(f"{label} cache ({size_mb:.0f} MB)")
         elif cdir.exists():
-            _warn(f"{label} cache exists but no compiled .so files — first start will be slow")
+            _warn(f"{label} cache dir exists but is empty — first start may be slow")
         else:
             _warn(f"{label} cache missing — first start will JIT compile (2-10 min)")
 
