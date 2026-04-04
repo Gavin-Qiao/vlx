@@ -212,3 +212,53 @@ def test_reset_config_clears_singleton():
     # Both should be valid VserveConfig — the point is reset didn't crash
     assert isinstance(c1, VserveConfig)
     assert isinstance(c2, VserveConfig)
+
+
+# --- llama.cpp config fields ---
+
+
+def test_config_llamacpp_defaults():
+    """New llamacpp fields have sensible defaults."""
+    c = _build_config(
+        vllm_root=Path("/opt/vllm"),
+        cuda_home=Path("/usr/local/cuda"),
+        service_name="vllm",
+        service_user="vllm",
+        port=8888,
+    )
+    assert c.llamacpp_root is None
+    assert c.llamacpp_service_name == "llama-cpp"
+    assert c.llamacpp_service_user == "llama-cpp"
+
+
+def test_config_llamacpp_roundtrip(tmp_path, mocker):
+    """llamacpp fields survive save/load cycle."""
+    config_file = tmp_path / "config.yaml"
+    mocker.patch("vserve.config.CONFIG_FILE", config_file)
+
+    c = _build_config(
+        vllm_root=Path("/opt/vllm"),
+        cuda_home=Path("/usr/local/cuda"),
+        service_name="vllm",
+        service_user="vllm",
+        port=8888,
+    )
+    c.llamacpp_root = Path("/opt/llama-cpp")
+    save_config(c)
+
+    reset_config()
+    loaded = load_config()
+    assert loaded.llamacpp_root == Path("/opt/llama-cpp")
+    assert loaded.llamacpp_service_name == "llama-cpp"
+    assert loaded.llamacpp_service_user == "llama-cpp"
+
+
+def test_config_without_llamacpp_fields(tmp_path, mocker):
+    """Existing config files without llamacpp fields load fine."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("vllm_root: /opt/vllm\ncuda_home: /usr/local/cuda\n")
+    mocker.patch("vserve.config.CONFIG_FILE", config_file)
+
+    reset_config()
+    loaded = load_config()
+    assert loaded.llamacpp_root is None
