@@ -1,9 +1,6 @@
 """Tests for the llama.cpp backend."""
 
-from pathlib import Path
 from unittest.mock import Mock
-
-import pytest
 
 from vserve.backends.llamacpp import LlamaCppBackend
 

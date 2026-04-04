@@ -7,6 +7,7 @@ import pytest
 
 from vserve.backends import register, get_backend, get_backend_by_name, available_backends
 from vserve.backends.protocol import Backend
+from vserve.backends.vllm import VllmBackend
 
 
 @pytest.fixture(autouse=True)
@@ -71,8 +72,6 @@ def test_available_backends_filters_missing():
 
 
 # --- VllmBackend tests ---
-
-from vserve.backends.vllm import VllmBackend
 
 
 class TestVllmBackend:
