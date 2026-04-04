@@ -190,3 +190,20 @@ class TestVllmBackend:
         assert cfg["tool-call-parser"] == "hermes"
         assert cfg["reasoning-parser"] == "qwen3"
         assert cfg["max-num-batched-tokens"] == 4096
+
+
+# --- Auto-registration ---
+
+
+def test_default_backends_registered():
+    """Importing backends registers vllm and llamacpp."""
+    import importlib
+    from vserve.backends import _BACKENDS
+    _BACKENDS.clear()
+    import vserve.backends
+    importlib.reload(vserve.backends)
+
+    from vserve.backends import _BACKENDS as reloaded
+    names = [b.name for b in reloaded]
+    assert "vllm" in names
+    assert "llamacpp" in names

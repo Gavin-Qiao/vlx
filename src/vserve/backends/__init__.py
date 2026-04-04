@@ -38,3 +38,14 @@ def get_backend_by_name(name: str) -> Backend:
 def available_backends() -> list[Backend]:
     """Return only backends whose entrypoint is installed."""
     return [b for b in _BACKENDS if b.find_entrypoint() is not None]
+
+
+# Auto-register built-in backends on import
+def _register_defaults() -> None:
+    from vserve.backends.vllm import VllmBackend
+    from vserve.backends.llamacpp import LlamaCppBackend
+    register(VllmBackend())
+    register(LlamaCppBackend())
+
+
+_register_defaults()
