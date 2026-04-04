@@ -765,79 +765,77 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
     console.print()
 
 
-def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
-    """Stop any running vLLM, start with given config, wait for health."""
-    from vserve.config import read_profile_yaml
-    from vserve.serve import start_vllm, stop_vllm, is_vllm_running
+def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
+    """Stop any running backend, start with given config, wait for health."""
+    import json
     import time
+    from vserve.config import read_profile_yaml
 
-    lock = _lock_or_exit("gpu", f"starting vLLM ({label})")
-    cfg = read_profile_yaml(cfg_path) or {}
+    lock = _lock_or_exit("gpu", f"starting {backend.display_name} ({label})")
+
+    # Read config (YAML for vLLM, JSON for llama.cpp)
+    if str(cfg_path).endswith(".json"):
+        cfg = json.loads(cfg_path.read_text())
+    else:
+        cfg = read_profile_yaml(cfg_path) or {}
 
     try:
         _session_or_exit()
 
-        if is_vllm_running():
-            console.print("[yellow]vLLM is already running.[/yellow]")
+        if backend.is_running():
+            console.print(f"[yellow]{backend.display_name} is already running.[/yellow]")
             if not typer.confirm("Stop and restart?", default=False):
                 lock.release()
                 return
             clear_session()
             try:
-                stop_vllm()
+                backend.stop()
             except RuntimeError as e:
                 console.print(f"[red]{e}[/red]")
             time.sleep(2)
 
-        ctx = cfg.get("max-model-len", "?")
+        ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
         ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-        console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan]")
-        console.print(f"  context: {ctx_d}  kv: {cfg.get('kv-cache-dtype', 'auto')}"
-                      f"  seqs: {cfg.get('max-num-seqs', '?')}")
+        console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan] ({backend.display_name})")
+        console.print(f"  context: {ctx_d}")
 
         try:
-            start_vllm(cfg_path)
+            backend.start(cfg_path)
         except RuntimeError as e:
-            from vserve.config import cfg as _cfg
-            svc = _cfg().service_name
             console.print(f"[red]{e}[/red]")
-            console.print(f"  Check: sudo journalctl -u {svc} --no-pager -n 20")
+            console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
             raise typer.Exit(1)
 
         from urllib.request import urlopen
         port = cfg.get("port", 8888)
-        health_url = f"http://localhost:{port}/health"
+        health = backend.health_url(port)
 
-        from vserve.config import cfg as _cfg
-        fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
-        if not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so")):
-            console.print("  [yellow]First run — compiling kernels (~5-10 min). Subsequent starts will be fast.[/yellow]")
+        # Backend-specific first-run messages
+        if backend.name == "vllm":
+            from vserve.config import cfg as _cfg
+            fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
+            if not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so")):
+                console.print("  [yellow]First run — compiling kernels (~5-10 min).[/yellow]")
 
-        console.print(f"  [dim]Waiting for {health_url} ...[/dim]")
+        console.print(f"  [dim]Waiting for {health} ...[/dim]")
         for i in range(150):  # 300s max
             time.sleep(2)
             try:
-                resp = urlopen(health_url, timeout=2)
+                resp = urlopen(health, timeout=2)
                 if resp.status == 200:
                     write_session(label)
-                    console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
+                    console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
                     console.print(f"  Config: {cfg_path}")
-                    from vserve.config import cfg as _cfg
-                    svc = _cfg().service_name
-                    console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
+                    console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
                     return
             except Exception:
                 pass
-            if i > 5 and not is_vllm_running():
-                from vserve.config import cfg as _cfg
-                svc = _cfg().service_name
-                console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
+            if i > 5 and not backend.is_running():
+                console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
                 raise typer.Exit(1)
             if i > 0 and i % 15 == 0:
                 console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-        from vserve.config import cfg as _cfg
-        svc = _cfg().service_name
-        console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
+        console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
         raise typer.Exit(1)
     finally:
         lock.release()
@@ -1016,8 +1014,11 @@ def start(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
     tools: bool = typer.Option(False, "--tools", help="Enable tool/function calling"),
     tool_parser: str | None = typer.Option(None, "--tool-parser", help="Override tool-call parser (e.g. hermes, qwen3_coder)"),
+    backend_name: str | None = typer.Option(None, "--backend", help="Force backend (vllm, llamacpp)"),
 ):
     """Start serving a model — interactive config picker."""
+    from vserve.backends import get_backend, get_backend_by_name
+
     # Check session lock early — before interactive config
     _session_or_exit()
 
@@ -1042,36 +1043,51 @@ def start(
     else:
         m = _resolve_model(model)
 
+    if backend_name:
+        backend = get_backend_by_name(backend_name)
+    else:
+        backend = get_backend(m)
+
     if tool_parser and not tools:
         tools = True
     cfg_path = _custom_config(m, tools=tools, tool_parser=tool_parser)
-    _launch_vllm(cfg_path, m.model_name)
+    _launch_backend(backend, cfg_path, m.model_name)
 
 
 @app.command()
 def stop():
-    """Stop the vLLM service."""
-    from vserve.serve import stop_vllm, is_vllm_running
+    """Stop the inference server."""
+    from vserve.backends import _BACKENDS
 
     _session_or_exit()
 
-    lock = _lock_or_exit("gpu", "stopping vLLM")
+    # Find which backend is running
+    running_backend = None
+    for b in _BACKENDS:
+        try:
+            if b.is_running():
+                running_backend = b
+                break
+        except Exception:
+            continue
+
+    if running_backend is None:
+        clear_session()
+        console.print("[dim]No server is running.[/dim]")
+        return
+
+    lock = _lock_or_exit("gpu", f"stopping {running_backend.display_name}")
     try:
         _session_or_exit()  # re-check under flock (TOCTOU)
 
-        if not is_vllm_running():
-            clear_session()
-            console.print("[dim]vLLM is not running.[/dim]")
-            return
-
         try:
-            stop_vllm()
+            running_backend.stop()
         except RuntimeError as e:
             clear_session()
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(1)
         clear_session()
-        console.print("[green]vLLM stopped.[/green]")
+        console.print(f"[green]{running_backend.display_name} stopped.[/green]")
     finally:
         lock.release()
 
