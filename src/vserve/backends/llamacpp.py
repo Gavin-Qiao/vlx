@@ -242,9 +242,35 @@ class LlamaCppBackend:
         return f"http://localhost:{port}/health"
 
     def detect_tools(self, model_path: Path) -> dict:
-        """Check if model supports tool calling via chat template."""
+        """Check if model supports tool calling via chat template or GGUF metadata."""
         from vserve.tools import supports_tools
-        return {"supports_tools": supports_tools(model_path)}
+        if supports_tools(model_path):
+            return {"supports_tools": True}
+        # Fall back to checking GGUF embedded template
+        return {"supports_tools": self._gguf_has_tools(model_path)}
+
+    def _gguf_has_tools(self, model_path: Path) -> bool:
+        """Check GGUF file's embedded chat template for tool markers."""
+        import re
+        gguf_files = sorted(model_path.glob("*.gguf"))
+        if not gguf_files:
+            return False
+        try:
+            from gguf import GGUFReader  # type: ignore[import-untyped]
+            reader = GGUFReader(str(gguf_files[0]))
+            field = reader.fields.get("tokenizer.chat_template")
+            if field is None:
+                return False
+            raw = field.parts[-1]
+            if hasattr(raw, "tobytes"):
+                template = raw.tobytes().decode("utf-8", errors="replace")
+            elif isinstance(raw, bytes):
+                template = raw.decode("utf-8", errors="replace")
+            else:
+                template = str(raw)
+            return bool(re.search(r"\btools\b", template))
+        except Exception:
+            return False
 
     def doctor_checks(self) -> list[tuple[str, Callable[[], bool]]]:
         def check_binary() -> bool:
