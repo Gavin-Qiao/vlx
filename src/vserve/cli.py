@@ -860,7 +860,7 @@ def tune(
         console.print(f"  [green]Saved to {lim_path}[/green]")
 
         # Offer pre-caching for vLLM (flashinfer JIT compilation)
-        if backend.name == "vllm" and not model:
+        if backend.name == "vllm" and not model and not all_models:
             # Only offer pre-cache in interactive mode (bare `vserve tune`)
             try:
                 from vserve.config import cfg as _cfg2
