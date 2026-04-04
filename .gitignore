@@ -9,3 +9,6 @@ docs/superpowers/
 docs/plans/
 docs/specs/
 .worktrees/
+node_modules/
+bun.lock
+package.json
