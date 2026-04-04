@@ -78,8 +78,30 @@ def _lock_or_exit(name: str, description: str) -> VserveLock:
     return lock
 
 
+def _all_models() -> list[ModelInfo]:
+    """Scan model directories for all registered backends."""
+    from vserve.backends import _BACKENDS
+    all_m: list[ModelInfo] = []
+    seen: set = set()
+    # Always include the legacy MODELS_DIR (vLLM)
+    for m in scan_models(MODELS_DIR):
+        if m.path not in seen:
+            all_m.append(m)
+            seen.add(m.path)
+    # Scan additional backend model dirs
+    for b in _BACKENDS:
+        models_dir = b.root_dir / "models"
+        if models_dir == MODELS_DIR or not models_dir.exists():
+            continue
+        for m in scan_models(models_dir):
+            if m.path not in seen:
+                all_m.append(m)
+                seen.add(m.path)
+    return all_m
+
+
 def _resolve_model(query: str) -> ModelInfo:
-    models = scan_models(MODELS_DIR)
+    models = _all_models()
     if not models:
         console.print("[red]No models found.[/red] Run: vserve download")
         raise typer.Exit(1)
@@ -144,7 +166,7 @@ def dashboard(ctx: typer.Context):
     from vserve.backends import running_backend as _running_backend
     from vserve.config import active_yaml_path, read_profile_yaml
 
-    models = scan_models(MODELS_DIR)
+    models = _all_models()
     probed = sum(
         1 for m in models if read_limits(limits_path(m.provider, m.model_name))
     )
@@ -255,7 +277,7 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     """List downloaded models."""
     from vserve.backends import _BACKENDS
 
-    all_models = scan_models(MODELS_DIR)
+    all_models = _all_models()
     if not all_models:
         console.print("[dim]No models found.[/dim] Run: vserve download")
         return
@@ -683,17 +705,16 @@ def tune(
         raise typer.Exit(1)
 
     from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
-    from vserve.probe import calculate_limits
     from vserve.config import write_limits
 
     # Resolve which models to tune
     if all_models:
-        models_to_tune = scan_models(MODELS_DIR)
+        models_to_tune = _all_models()
     elif model:
         m = _resolve_model(model)
         models_to_tune = [m]
     else:
-        all_m = scan_models(MODELS_DIR)
+        all_m = _all_models()
         if not all_m:
             console.print("[red]No models found.[/red] Run: vserve download")
             raise typer.Exit(1)
@@ -744,6 +765,13 @@ def tune(
     console.print(f"\n[bold]vserve tune[/bold]  [dim]{gpu.name} ({gpu.vram_total_gb:.0f} GB, util {gpu_util:.0%})[/dim]\n")
 
     for m in models_to_tune:
+        from vserve.backends import get_backend
+        try:
+            backend = get_backend(m)
+        except ValueError:
+            console.print(f"[bold]{m.full_name}[/bold]  [red]No backend available[/red]")
+            continue
+
         # Check cached limits (invalidate if gpu_util changed)
         lim_path = limits_path(m.provider, m.model_name)
         if not recalc:
@@ -753,24 +781,25 @@ def tune(
                 _print_limits_table(existing, m)
                 continue
 
-        # Check architecture fields
-        if m.num_kv_heads is None or m.head_dim is None or m.num_layers is None:
+        # For vLLM backend, check architecture fields
+        if backend.name == "vllm" and (m.num_kv_heads is None or m.head_dim is None or m.num_layers is None):
             console.print(f"[bold]{m.full_name}[/bold]")
             console.print("  [red]Missing architecture fields in config.json[/red]")
             console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
             continue
 
-        limits_data = calculate_limits(
-            model_info=m,
-            vram_total_gb=gpu.vram_total_gb,
-            gpu_mem_util=gpu_util,
-        )
+        try:
+            limits_data = backend.tune(m, gpu, gpu_mem_util=gpu_util)
+        except Exception as e:
+            console.print(f"[bold]{m.full_name}[/bold]  [red]{e}[/red]")
+            continue
 
         write_limits(lim_path, limits_data)
-        console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {m.quant_method or 'none'})[/dim]")
+        console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {backend.display_name})[/dim]")
         _print_limits_table(limits_data, m)
         tp = limits_data.get("tool_call_parser")
         rp = limits_data.get("reasoning_parser")
+        supports = limits_data.get("supports_tools")
         if tp or rp:
             parts = []
             if tp:
@@ -778,6 +807,9 @@ def tune(
             if rp:
                 parts.append(f"reasoning=[green]{rp}[/green]")
             console.print(f"  Capabilities: {' '.join(parts)}")
+        elif supports:
+            # llama.cpp: tools supported via --jinja, no parser name needed
+            console.print("  Capabilities: [green]tool calling (--jinja)[/green]")
         else:
             from vserve.tools import supports_tools as _supports_tools
             if _supports_tools(m.path):
@@ -794,25 +826,51 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
     if avail is not None:
         console.print(f"  [dim]KV cache: {avail} GB available[/dim]")
 
-    table = Table(show_header=True, box=None, padding=(0, 2))
-    table.add_column("Context", style="bold")
-    table.add_column("Auto KV", justify="right")
-    table.add_column("FP8 KV", justify="right")
+    # Detect format: llama.cpp uses flat int values, vLLM uses nested dicts
+    limits = limits_data.get("limits", {})
+    is_flat = any(isinstance(v, (int, type(None))) for v in limits.values())
 
-    for ctx_str in sorted(limits_data.get("limits", {}), key=int):
-        entry = limits_data["limits"][ctx_str]
-        ctx_val = int(ctx_str)
-        ctx_label = f"{ctx_val:,}"
+    if is_flat:
+        # llama.cpp format: {"4096": 8, "8192": 4, ...}
+        n_layers = limits_data.get("n_gpu_layers")
+        num_layers = limits_data.get("num_layers")
+        if n_layers is not None and num_layers:
+            offload = "full" if n_layers >= num_layers else f"{n_layers}/{num_layers} layers"
+            console.print(f"  [dim]GPU offload: {offload}[/dim]")
 
-        auto_val = entry.get("auto")
-        fp8_val = entry.get("fp8")
+        table = Table(show_header=True, box=None, padding=(0, 2))
+        table.add_column("Context", style="bold")
+        table.add_column("Parallel slots", justify="right")
 
-        auto_str = f"{auto_val} slots" if auto_val else "[dim]OOM[/dim]"
-        fp8_str = f"{fp8_val} slots" if fp8_val else "[dim]OOM[/dim]"
+        for ctx_str in sorted(limits, key=int):
+            entry = limits[ctx_str]
+            ctx_val = int(ctx_str)
+            ctx_label = f"{ctx_val:,}"
+            slot_str = f"{entry} slots" if entry else "[dim]OOM[/dim]"
+            table.add_row(ctx_label, slot_str)
 
-        table.add_row(ctx_label, auto_str, fp8_str)
+        console.print(table)
+    else:
+        # vLLM format: {"4096": {"auto": 64, "fp8": 128}, ...}
+        table = Table(show_header=True, box=None, padding=(0, 2))
+        table.add_column("Context", style="bold")
+        table.add_column("Auto KV", justify="right")
+        table.add_column("FP8 KV", justify="right")
 
-    console.print(table)
+        for ctx_str in sorted(limits, key=int):
+            entry = limits[ctx_str]
+            ctx_val = int(ctx_str)
+            ctx_label = f"{ctx_val:,}"
+
+            auto_val = entry.get("auto")
+            fp8_val = entry.get("fp8")
+
+            auto_str = f"{auto_val} slots" if auto_val else "[dim]OOM[/dim]"
+            fp8_str = f"{fp8_val} slots" if fp8_val else "[dim]OOM[/dim]"
+
+            table.add_row(ctx_label, auto_str, fp8_str)
+
+        console.print(table)
     console.print()
 
 
@@ -1161,7 +1219,7 @@ def start(
     _session_or_exit()
 
     if model is None:
-        all_models = scan_models(MODELS_DIR)
+        all_models = _all_models()
         if not all_models:
             console.print("[red]No models found.[/red] Run: vserve download")
             raise typer.Exit(1)
@@ -1944,7 +2002,7 @@ def doctor():
         _warn("tty group not found")
 
     # Models
-    all_models = scan_models(MODELS_DIR)
+    all_models = _all_models()
     probed = sum(1 for m in all_models if read_limits(limits_path(m.provider, m.model_name)))
     _ok(f"{len(all_models)} models downloaded, {probed} probed")
 

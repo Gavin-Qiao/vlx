@@ -115,12 +115,19 @@ class LlamaCppBackend:
             arch_field = reader.fields.get("general.architecture")
             if arch_field is not None:
                 raw = arch_field.parts[-1]
-                arch = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                if isinstance(raw, bytes):
+                    arch = raw.decode("utf-8")
+                elif hasattr(raw, 'tobytes'):
+                    arch = raw.tobytes().decode("utf-8")
+                else:
+                    arch = str(raw)
 
             def _get_int(key: str, default: int) -> int:
                 field = reader.fields.get(key)
                 if field is not None:
-                    return int(field.parts[-1])
+                    val = field.parts[-1]
+                    # gguf returns numpy arrays; extract scalar
+                    return int(val[0]) if hasattr(val, '__len__') and not isinstance(val, (str, bytes)) else int(val)
                 return default
 
             num_layers = _get_int(f"{arch}.block_count", 32)
