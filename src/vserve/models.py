@@ -19,6 +19,7 @@ class ModelInfo:
     num_kv_heads: int | None = None
     num_layers: int | None = None
     head_dim: int | None = None
+    is_gguf: bool = False
 
     @property
     def full_name(self) -> str:
@@ -42,6 +43,25 @@ def quant_flag(method: str | None) -> str:
 
 def detect_model(model_dir: Path) -> ModelInfo:
     config_path = model_dir / "config.json"
+    gguf_files = list(model_dir.glob("*.gguf"))
+
+    if gguf_files and not config_path.exists():
+        # GGUF-only model — no config.json
+        size_bytes = sum(f.stat().st_size for f in gguf_files)
+        size_gb = round(size_bytes / (1024**3), 1)
+        return ModelInfo(
+            path=model_dir,
+            provider=model_dir.parent.name,
+            model_name=model_dir.name,
+            architecture="gguf",
+            model_type="gguf",
+            quant_method=None,
+            max_position_embeddings=0,  # read from GGUF metadata at tune time
+            is_moe=False,
+            model_size_gb=size_gb,
+            is_gguf=True,
+        )
+
     if not config_path.exists():
         raise FileNotFoundError(f"No config.json in {model_dir}")
 
@@ -112,9 +132,14 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
         for model_dir in sorted(provider_dir.iterdir()):
             if not model_dir.is_dir():
                 continue
-            if not (model_dir / "config.json").exists():
+            has_config = (model_dir / "config.json").exists()
+            has_gguf = any(model_dir.glob("*.gguf"))
+            if not has_config and not has_gguf:
                 continue
-            models.append(detect_model(model_dir))
+            try:
+                models.append(detect_model(model_dir))
+            except Exception:
+                continue
     return models
 
 

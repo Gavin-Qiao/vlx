@@ -185,3 +185,26 @@ def test_fuzzy_match_full_path(models_root):
     full_path = str(models[0].path)
     matches = fuzzy_match(full_path, models)
     assert len(matches) == 1
+
+
+# --- GGUF model detection ---
+
+
+def test_detect_gguf_model(fake_gguf_model_dir):
+    m = detect_model(fake_gguf_model_dir)
+    assert m.provider == "bartowski"
+    assert m.model_name == "TestModel-8B-GGUF"
+    assert m.model_size_gb >= 0  # fake file is tiny
+    assert m.is_gguf is True
+    assert m.architecture == "gguf"
+
+
+def test_scan_models_finds_gguf(tmp_path, fake_gguf_model_dir):
+    models = scan_models(tmp_path / "models")
+    gguf_models = [m for m in models if m.is_gguf]
+    assert len(gguf_models) == 1
+
+
+def test_safetensors_model_not_gguf(fake_model_dir):
+    m = detect_model(fake_model_dir)
+    assert m.is_gguf is False

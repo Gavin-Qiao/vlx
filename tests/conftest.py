@@ -79,6 +79,20 @@ def fake_limits() -> dict:
 
 
 @pytest.fixture
+def fake_gguf_model_dir(tmp_path: Path) -> Path:
+    """Create a fake GGUF model directory."""
+    model_dir = tmp_path / "models" / "bartowski" / "TestModel-8B-GGUF"
+    model_dir.mkdir(parents=True)
+
+    (model_dir / "TestModel-8B-Q4_K_M.gguf").write_bytes(b"\0" * 4096)
+
+    tok_config = {"chat_template": "{% if tools %}tools{% endif %}{{ messages }}"}
+    (model_dir / "tokenizer_config.json").write_text(json.dumps(tok_config))
+
+    return model_dir
+
+
+@pytest.fixture
 def models_root(tmp_path: Path, fake_model_dir: Path) -> Path:
     """Return the models root containing fake_model_dir."""
     return tmp_path / "models"
