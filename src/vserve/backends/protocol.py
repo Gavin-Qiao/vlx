@@ -18,7 +18,11 @@ class Backend(Protocol):
     display_name: str
     service_name: str
     service_user: str
-    root_dir: Path
+
+    @property
+    def root_dir(self) -> Path:
+        """Root directory for this backend (e.g. /opt/vllm, /opt/llama-cpp)."""
+        ...
 
     def can_serve(self, model: ModelInfo) -> bool:
         """Can this backend serve this model? (format check)"""
