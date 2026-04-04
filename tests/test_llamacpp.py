@@ -81,6 +81,40 @@ class TestLlamaCppBuildConfig:
         cfg = b.build_config(m, choices)
         assert cfg["model"].endswith(".gguf")
 
+    def test_config_embedding_mode(self, fake_gguf_model_dir):
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+
+        choices = {
+            "context": 512,
+            "n_gpu_layers": 10,
+            "parallel": 8,
+            "port": 8888,
+            "embedding": True,
+            "pooling": "mean",
+        }
+        cfg = b.build_config(m, choices)
+        assert cfg["embedding"] is True
+        assert cfg["pooling"] == "mean"
+        assert "jinja" not in cfg  # no tool calling in embedding mode
+
+    def test_config_embedding_cls_pooling(self, fake_gguf_model_dir):
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+
+        choices = {
+            "context": 512,
+            "n_gpu_layers": 10,
+            "parallel": 1,
+            "port": 8888,
+            "embedding": True,
+            "pooling": "cls",
+        }
+        cfg = b.build_config(m, choices)
+        assert cfg["pooling"] == "cls"
+
 
 class TestLlamaCppQuant:
     def test_quant_flag_always_empty(self):
@@ -297,3 +331,175 @@ class TestLlamaCppLaunchScript:
         assert "model file.gguf" in script
         # The path should be single-quoted by shlex
         assert "'/opt/models/My Model Dir/model file.gguf'" in script
+
+
+class TestLlamaCppEmbedding:
+    def _mock_metadata(self, mocker, pooling=None):
+        meta = {
+            "arch": "nomic-bert",
+            "num_layers": 12,
+            "max_context": 8192,
+            "num_kv_heads": 12,
+            "head_dim": 64,
+            "pooling": pooling,
+        }
+        mocker.patch.object(LlamaCppBackend, "_read_gguf_metadata", return_value=meta)
+
+    def test_tune_embedding_model(self, fake_embedding_model_dir, mocker):
+        """tune() returns is_embedding and pooling for embedding models."""
+        self._mock_metadata(mocker, pooling="mean")
+        mocker.patch.object(LlamaCppBackend, "detect_tools", return_value={})
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_embedding_model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+        assert result["is_embedding"] is True
+        assert result["pooling"] == "mean"
+        assert result["supports_tools"] is False
+
+    def test_tune_embedding_guesses_pooling(self, fake_embedding_model_dir, mocker):
+        """tune() guesses pooling when GGUF metadata lacks it."""
+        self._mock_metadata(mocker, pooling=None)
+        mocker.patch.object(LlamaCppBackend, "detect_tools", return_value={})
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_embedding_model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+        assert result["is_embedding"] is True
+        assert result["pooling"] == "mean"  # nomic → mean
+
+    def test_tune_non_embedding_has_no_embedding_key(self, fake_gguf_model_dir, mocker):
+        """tune() for non-embedding models has no is_embedding key."""
+        mocker.patch.object(LlamaCppBackend, "_read_gguf_metadata", return_value={
+            "arch": "llama", "num_layers": 32, "max_context": 8192,
+            "num_kv_heads": 8, "head_dim": 128, "pooling": None,
+        })
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+        assert "is_embedding" not in result
+        assert "pooling" not in result
+
+    def test_build_config_embedding_no_jinja(self, fake_embedding_model_dir):
+        """Embedding config has --embedding but not --jinja."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_embedding_model_dir)
+
+        choices = {
+            "context": 512, "n_gpu_layers": 12, "parallel": 8,
+            "port": 8888, "embedding": True, "pooling": "mean",
+        }
+        cfg = b.build_config(m, choices)
+        assert cfg["embedding"] is True
+        assert cfg["pooling"] == "mean"
+        assert "jinja" not in cfg
+
+    def test_start_script_embedding_flags(self, mocker, tmp_path):
+        """Launch script includes --embedding and --pooling flags."""
+        import json
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        active = tmp_path / "configs" / "active.sh"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        cfg = {
+            "model": "/opt/llama-cpp/models/nomic/embed.gguf",
+            "host": "0.0.0.0", "port": 8888,
+            "ctx_size": 8192, "n_gpu_layers": 12, "parallel": 8,
+            "flash_attn": True,
+            "embedding": True, "pooling": "mean",
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "--embedding" in script
+        assert "--pooling mean" in script
+        assert "--jinja" not in script
+
+    def test_start_script_cls_pooling(self, mocker, tmp_path):
+        """Launch script respects cls pooling for BGE models."""
+        import json
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        active = tmp_path / "configs" / "active.sh"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        cfg = {
+            "model": "/opt/llama-cpp/models/bge/model.gguf",
+            "host": "0.0.0.0", "port": 8888,
+            "ctx_size": 512, "n_gpu_layers": 12, "parallel": 1,
+            "flash_attn": True,
+            "embedding": True, "pooling": "cls",
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "--pooling cls" in script
+
+    def test_start_script_no_pooling_when_absent(self, mocker, tmp_path):
+        """No --pooling flag when pooling is not set."""
+        import json
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        active = tmp_path / "configs" / "active.sh"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        cfg = {
+            "model": "/m/model.gguf", "host": "0.0.0.0", "port": 8888,
+            "ctx_size": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "flash_attn": True,
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "--pooling" not in script
+        assert "--embedding" not in script
+
+    def test_build_config_no_tools_no_embedding(self, fake_gguf_model_dir):
+        """Config with neither tools nor embedding has no jinja or embedding flags."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+
+        choices = {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        }
+        cfg = b.build_config(m, choices)
+        assert "jinja" not in cfg
+        assert "embedding" not in cfg
+        assert "pooling" not in cfg
+
+    def test_guess_pooling_case_insensitive(self):
+        assert LlamaCppBackend._guess_pooling("BGE-Large-EN-v1.5") == "cls"
+        assert LlamaCppBackend._guess_pooling("NOMIC-EMBED-TEXT") == "mean"
+        assert LlamaCppBackend._guess_pooling("Jina-Reranker-v2") == "rank"

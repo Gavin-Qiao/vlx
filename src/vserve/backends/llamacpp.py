@@ -87,10 +87,16 @@ class LlamaCppBackend:
                 parallel = 0
             limits[str(ctx)] = parallel if parallel >= 1 else None
 
-        tool_info = self.detect_tools(model.path)
+        # Embedding model detection
+        is_embedding = model.is_embedding
+        pooling = metadata.get("pooling")
+        if is_embedding and not pooling:
+            pooling = self._guess_pooling(model.model_name)
+
+        tool_info = self.detect_tools(model.path) if not is_embedding else {}
 
         from datetime import datetime, timezone
-        return {
+        result = {
             "backend": "llamacpp",
             "model_path": str(model.path),
             "calculated_at": datetime.now(timezone.utc).isoformat(),
@@ -105,6 +111,10 @@ class LlamaCppBackend:
             "supports_reasoning": tool_info.get("supports_reasoning", False),
             "limits": limits,
         }
+        if is_embedding:
+            result["is_embedding"] = True
+            result["pooling"] = pooling or "mean"
+        return result
 
     def _read_gguf_metadata(self, gguf_path: Path) -> dict:
         """Read model metadata from GGUF file header."""
@@ -138,12 +148,22 @@ class LlamaCppBackend:
             embedding_length = _get_int(f"{arch}.embedding_length", 4096)
             head_dim = embedding_length // num_attn_heads if num_attn_heads else 128
 
+            # Detect pooling type (embedding models)
+            pooling_field = reader.fields.get("tokenizer.ggml.pooling_type")
+            pooling = None
+            if pooling_field is not None:
+                val = pooling_field.parts[-1]
+                pval = int(val[0]) if hasattr(val, '__len__') and not isinstance(val, (str, bytes)) else int(val)
+                # llama.cpp: 0=none, 1=mean, 2=cls, 3=last, 4=rank
+                pooling = {0: "none", 1: "mean", 2: "cls", 3: "last", 4: "rank"}.get(pval)
+
             return {
                 "arch": arch,
                 "num_layers": num_layers,
                 "max_context": max_context,
                 "num_kv_heads": num_kv_heads,
                 "head_dim": head_dim,
+                "pooling": pooling,
             }
         except ImportError:
             raise ImportError(
@@ -154,6 +174,17 @@ class LlamaCppBackend:
             import sys
             print(f"[vserve] warning: failed to read GGUF metadata from {gguf_path}", file=sys.stderr)
             return {}
+
+    @staticmethod
+    def _guess_pooling(model_name: str) -> str:
+        """Guess pooling type from model name when GGUF metadata is absent."""
+        name = model_name.lower()
+        if "bge" in name:
+            return "cls"
+        if "rerank" in name:
+            return "rank"
+        # nomic, e5, jina, mxbai, snowflake, qwen-embed all use mean
+        return "mean"
 
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
         """Build llama-server JSON config."""
@@ -176,7 +207,11 @@ class LlamaCppBackend:
             "parallel": choices.get("parallel", 1),
             "flash_attn": True,
         }
-        if choices.get("tools"):
+        if choices.get("embedding"):
+            cfg["embedding"] = True
+            if choices.get("pooling"):
+                cfg["pooling"] = choices["pooling"]
+        elif choices.get("tools"):
             cfg["jinja"] = True
         return cfg
 
@@ -206,6 +241,10 @@ class LlamaCppBackend:
         # Boolean flags
         if cfg.get("flash_attn"):
             args.extend(["-fa", "on"])
+        if cfg.get("embedding"):
+            args.append("--embedding")
+        if cfg.get("pooling"):
+            args.extend(["--pooling", str(cfg["pooling"])])
         if cfg.get("jinja"):
             args.append("--jinja")
 

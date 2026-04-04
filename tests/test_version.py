@@ -177,24 +177,51 @@ class TestBackgroundRefresh:
             V.background_refresh()
             mock_pypi.assert_not_called()
 
+    def test_failure_clears_stale_latest(self):
+        """PyPI failure writes current version, clearing any bogus latest."""
+        _write_cache(latest="9.9.9", current=V.__version__, age=V.STALE_SECONDS + 1)
+        with patch("vserve.version.check_pypi", return_value=None):
+            V.background_refresh()
+            import threading
+            for t in threading.enumerate():
+                if t.daemon and t.is_alive():
+                    t.join(timeout=3)
+            cache = V.read_cache()
+            # Should have written current version, not kept 9.9.9
+            assert cache["latest"] == V.__version__
+
+    def test_failure_no_update_notice(self):
+        """After PyPI failure, update_available returns None."""
+        _write_cache(latest="9.9.9", current=V.__version__, age=V.STALE_SECONDS + 1)
+        with patch("vserve.version.check_pypi", return_value=None):
+            V.background_refresh()
+            import threading
+            for t in threading.enumerate():
+                if t.daemon and t.is_alive():
+                    t.join(timeout=3)
+            assert V.update_available() is None
+
 
 # ── CLI: vserve version ──────────────────────────────
 
 
 class TestVersionCommand:
-    def test_shows_current(self):
+    def test_shows_current(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
         result = runner.invoke(app, ["version"])
         assert result.exit_code == 0
         assert V.__version__ in result.output
 
-    def test_shows_update(self):
+    def test_shows_update(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
         _write_cache(latest="9.9.9", current=V.__version__)
         result = runner.invoke(app, ["version"])
         assert result.exit_code == 0
         assert "9.9.9" in result.output
         assert "Update available" in result.output
 
-    def test_no_update(self):
+    def test_no_update(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
         _write_cache(latest=V.__version__, current=V.__version__)
         result = runner.invoke(app, ["version"])
         assert result.exit_code == 0
@@ -205,24 +232,26 @@ class TestVersionCommand:
 
 
 class TestUpdateCommand:
-    def test_already_up_to_date(self):
+    def test_already_up_to_date(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
         with patch("vserve.version.check_pypi", return_value=V.__version__):
             result = runner.invoke(app, ["update"])
             assert result.exit_code == 0
             assert "up to date" in result.output
 
-    def test_upgrade_via_uv(self):
+    def test_upgrade_via_uv(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
         with patch("vserve.version.check_pypi", return_value="9.9.9"), \
              patch("shutil.which", return_value="/usr/bin/uv"), \
              patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="vserve v0.1.0\n")
             result = runner.invoke(app, ["update"])
             assert result.exit_code == 0
-            # Should call uv tool upgrade
             calls = [str(c) for c in mock_run.call_args_list]
             assert any("upgrade" in c for c in calls)
 
-    def test_no_package_manager(self):
+    def test_no_package_manager(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
         with patch("vserve.version.check_pypi", return_value="9.9.9"), \
              patch("shutil.which", return_value=None):
             result = runner.invoke(app, ["update"])

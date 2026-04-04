@@ -13,26 +13,41 @@ _vllm_root="/opt/vllm"
 _svc_name="vllm"
 _port="8888"
 
+_llamacpp_root=""
+
 if [ -f "$_vserve_cfg" ]; then
     _vllm_root="$(grep '^vllm_root:' "$_vserve_cfg" 2>/dev/null | sed 's/vllm_root: *//')" || _vllm_root="/opt/vllm"
     _svc_name="$(grep '^service_name:' "$_vserve_cfg" 2>/dev/null | sed 's/service_name: *//')" || _svc_name="vllm"
     _port="$(grep '^port:' "$_vserve_cfg" 2>/dev/null | sed 's/port: *//')" || _port="8888"
+    _llamacpp_root="$(grep '^llamacpp_root:' "$_vserve_cfg" 2>/dev/null | sed 's/llamacpp_root: *//')"
 fi
 
 # ── Gather data ──────────────────────────────────────
 
 _s="inactive"
 systemctl is-active --quiet "$_svc_name" 2>/dev/null && _s="active"
+# Also check llama-cpp service
+if [ "$_s" = "inactive" ] && [ -n "$_llamacpp_root" ]; then
+    systemctl is-active --quiet "llama-cpp" 2>/dev/null && _s="active"
+fi
 
 _m=""
 _active="$_vllm_root/configs/active.yaml"
 if [ -f "$_active" ]; then
     _m="$(grep '^model:' "$_active" 2>/dev/null | sed "s|model: *${_vllm_root}/models/||; s|model: *||")"
 fi
+# Fall back to llama.cpp active config
+if [ -z "$_m" ] && [ -n "$_llamacpp_root" ] && [ -f "$_llamacpp_root/configs/active.json" ]; then
+    _m="$(grep -o '"model" *: *"[^"]*"' "$_llamacpp_root/configs/active.json" 2>/dev/null | sed 's/"model" *: *"//;s/"$//' | sed 's|.*/||')"
+fi
 
 _mc=0
 if [ -d "$_vllm_root/models" ]; then
     _mc="$(/usr/bin/find "$_vllm_root/models" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)"
+fi
+if [ -n "$_llamacpp_root" ] && [ -d "$_llamacpp_root/models" ]; then
+    _lc_mc="$(/usr/bin/find "$_llamacpp_root/models" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)"
+    _mc=$((_mc + _lc_mc))
 fi
 
 _gpu_q="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,name --format=csv,noheader,nounits 2>/dev/null)"
@@ -121,12 +136,13 @@ fi
 _sep="$(gum style --foreground 238 '────────────────────────────────────────────────────────')"
 
 _sec_cmds="$(gum join --vertical \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve download [model]')"    "$(gum style --foreground 240 'search & download from HuggingFace')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve start [model]')"        "$(gum style --foreground 240 'start serving (interactive config)')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve stop')"              "$(gum style --foreground 240 'stop the vLLM service')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve list')"              "$(gum style --foreground 240 'list models with limits & capabilities')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve add [model]')"       "$(gum style --foreground 240 'search & download from HuggingFace')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve rm [model]')"        "$(gum style --foreground 240 'remove a downloaded model')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve tune [model]')"      "$(gum style --foreground 240 'calculate context & concurrency limits')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve run [model]')"       "$(gum style --foreground 240 'start serving (interactive config)')")" \
+    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve stop')"              "$(gum style --foreground 240 'stop the inference server')")" \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve status')"            "$(gum style --foreground 240 'show what is currently serving')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve models')"            "$(gum style --foreground 240 'list models with limits & profiles')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve tune [model] [prof]')"  "$(gum style --foreground 240 'probe limits + benchmark')")" \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve fan [auto|off|30-100]')" "$(gum style --foreground 240 'GPU fan control')")" \
     "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve doctor')"            "$(gum style --foreground 240 'check system readiness')")" \
 )"
@@ -156,8 +172,8 @@ _body="$(gum join --vertical \
 gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2" "$_body"
 
 unset -f _lbl _mkbar
-unset _vserve_cfg _vllm_root _svc_name _port
-unset _s _m _mc _active _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
+unset _vserve_cfg _vllm_root _llamacpp_root _svc_name _port
+unset _s _m _mc _lc_mc _active _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
 unset _proc_data _ph _prows _row
 unset _update_cache _uc_current _uc_latest

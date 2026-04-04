@@ -25,6 +25,17 @@ class ModelInfo:
     def full_name(self) -> str:
         return f"{self.provider}/{self.model_name}"
 
+    @property
+    def is_embedding(self) -> bool:
+        name = self.model_name.lower()
+        arch = self.architecture.lower()
+        return (
+            "embed" in name or "embed" in arch
+            or "e5" in name.split("-")
+            or "bge" in name.split("-")
+            or "rerank" in name
+        )
+
 
 QUANT_FLAGS = {
     "gptq": "--quantization gptq_marlin",

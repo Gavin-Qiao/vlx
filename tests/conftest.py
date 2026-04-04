@@ -93,6 +93,17 @@ def fake_gguf_model_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def fake_embedding_model_dir(tmp_path: Path) -> Path:
+    """Create a fake GGUF embedding model directory."""
+    model_dir = tmp_path / "models" / "nomic-ai" / "nomic-embed-text-v1.5-GGUF"
+    model_dir.mkdir(parents=True)
+
+    (model_dir / "nomic-embed-text-v1.5-Q8_0.gguf").write_bytes(b"\0" * 2048)
+
+    return model_dir
+
+
+@pytest.fixture
 def models_root(tmp_path: Path, fake_model_dir: Path) -> Path:
     """Return the models root containing fake_model_dir."""
     return tmp_path / "models"

@@ -9,7 +9,7 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![vLLM 0.19+](https://img.shields.io/badge/vLLM-0.19%2B-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-264%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-318%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
@@ -40,10 +40,10 @@ pip install 'vserve[llamacpp]'
 
 ```bash
 vserve init                        # scan GPU, backends, CUDA, systemd — write config
-vserve download                    # search HuggingFace, pick variant, download
-vserve start <model>               # auto-tune + interactive config + serve
-vserve start <model> --tools       # enable tool calling (auto-detected)
-vserve start <model> --backend llamacpp  # force a specific backend
+vserve add                         # search HuggingFace, pick variant, download
+vserve run <model>                 # auto-tune + interactive config + serve
+vserve run <model> --tools         # enable tool calling (auto-detected)
+vserve run <model> --backend llamacpp  # force a specific backend
 ```
 
 ---
@@ -57,7 +57,7 @@ vserve auto-detects the right backend from the model format:
 | safetensors, GPTQ, AWQ, FP8 | **vLLM** | PagedAttention, continuous batching |
 | GGUF | **llama.cpp** | CPU/GPU offload, quantized inference |
 
-No configuration needed — download a model and `vserve start` picks the right engine.
+No configuration needed — download a model and `vserve run` picks the right engine.
 
 ### vLLM
 
@@ -85,7 +85,7 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 - **Download** — search HuggingFace, see available weight variants (FP8, NVFP4, BF16, GGUF) with sizes, download only what you need
 - **Auto-tune** — calculate exactly what context lengths and concurrency your GPU can handle, based on model architecture and available VRAM
 - **Tool calling** — auto-detects the correct parser from the model's chat template (vLLM) or uses `--jinja` (llama.cpp)
-- **Start/Stop** — interactive config wizard, systemd service management, health check with timeout
+- **Run/Stop** — interactive config wizard, systemd service management, health check with timeout
 - **Fan control** — temperature-based curve daemon with quiet hours, or hold a fixed speed
 - **Multi-user** — session-based GPU ownership prevents other users from disrupting your running model
 - **Doctor** — diagnose GPU, CUDA, backend, systemd issues with actionable fix suggestions
@@ -98,19 +98,22 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 |:--------|:------------|
 | `vserve` | Dashboard — GPU, models, status |
 | `vserve init` | Auto-discover backends and write config |
-| `vserve download [model]` | Search and download from HuggingFace with variant picker |
-| `vserve models [name]` | List models with backend, tools, and limits |
+| `vserve list [name]` | List models with backend, tools, and limits |
+| `vserve add [model]` | Search and download from HuggingFace with variant picker |
+| `vserve rm <name>` | Remove a downloaded model |
 | `vserve tune [model]` | Calculate context/concurrency limits |
-| `vserve start [model]` | Configure and start serving (auto-tunes if needed) |
-| `vserve start <model> --tools` | Start with tool calling enabled |
-| `vserve start <model> --backend llamacpp` | Force a specific backend |
+| `vserve run [model]` | Configure and start serving (auto-tunes if needed) |
+| `vserve run <model> --tools` | Start with tool calling enabled |
+| `vserve run <model> --backend llamacpp` | Force a specific backend |
 | `vserve stop` | Stop the running server |
 | `vserve status` | Show current serving config |
 | `vserve fan [auto\|off\|30-100]` | GPU fan control with temp-based curve |
 | `vserve doctor` | Check system readiness |
 | `vserve cache clean [--all]` | Clean stale sockets and JIT caches |
+| `vserve version` | Show current version and check for updates |
+| `vserve update` | Update vserve to the latest version |
 
-All commands support **fuzzy matching** — `vserve start qwen fp8` finds the right model.
+All commands support **fuzzy matching** — `vserve run qwen fp8` finds the right model.
 
 ---
 
@@ -237,7 +240,7 @@ The registry auto-detects the right backend from the model format. All CLI comma
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 264 tests
+uv run pytest tests/              # 318 tests
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/           # type check
 ```

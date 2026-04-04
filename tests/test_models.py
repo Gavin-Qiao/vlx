@@ -239,3 +239,85 @@ def test_mixed_safetensors_and_gguf_prefers_safetensors(tmp_path):
     }))
     m = detect_model(model_dir)
     assert m.is_gguf is False
+
+
+def test_is_embedding_by_name():
+    from vserve.models import ModelInfo
+    from pathlib import Path
+
+    for name, expected in [
+        ("nomic-embed-text-v1.5-GGUF", True),
+        ("Qwen3-Embedding-8B", True),
+        ("bge-base-en-v1.5-gguf", True),
+        ("e5-small-v2-gguf", True),
+        ("jina-reranker-v2-GGUF", True),
+        ("Qwen3.5-27B-FP8", False),
+        ("Llama-3-8B", False),
+    ]:
+        m = ModelInfo(
+            path=Path(f"/fake/{name}"), provider="test", model_name=name,
+            architecture="gguf", model_type="gguf", quant_method=None,
+            max_position_embeddings=0, is_moe=False, model_size_gb=1.0,
+        )
+        assert m.is_embedding is expected, f"{name}: expected {expected}"
+
+
+def test_is_embedding_by_architecture():
+    """is_embedding detects from architecture field."""
+    from vserve.models import ModelInfo
+    from pathlib import Path
+
+    m = ModelInfo(
+        path=Path("/fake/SomeModel"), provider="test", model_name="SomeModel",
+        architecture="BertForEmbedding", model_type="bert", quant_method=None,
+        max_position_embeddings=512, is_moe=False, model_size_gb=0.5,
+    )
+    assert m.is_embedding is True
+
+    m2 = ModelInfo(
+        path=Path("/fake/LLM"), provider="test", model_name="LLM",
+        architecture="LlamaForCausalLM", model_type="llama", quant_method=None,
+        max_position_embeddings=32768, is_moe=False, model_size_gb=7.0,
+    )
+    assert m2.is_embedding is False
+
+
+def test_is_embedding_edge_cases():
+    """is_embedding handles hyphenated names correctly."""
+    from vserve.models import ModelInfo
+    from pathlib import Path
+
+    for name, expected in [
+        ("bge-m3-GGUF", True),
+        ("my-bge-model", True),
+        ("e5-large-v2", True),
+        ("Qwen3-Embedding-8B", True),
+        ("e5x-model", False),  # "e5" must be a whole segment
+        ("biggest-model", False),  # contains "e5" but not as a segment
+    ]:
+        m = ModelInfo(
+            path=Path(f"/fake/{name}"), provider="test", model_name=name,
+            architecture="gguf", model_type="gguf", quant_method=None,
+            max_position_embeddings=0, is_moe=False, model_size_gb=1.0,
+        )
+        assert m.is_embedding is expected, f"{name}: expected {expected}"
+
+
+def test_detect_gguf_model_no_config(tmp_path):
+    """GGUF model without config.json still detected."""
+    model_dir = tmp_path / "models" / "user" / "Model-GGUF"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model-Q4_K_M.gguf").write_bytes(b"\0" * 8192)
+    # No config.json, no tokenizer_config.json
+    m = detect_model(model_dir)
+    assert m.is_gguf is True
+    assert m.architecture == "gguf"
+    assert m.model_size_gb >= 0
+
+
+def test_guess_pooling():
+    from vserve.backends.llamacpp import LlamaCppBackend
+    assert LlamaCppBackend._guess_pooling("bge-base-en-v1.5-gguf") == "cls"
+    assert LlamaCppBackend._guess_pooling("nomic-embed-text-v1.5") == "mean"
+    assert LlamaCppBackend._guess_pooling("jina-reranker-v2") == "rank"
+    assert LlamaCppBackend._guess_pooling("e5-small-v2") == "mean"

@@ -1,6 +1,6 @@
 [project]
 name = "vserve"
-version = "0.4.0"
+version = "0.5.0"
 description = "CLI for managing LLM inference on GPU workstations"
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,7 @@ dependencies = [
     "huggingface-hub>=0.30",
     "pyyaml>=6",
     "nvidia-ml-py>=13.595.45",
+    "simple-term-menu>=1.6",
 ]
 
 [project.optional-dependencies]

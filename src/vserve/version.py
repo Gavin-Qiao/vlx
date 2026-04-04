@@ -95,8 +95,8 @@ def background_refresh() -> None:
 
     def _refresh() -> None:
         latest = check_pypi()
-        if latest:
-            write_cache(latest)
+        # Always write — on failure, use current version to clear stale data
+        write_cache(latest or __version__)
 
     t = threading.Thread(target=_refresh, daemon=True)
     t.start()

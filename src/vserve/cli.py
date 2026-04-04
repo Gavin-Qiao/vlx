@@ -103,7 +103,7 @@ def _all_models() -> list[ModelInfo]:
 def _resolve_model(query: str) -> ModelInfo:
     models = _all_models()
     if not models:
-        console.print("[red]No models found.[/red] Run: vserve download")
+        console.print("[red]No models found.[/red] Run: vserve add")
         raise typer.Exit(1)
     matches = fuzzy_match(query, models)
     if len(matches) == 0:
@@ -197,15 +197,18 @@ def dashboard(ctx: typer.Context):
     cmd_tbl.add_column(min_width=26)
     cmd_tbl.add_column(style="dim")
     for cmd, desc in [
-        ("download [model]", "Search & download from HuggingFace"),
-        ("start [model]", "Start serving (interactive config picker)"),
+        ("list", "List models with limits & capabilities"),
+        ("add [model]", "Search & download from HuggingFace"),
+        ("rm [model]", "Remove a downloaded model"),
+        ("tune [model]", "Calculate context & concurrency limits"),
+        ("run [model]", "Start serving (interactive config)"),
         ("stop", "Stop the inference server"),
         ("status", "Show what's currently serving"),
-        ("models", "List models with limits & profiles"),
-        ("tune [model]", "Calculate context & concurrency limits"),
         ("fan [auto|off|30-100]", "GPU fan control with temp curve"),
         ("doctor", "Check system readiness"),
         ("init", "Auto-discover backends and write config"),
+        ("version", "Show current version"),
+        ("update", "Update to the latest version"),
     ]:
         cmd_tbl.add_row(_Txt(cmd, style="bold cyan"), desc)
 
@@ -272,14 +275,14 @@ def update():
     console.print("Run manually: [cyan]uv tool upgrade vserve[/cyan] or [cyan]pip install -U vserve[/cyan]")
 
 
-@app.command()
-def models(model: str = typer.Argument(None, help="Model name for detail view")):
+@app.command(name="list")
+def list_models(model: str = typer.Argument(None, help="Model name for detail view")):
     """List downloaded models."""
     from vserve.backends import _BACKENDS
 
     all_models = _all_models()
     if not all_models:
-        console.print("[dim]No models found.[/dim] Run: vserve download")
+        console.print("[dim]No models found.[/dim] Run: vserve add")
         return
 
     if model:
@@ -344,6 +347,12 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     console.print(table)
 
 
+@app.command(name="ls", hidden=True)
+def ls(model: str = typer.Argument(None, help="Model name for detail view")):
+    """List downloaded models (alias for list)."""
+    list_models(model)
+
+
 def _show_model_detail(m: ModelInfo):
     lim = read_limits(limits_path(m.provider, m.model_name))
 
@@ -381,33 +390,123 @@ def _show_model_detail(m: ModelInfo):
     console.print()
 
 
+def _is_interactive() -> bool:
+    """True when stdin is a real terminal (not CI, not CliRunner)."""
+    import sys
+    return sys.stdin.isatty()
+
+
 def _has_gum() -> bool:
     import shutil
     return shutil.which("gum") is not None
 
 
-def _gum_input(placeholder: str) -> str | None:
-    """Interactive text input via gum. Returns None on Esc/Ctrl-C."""
-    import subprocess
-    r = subprocess.run(
-        ["gum", "input", "--placeholder", placeholder, "--width", "60"],
-        stdout=subprocess.PIPE, text=True,
+def _pick(items: list[str], title: str = "") -> int | None:
+    """Single-select menu. Returns index or None on cancel.
+
+    Uses gum → simple-term-menu → numbered prompt (best available).
+    """
+    if not _is_interactive():
+        # CI / CliRunner fallback
+        for i, item in enumerate(items, 1):
+            console.print(f"  {i}) {item}")
+        while True:
+            choice = typer.prompt(title or "Choice")
+            try:
+                n = int(choice)
+                if 1 <= n <= len(items):
+                    return n - 1
+            except ValueError:
+                pass
+            console.print(f"[red]Enter a number 1-{len(items)}.[/red]")
+
+    if _has_gum():
+        import subprocess
+        cmd = ["gum", "choose", "--cursor.foreground", "6", "--item.faint"]
+        if title:
+            cmd.extend(["--header", title])
+        cmd.extend(items)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        selected = r.stdout.strip()
+        for i, item in enumerate(items):
+            if item == selected:
+                return i
+        return None
+
+    from simple_term_menu import TerminalMenu
+    menu = TerminalMenu(
+        items, title=title,
+        menu_cursor="❯ ",
+        menu_cursor_style=("fg_cyan", "bold"),
+        menu_highlight_style=("standout",),
+        cycle_cursor=True,
+        status_bar="  ↑↓ navigate · enter select · q cancel",
+        status_bar_style=("fg_gray",),
     )
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    idx = menu.show()
+    return idx  # type: ignore[return-value]
 
 
-def _gum_filter(items: list[str], header: str = "") -> str | None:
-    """Interactive fuzzy filter via gum. Returns None on Esc/Ctrl-C."""
-    import subprocess
-    cmd = ["gum", "filter", "--height", "15", "--placeholder", "Type to filter..."]
-    if header:
-        cmd.extend(["--header", header])
-    r = subprocess.run(cmd, input="\n".join(items), stdout=subprocess.PIPE, text=True)
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+def _pick_many(items: list[str], title: str = "") -> list[int]:
+    """Multi-select menu. Returns list of indices.
+
+    Uses gum → simple-term-menu → numbered prompt (best available).
+    """
+    if not _is_interactive():
+        for i, item in enumerate(items, 1):
+            console.print(f"  {i}) {item}")
+        answer = typer.prompt(title or "Select (e.g. 1 or 1,2)", default="")
+        if not answer:
+            return []
+        indices: list[int] = []
+        for part in answer.replace(",", " ").split():
+            try:
+                n = int(part)
+                if 1 <= n <= len(items):
+                    indices.append(n - 1)
+            except ValueError:
+                pass
+        return indices
+
+    if _has_gum():
+        import subprocess
+        cmd = [
+            "gum", "choose", "--no-limit",
+            "--cursor.foreground", "6",
+            "--selected.foreground", "2", "--selected.bold",
+        ]
+        if title:
+            cmd.extend(["--header", title])
+        cmd.extend(items)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+        selected_lines = r.stdout.strip().split("\n")
+        return [i for i, item in enumerate(items) if item in selected_lines]
+
+    from simple_term_menu import TerminalMenu
+    menu = TerminalMenu(
+        items, title=title,
+        multi_select=True,
+        show_multi_select_hint=True,
+        menu_cursor="❯ ",
+        menu_cursor_style=("fg_cyan", "bold"),
+        multi_select_cursor_style=("fg_green", "bold"),
+        menu_highlight_style=("standout",),
+        cycle_cursor=True,
+        status_bar="  ↑↓ navigate · space toggle · enter confirm · q cancel",
+        status_bar_style=("fg_gray",),
+    )
+    result = menu.show()
+    if result is None:
+        return []
+    return list(result) if isinstance(result, tuple) else [result]
 
 
 @app.command()
-def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")):
+def add(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qwen/Qwen3.5-27B-FP8)")):
     """Search and download a model from HuggingFace."""
     from huggingface_hub import snapshot_download, HfApi
     from vserve.config import cfg as _cfg
@@ -427,19 +526,13 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
             return
         # Not found — fall through to keyword search
 
-    use_gum = _has_gum()
-
     # Search loop
     query = model_id or ""
     results: list = []
     while True:
         if not query:
-            if use_gum:
-                query = _gum_input("Search HuggingFace (e.g. qwen 27b fp8)") or ""
-            else:
-                query = typer.prompt("\nSearch HuggingFace (Ctrl-C to quit)")
+            query = typer.prompt("\nSearch HuggingFace (Ctrl-C to quit)")
             if not query:
-                # Esc/Ctrl-C in gum input — exit
                 return
 
         # Only re-search if we don't already have results for this query
@@ -457,85 +550,29 @@ def download(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.
                 query = ""
                 continue
 
-        if use_gum:
-            lines = []
-            for m in results:
-                dl = f"{m.downloads:,}" if m.downloads else "?"
-                lines.append(f"{m.id}  ({dl} downloads)")
+        lines = []
+        for m in results:
+            dl = f"{m.downloads:,}" if m.downloads else "?"
+            lines.append(f"{m.id}  ({dl} downloads)")
 
-            selected = _gum_filter(lines, header=f"Results for '{query}' — Esc to search again")
-            if selected is None:
-                query = ""
-                results = []
-                continue
-
-            picked_id = selected.split("  (")[0]
-            if _download_model(picked_id, models_dir, snapshot_download, api):
-                return
-            # User backed out of variant picker — re-show same results
-            console.clear()
-            continue
-        else:
-            console.print()
-            for i, m in enumerate(results, 1):
-                dl = f"{m.downloads:,}" if m.downloads else "?"
-                console.print(f"  [bold]{i:>2}[/bold]) {m.id}  [dim]({dl} downloads)[/dim]")
-
-            console.print("\n  [dim]Enter number to download, or type a new search[/dim]")
-            answer = typer.prompt("\nChoice or search", default="")
-            if not answer:
-                continue
-            try:
-                idx = int(answer)
-                if 1 <= idx <= len(results):
-                    if _download_model(results[idx - 1].id, models_dir, snapshot_download, api):
-                        return
-                    # User backed out — re-show same results
-                    console.clear()
-                    continue
-            except ValueError:
-                pass
-            query = answer
+        idx = _pick(lines, title=f"Results for '{query}':")
+        if idx is None:
+            query = ""
             results = []
+            continue
+
+        if _download_model(results[idx].id, models_dir, snapshot_download, api):
+            return
+        # User backed out of variant picker — re-show same results
+        continue
 
 
 def _pick_variants(variants: list) -> list:
     """Interactive variant selection. Returns list of selected Variant objects."""
-    import subprocess
-
-    if _has_gum():
-        from vserve.variants import format_variant_line
-        lines = [format_variant_line(v, index=i) for i, v in enumerate(variants, 1)]
-        cmd = [
-            "gum", "choose", "--no-limit",
-            "--header", "Select variant(s) — space to toggle, enter to confirm:",
-            *lines,
-        ]
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-        if r.returncode != 0 or not r.stdout.strip():
-            return []
-        selected_lines = r.stdout.strip().split("\n")
-        selected = []
-        for line in selected_lines:
-            for i, v in enumerate(variants, 1):
-                if line.lstrip().startswith(f"{i}) "):
-                    selected.append(v)
-                    break
-        return selected
-    else:
-        prompt = "Select variant(s) (e.g. 1 or 1,2)"
-        answer = typer.prompt(prompt, default="")
-        if not answer:
-            return []
-        indices: list[int] = []
-        for part in answer.replace(",", " ").split():
-            try:
-                idx = int(part)
-                if 1 <= idx <= len(variants):
-                    indices.append(idx)
-            except ValueError:
-                pass
-        return [variants[i - 1] for i in indices]
+    from vserve.variants import format_variant_line
+    lines = [format_variant_line(v, index=i) for i, v in enumerate(variants, 1)]
+    indices = _pick_many(lines, title="Select variant(s) — space to toggle, enter to confirm:")
+    return [variants[i] for i in indices]
 
 
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
@@ -720,13 +757,85 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
             limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
             lim_path = limits_path(info.provider, info.model_name)
             write_limits(lim_path, limits_data)
-            console.print(f"[green]Tuned.[/green] Ready: vserve start {model_name}")
+            console.print(f"[green]Tuned.[/green] Ready: vserve run {model_name}")
         except Exception as e:
             console.print(f"  [yellow]Auto-tune skipped: {e}[/yellow]")
             console.print(f"  Run: vserve tune {model_name}")
     else:
         console.print(f"\n[green]Downloaded to {local_dir}[/green]")
     return True
+
+
+def _model_rm_impl(model: str | None, force: bool = False):
+    """Shared implementation for model rm / model remove."""
+    import shutil
+
+    if model is None:
+        all_models = _all_models()
+        if not all_models:
+            console.print("[dim]No models to remove.[/dim]")
+            return
+        name_w = max(len(m.full_name) for m in all_models)
+        size_w = max(len(f"{m.model_size_gb} GB") for m in all_models)
+        items = [
+            f"{m.full_name:<{name_w}}  {f'{m.model_size_gb} GB':>{size_w}}"
+            for m in all_models
+        ]
+        idx = _pick(items, title="Remove which model?")
+        if idx is None:
+            return
+        m = all_models[idx]
+    else:
+        m = _resolve_model(model)
+
+    size_gb = m.model_size_gb
+    console.print(f"\n  [bold]{m.full_name}[/bold]")
+    console.print(f"  Path: {m.path}")
+    console.print(f"  Size: {size_gb} GB\n")
+
+    if not force:
+        if not typer.confirm(f"  Delete {m.full_name}?", default=False):
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+    # Delete model directory
+    shutil.rmtree(m.path)
+    console.print(f"[green]Deleted {m.full_name}[/green] ({size_gb} GB)")
+
+    # Clean up cached limits
+    lim = limits_path(m.provider, m.model_name)
+    if lim.exists():
+        lim.unlink()
+        console.print("  [dim]Removed limits cache[/dim]")
+
+    # Clean up profile configs
+    prof = profile_path(m.provider, m.model_name, "custom")
+    if prof.exists():
+        prof.unlink()
+        console.print("  [dim]Removed profile config[/dim]")
+
+    # Remove empty parent dir (provider dir) if it's now empty
+    parent = m.path.parent
+    if parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+
+
+@app.command()
+def rm(
+    model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Remove a downloaded model."""
+    _model_rm_impl(model, force=force)
+
+
+@app.command(hidden=True)
+def remove(
+    model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Remove a downloaded model (alias for rm)."""
+    _model_rm_impl(model, force=force)
 
 
 @app.command()
@@ -753,12 +862,12 @@ def tune(
     else:
         all_m = _all_models()
         if not all_m:
-            console.print("[red]No models found.[/red] Run: vserve download")
+            console.print("[red]No models found.[/red] Run: vserve add")
             raise typer.Exit(1)
-        for i, m in enumerate(all_m):
-            console.print(f"  {i + 1}) {m.full_name}")
-        console.print(f"  {len(all_m) + 1}) All models")
-        idx = _pick_number("Which model?", len(all_m) + 1) - 1
+        items = [m.full_name for m in all_m] + ["All models"]
+        idx = _pick(items, title="Which model?")
+        if idx is None:
+            raise typer.Exit(0)
         if idx == len(all_m):
             models_to_tune = all_m
         else:
@@ -854,7 +963,7 @@ def tune(
             from vserve.tools import supports_tools as _supports_tools
             if _supports_tools(m.path):
                 console.print("  Capabilities: [yellow]tool markers found but parser unknown[/yellow]")
-                console.print("                use --tools --tool-parser <parser> with vserve start")
+                console.print("                use --tools --tool-parser <parser> with vserve run")
             else:
                 console.print("  Capabilities: [dim]no tool calling detected[/dim]")
         console.print(f"  [green]Saved to {lim_path}[/green]")
@@ -1037,17 +1146,6 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
         lock.release()
 
 
-def _pick_number(prompt: str, max_val: int) -> int:
-    while True:
-        choice = typer.prompt(prompt)
-        try:
-            n = int(choice)
-            if 1 <= n <= max_val:
-                return n
-        except ValueError:
-            pass
-        console.print(f"[red]Enter a number 1-{max_val}.[/red]")
-
 
 def _custom_config(m: ModelInfo, backend, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
     """Guide user through parameter selection, delegate config building to backend."""
@@ -1085,13 +1183,16 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
         raise typer.Exit(1)
 
     console.print(f"\n[bold]Configure {m.model_name}[/bold] (llama.cpp)\n")
-    console.print("  [bold]1. Context window[/bold]")
-    for i, ctx in enumerate(working_ctxs, 1):
+    ctx_items = []
+    for ctx in working_ctxs:
         slots = limits.get(str(ctx))
         slot_str = f"({slots} slots)" if slots else ""
-        console.print(f"     {i}) {ctx // 1024}k  {slot_str}")
-    ctx_idx = _pick_number("\n  Context", len(working_ctxs))
-    chosen_ctx = working_ctxs[ctx_idx - 1]
+        ctx_items.append(f"{ctx // 1024}k  {slot_str}")
+    console.print("  [bold]1. Context window[/bold]")
+    ctx_idx = _pick(ctx_items, title="  Context:")
+    if ctx_idx is None:
+        raise typer.Exit(0)
+    chosen_ctx = working_ctxs[ctx_idx]
 
     # 2. GPU layers
     if not full_offload:
@@ -1114,24 +1215,46 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     except ValueError:
         chosen_parallel = max_parallel
 
-    # 4. Tool calling
-    tool_info = backend.detect_tools(m.path)
-    supports = tool_info.get("supports_tools", False)
-    if supports:
-        console.print("\n  [bold]4. Tool calling[/bold]")
-        if not tools:
-            tools = typer.confirm("     Enable tool calling? (--jinja)", default=False)
-        else:
-            console.print("     [green]Enabled[/green] (--jinja)")
+    # 4. Embedding or tool calling
+    is_embedding = lim.get("is_embedding", False) or m.is_embedding
+    chosen_pooling: str | None = None
+
+    if is_embedding:
+        pooling_options = ["mean", "cls", "last"]
+        default_pooling = lim.get("pooling", "mean")
+        default_idx = pooling_options.index(default_pooling) if default_pooling in pooling_options else 0
+        pooling_labels = [
+            "mean  — average all tokens (Nomic, E5, Jina, Qwen)",
+            "cls   — [CLS] token only (BGE, BERT-style)",
+            "last  — last token (decoder-based embeddings)",
+        ]
+        console.print("\n  [bold]4. Pooling strategy[/bold]")
+        pool_idx = _pick(pooling_labels, title="  Pooling:")
+        if pool_idx is None:
+            pool_idx = default_idx
+        chosen_pooling = pooling_options[pool_idx]
+    else:
+        tool_info = backend.detect_tools(m.path)
+        supports = tool_info.get("supports_tools", False)
+        if supports:
+            console.print("\n  [bold]4. Tool calling[/bold]")
+            if not tools:
+                tools = typer.confirm("     Enable tool calling? (--jinja)", default=False)
+            else:
+                console.print("     [green]Enabled[/green] (--jinja)")
 
     # Build config via backend
-    choices = {
+    choices: dict = {
         "context": chosen_ctx,
         "n_gpu_layers": n_gpu_layers,
         "parallel": chosen_parallel,
         "port": 8888,
-        "tools": tools,
     }
+    if is_embedding:
+        choices["embedding"] = True
+        choices["pooling"] = chosen_pooling
+    else:
+        choices["tools"] = tools
     cfg = backend.build_config(m, choices)
 
     # Summary
@@ -1139,7 +1262,9 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     console.print(f"    Context:     {chosen_ctx // 1024}k")
     console.print(f"    GPU layers:  {n_gpu_layers}/{num_layers}")
     console.print(f"    Parallel:    {chosen_parallel}")
-    if tools:
+    if is_embedding:
+        console.print(f"    Mode:        [green]embedding (--pooling {chosen_pooling})[/green]")
+    elif tools:
         console.print("    Tool calling: [green]enabled (--jinja)[/green]")
 
     confirm = typer.prompt("\n  Start? [Y/n]", default="Y")
@@ -1182,22 +1307,29 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
         raise typer.Exit(1)
 
     console.print(f"\n[bold]Configure {m.model_name}[/bold] (vLLM)\n")
+
+    # 1. Context window
+    ctx_items = [f"{ctx // 1024}k" for ctx in working_ctxs]
     console.print("  [bold]1. Context window[/bold] (max tokens per request)")
-    for i, ctx in enumerate(working_ctxs, 1):
-        console.print(f"     {i}) {ctx // 1024}k")
-    ctx_idx = _pick_number("\n  Context", len(working_ctxs))
-    chosen_ctx = working_ctxs[ctx_idx - 1]
+    ctx_idx = _pick(ctx_items, title="  Context:")
+    if ctx_idx is None:
+        raise typer.Exit(0)
+    chosen_ctx = working_ctxs[ctx_idx]
 
     # 2. KV cache dtype
     ctx_entry = limits.get(str(chosen_ctx), {})
     working_kvs = [k for k, v in ctx_entry.items() if v is not None]
 
+    kv_labels = {
+        "auto": "auto (bfloat16)",
+        "fp8": "fp8 (saves memory, slightly less accurate)",
+    }
+    kv_items = [f"{kv}  — {kv_labels.get(kv, kv)}" for kv in working_kvs]
     console.print("\n  [bold]2. KV cache dtype[/bold]")
-    for i, kv in enumerate(working_kvs, 1):
-        label = "auto (bfloat16)" if kv == "auto" else "fp8 (saves memory, slightly less accurate)"
-        console.print(f"     {i}) {kv}  — {label}")
-    kv_idx = _pick_number("\n  KV dtype", len(working_kvs))
-    chosen_kv = working_kvs[kv_idx - 1]
+    kv_idx = _pick(kv_items, title="  KV dtype:")
+    if kv_idx is None:
+        raise typer.Exit(0)
+    chosen_kv = working_kvs[kv_idx]
 
     # 3. Concurrent slots
     max_seqs = ctx_entry.get(chosen_kv, 1)
@@ -1210,15 +1342,16 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
         chosen_seqs = max_seqs
 
     # 4. Batched tokens (for throughput tuning)
-    console.print("\n  [bold]4. Max batched tokens[/bold] (tokens processed per scheduler step)")
-    console.print("     Higher = more throughput, uses more memory per step")
-    console.print("     1) auto  — let vLLM decide (good for chat)")
-    console.print("     2) 2048  — balanced")
-    console.print("     3) 4096  — high throughput")
-    console.print("     4) 8192  — maximum throughput (batch processing)")
-    bt_map = {"1": None, "2": 2048, "3": 4096, "4": 8192}
-    bt_choice = typer.prompt("\n  Batched tokens", default="1")
-    chosen_bt = bt_map.get(bt_choice)
+    bt_options = [
+        "auto  — let vLLM decide (good for chat)",
+        "2048  — balanced",
+        "4096  — high throughput",
+        "8192  — maximum throughput (batch processing)",
+    ]
+    bt_values: list[int | None] = [None, 2048, 4096, 8192]
+    console.print("\n  [bold]4. Max batched tokens[/bold]")
+    bt_idx = _pick(bt_options, title="  Batched tokens:")
+    chosen_bt = bt_values[bt_idx] if bt_idx is not None else None
 
     # Tool calling & reasoning
     tool_info = backend.detect_tools(m.path)
@@ -1287,13 +1420,13 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
         raise typer.Exit(0)
 
     cfg_path = profile_path(m.provider, m.model_name, "custom")
-    write_profile_yaml(cfg_path, cfg, comment="vserve start — custom config")
+    write_profile_yaml(cfg_path, cfg, comment="vserve run — custom config")
     console.clear()
     return cfg_path
 
 
 @app.command()
-def start(
+def run(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
     tools: bool = typer.Option(False, "--tools", help="Enable tool/function calling"),
     tool_parser: str | None = typer.Option(None, "--tool-parser", help="Override tool-call parser (e.g. hermes, qwen3_coder)"),
@@ -1308,17 +1441,52 @@ def start(
     if model is None:
         all_models = _all_models()
         if not all_models:
-            console.print("[red]No models found.[/red] Run: vserve download")
+            console.print("[red]No models found.[/red] Run: vserve add")
             raise typer.Exit(1)
 
-        console.print("\n[bold]Select a model:[/bold]")
-        for i, m in enumerate(all_models, 1):
-            has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
-            status = "[green]tuned[/green]" if has_limits else "[dim]not tuned[/dim]"
-            console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
+        from vserve.backends import _BACKENDS
 
-        choice = _pick_number("\nModel number", len(all_models))
-        m = all_models[choice - 1]
+        name_w = max(len(m.full_name) for m in all_models)
+        size_w = max(len(f"{m.model_size_gb} GB") for m in all_models)
+        items = []
+        for m in all_models:
+            lim = read_limits(limits_path(m.provider, m.model_name))
+            size = f"{m.model_size_gb} GB"
+
+            # Capability tags
+            tags: list[str] = []
+            if lim:
+                tags.append("tuned")
+                tp = lim.get("tool_call_parser") or lim.get("supports_tools")
+                rp = lim.get("reasoning_parser") or lim.get("supports_reasoning")
+                if tp:
+                    tags.append("tools")
+                if rp:
+                    tags.append("reasoning")
+            else:
+                # Try live detect for untuned models
+                backend_obj = None
+                for b in _BACKENDS:
+                    if b.can_serve(m):
+                        backend_obj = b
+                        break
+                if backend_obj:
+                    tool_info = backend_obj.detect_tools(m.path)
+                    if tool_info.get("tool_call_parser") or tool_info.get("supports_tools"):
+                        tags.append("tools")
+                    if tool_info.get("reasoning_parser") or tool_info.get("supports_reasoning"):
+                        tags.append("reasoning")
+
+            if m.is_embedding:
+                tags.append("embedding")
+
+            tag_str = "  ".join(tags) if tags else "not tuned"
+            items.append(f"{m.full_name:<{name_w}}  {size:>{size_w}}  {tag_str}")
+
+        idx = _pick(items, title="Select a model:")
+        if idx is None:
+            raise typer.Exit(0)
+        m = all_models[idx]
     else:
         m = _resolve_model(model)
 
@@ -1568,11 +1736,11 @@ def fan(
         options.append(("fixed", "Fixed speed"))
 
     console.print()
-    for i, (_, desc) in enumerate(options, 1):
-        console.print(f"  {i}) {desc}")
-
-    choice = _pick_number("\nChoice", len(options))
-    action = options[choice - 1][0]
+    descs = [desc for _, desc in options]
+    idx = _pick(descs, title="Fan mode:")
+    if idx is None:
+        return
+    action = options[idx][0]
 
     if action == "off":
         _stop_daemon()
@@ -1628,7 +1796,7 @@ def status():
             continue
 
     if running_backend is None:
-        console.print("[dim]No server is running.[/dim] Start with: vserve start")
+        console.print("[dim]No server is running.[/dim] Start with: vserve run")
         return
 
     # Find active config — different path per backend
@@ -1780,15 +1948,38 @@ def init():
         else:
             _warn(f"GGUF models {lc_models} does not exist")
 
-    # ── systemd ──
+    # ── systemd (vLLM) ──
     svc_name, svc_user = _discover_service()
     svc_path = _Path(f"/etc/systemd/system/{svc_name}.service")
     if svc_path.exists():
         _ok(f"systemd     {svc_name}.service (user: {svc_user})")
     else:
-        _fail("systemd     no vLLM systemd service found (required for vserve start/stop)")
+        _fail("systemd     no vLLM systemd service found (required for vserve run/stop)")
         _fail(f"            Create /etc/systemd/system/{svc_name}.service with:")
         _fail("            [Service] ExecStart=/opt/vllm/venv/bin/vllm serve ...")
+
+    # ── systemd (llama.cpp) ──
+    if llamacpp_root:
+        lc_svc_name = "llama-cpp"
+        lc_svc_user = "llama-cpp"
+        lc_svc_path = _Path(f"/etc/systemd/system/{lc_svc_name}.service")
+        if lc_svc_path.exists():
+            _ok(f"systemd     {lc_svc_name}.service")
+        else:
+            _warn(f"systemd     no {lc_svc_name}.service found")
+            _warn(f"            Create /etc/systemd/system/{lc_svc_name}.service with:")
+            _warn(f"            [Service] ExecStart={llamacpp_root}/configs/active.sh")
+
+        # Service user
+        try:
+            r = subprocess.run(["id", lc_svc_user], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                _ok(f"user        {lc_svc_user} exists")
+            else:
+                _warn(f"user        {lc_svc_user} not found")
+                _warn(f"            sudo useradd -r -s /usr/sbin/nologin -g llm {lc_svc_user}")
+        except Exception:
+            pass
 
     # ── Port ──
     port = _discover_port(root)
@@ -1803,9 +1994,9 @@ def init():
 
     # ── gum (interactive UI) ──
     if shutil.which("gum"):
-        _ok("gum         installed (interactive UI enabled)")
+        _ok("gum         installed (enhanced interactive menus)")
     else:
-        _warn("gum         not installed (vserve download will use basic mode)")
+        _warn("gum         not installed (using built-in menus)")
 
     # ── Write config ──
     console.print()
@@ -1869,9 +2060,9 @@ def init():
     # ── Next steps ──
     console.print()
     console.print("[bold]Next steps[/bold]")
-    console.print("  vserve download    Search & download a model")
-    console.print("  vserve doctor      Full system check")
-    console.print("  vserve             Dashboard")
+    console.print("  vserve add      Search & download a model")
+    console.print("  vserve doctor   Full system check")
+    console.print("  vserve          Dashboard")
     console.print()
 
 
@@ -1958,9 +2149,14 @@ def doctor():
             except Exception:
                 _warn(f"{desc} (check error)")
 
-    # Service user
+    # -- Per-backend checks --
     from vserve.config import cfg as _cfg
     _c = _cfg()
+
+    # ── vLLM ──
+    console.print("\n  [bold]vLLM[/bold]")
+
+    # Service user
     try:
         r = subprocess.run(["id", _c.service_user], capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
@@ -2001,9 +2197,15 @@ def doctor():
     else:
         _fail(f"No .env at {env_path}")
 
-    # -- Caches --
-    console.print("\n  [bold]Caches[/bold]")
+    # Models directory
+    vllm_models = VLLM_ROOT / "models"
+    if vllm_models.exists():
+        vllm_mc = sum(1 for p in vllm_models.glob("*/*/config.json"))
+        _ok(f"Models dir: {vllm_models} ({vllm_mc} models)")
+    else:
+        _warn(f"Models dir {vllm_models} does not exist")
 
+    # Caches
     cache_checks = [
         (VLLM_ROOT / ".cache" / "flashinfer", "FlashInfer JIT"),
         (VLLM_ROOT / ".cache" / "vllm" / "torch_compile_cache", "torch.compile"),
@@ -2017,11 +2219,28 @@ def doctor():
         else:
             _warn(f"{label} cache missing — first start will JIT compile (2-10 min)")
 
+    # Active config
+    active = active_yaml_path()
+    if active.exists() and active.is_symlink():
+        target = active.resolve()
+        if target.exists():
+            cfg_data = read_profile_yaml(active) or {}
+            model_path = cfg_data.get("model", "")
+            if model_path and Path(model_path).exists():
+                _ok(f"active.yaml → {target.name}")
+            else:
+                _fail(f"active.yaml model path missing: {model_path}")
+        else:
+            _fail(f"active.yaml → broken symlink: {target}")
+    elif active.exists():
+        _ok("active.yaml exists (not a symlink)")
+    else:
+        _ok("No active.yaml (clean — will be created on vserve run)")
+
     # TMPDIR
     tmp_dir = VLLM_ROOT / "tmp"
     if tmp_dir.exists() and tmp_dir.is_dir():
         _ok(f"TMPDIR at {tmp_dir}")
-        # Count stale sockets
         sockets = list(tmp_dir.glob("*"))
         stale = [s for s in sockets if s.is_socket()]
         if len(stale) > 10:
@@ -2029,25 +2248,107 @@ def doctor():
     else:
         _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
 
-    # -- Config --
-    console.print("\n  [bold]Config[/bold]")
+    # ── llama.cpp ──
+    console.print("\n  [bold]llama.cpp[/bold]")
 
-    active = active_yaml_path()
-    if active.exists() and active.is_symlink():
-        target = active.resolve()
-        if target.exists():
-            cfg = read_profile_yaml(active) or {}
-            model_path = cfg.get("model", "")
-            if model_path and Path(model_path).exists():
-                _ok(f"active.yaml -> {target.name}")
-            else:
-                _fail(f"Model path in config does not exist: {model_path}")
-        else:
-            _fail(f"active.yaml points to missing file: {target}")
-    elif active.exists():
-        _ok("active.yaml exists (not a symlink)")
+    lc_root = _c.llamacpp_root
+    if lc_root is None:
+        _warn("llama.cpp not configured (run vserve init to detect)")
     else:
-        _warn("No active.yaml — run vserve start to configure")
+        _ok(f"Root: {lc_root}")
+
+        # Binary
+        lc_bin = lc_root / "bin" / "llama-server"
+        if lc_bin.exists():
+            try:
+                r = subprocess.run([str(lc_bin), "--version"], capture_output=True, text=True, timeout=5)
+                ver_line = ""
+                for ln in (r.stdout + r.stderr).splitlines():
+                    if "version" in ln.lower() or ln.startswith("b"):
+                        ver_line = ln.strip()
+                        break
+                _ok(f"llama-server {ver_line}" if ver_line else f"llama-server at {lc_bin}")
+            except Exception:
+                _ok(f"llama-server at {lc_bin}")
+        elif __import__("shutil").which("llama-server"):
+            _ok("llama-server found on PATH")
+        else:
+            _fail("llama-server not found",
+                  "Build: cmake -B build -DGGML_CUDA=ON && cmake --build build -t llama-server")
+
+        # Service user
+        lc_user = _c.llamacpp_service_user
+        try:
+            r = subprocess.run(["id", lc_user], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                _ok(f"Service user '{lc_user}' exists")
+            else:
+                _fail(f"Service user '{lc_user}' not found",
+                      f"sudo useradd -r -s /usr/sbin/nologin -g llm {lc_user}")
+        except Exception:
+            _fail("Cannot check llama-cpp service user")
+
+        # systemd unit (deep inspection, matching vLLM)
+        lc_svc = _c.llamacpp_service_name
+        lc_svc_path = Path(f"/etc/systemd/system/{lc_svc}.service")
+        if lc_svc_path.exists():
+            lc_svc_content = lc_svc_path.read_text()
+            issues = []
+            if "CUDA_VISIBLE_DEVICES" not in lc_svc_content:
+                issues.append("missing CUDA_VISIBLE_DEVICES (may use wrong GPU)")
+            if "TimeoutStartSec" not in lc_svc_content:
+                issues.append("no TimeoutStartSec (large models need time)")
+            if issues:
+                _warn(f"{lc_svc}.service: {'; '.join(issues)}")
+            else:
+                _ok(f"{lc_svc}.service unit configured correctly")
+        else:
+            _fail(f"No systemd unit at {lc_svc_path}",
+                  f"Create /etc/systemd/system/{lc_svc}.service with ExecStart={lc_root}/configs/active.sh")
+
+        # Models directory
+        lc_models = lc_root / "models"
+        if lc_models.exists():
+            model_count = sum(1 for p in lc_models.rglob("*.gguf") if p.is_file())
+            _ok(f"Models dir: {lc_models} ({model_count} GGUF files)")
+        else:
+            _warn(f"Models dir {lc_models} does not exist",
+                  f"sudo mkdir -p {lc_models} && sudo chown {lc_user}:llm {lc_models}")
+
+        # Configs directory + active config
+        lc_configs = lc_root / "configs"
+        if lc_configs.exists():
+            active_sh = lc_configs / "active.sh"
+            active_json = lc_configs / "active.json"
+            if active_sh.exists():
+                _ok("active.sh launch script present")
+            else:
+                _ok(f"Configs dir: {lc_configs} (no active config yet)")
+            if active_json.exists():
+                try:
+                    import json as _json2
+                    lc_cfg = _json2.loads(active_json.read_text())
+                    lc_model = lc_cfg.get("model", "")
+                    if lc_model and Path(lc_model).exists():
+                        _ok(f"active.json → {Path(lc_model).name}")
+                    elif lc_model:
+                        _fail(f"active.json model path missing: {lc_model}")
+                except Exception:
+                    _warn("active.json exists but unreadable")
+        else:
+            _warn(f"Configs dir {lc_configs} does not exist",
+                  f"sudo mkdir -p {lc_configs} && sudo chown {lc_user}:llm {lc_configs}")
+
+        # gguf package
+        try:
+            import gguf  # type: ignore[import-untyped]  # noqa: F401
+            _ok("gguf package installed")
+        except ImportError:
+            _warn("gguf package not installed — needed for GGUF metadata reading",
+                  "pip install 'vserve\\[llamacpp]'")
+
+    # -- Shared --
+    console.print("\n  [bold]Shared[/bold]")
 
     # Port
     _port = _c.port
@@ -2155,4 +2456,4 @@ def cache_clean(
 
         if total_freed > 0:
             console.print(f"\n  [bold]Freed {total_freed} MB total[/bold]")
-        console.print("  [yellow]Next vserve start will recompile kernels (~5-10 min)[/yellow]")
+        console.print("  [yellow]Next vserve run will recompile kernels (~5-10 min)[/yellow]")
