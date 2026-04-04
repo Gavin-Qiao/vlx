@@ -7,6 +7,7 @@ runner = CliRunner()
 
 
 def test_tune_no_model_found(mocker):
+    mocker.patch("vserve.cli._all_models", return_value=[])
     mocker.patch("vserve.cli.scan_models", return_value=[])
     result = runner.invoke(app, ["tune", "nonexistent"])
     assert result.exit_code == 1
@@ -17,6 +18,7 @@ def test_tune_calculates_limits(mocker, fake_model_dir):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
     mocker.patch("vserve.gpu.get_gpu_info", return_value=type("GPU", (), {
@@ -35,6 +37,7 @@ def test_tune_all_models(mocker, fake_model_dir):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.gpu.get_gpu_info", return_value=type("GPU", (), {
         "name": "Test GPU", "vram_total_gb": 48.0, "cuda": "13.1",
@@ -75,6 +78,7 @@ def test_tune_recalc_ignores_cache(mocker, fake_model_dir, fake_limits):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
     mocker.patch("vserve.cli.read_limits", return_value=fake_limits)
@@ -113,6 +117,7 @@ def test_tune_missing_arch_fields(mocker, tmp_path):
     (model_dir / "model.safetensors").write_bytes(b"\0" * 512)
     m = detect_model(model_dir)
 
+    mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
     mocker.patch("vserve.cli.read_limits", return_value=None)
