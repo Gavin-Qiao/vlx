@@ -221,10 +221,79 @@ class TestLlamaCppStartFailure:
         mocker.patch("vserve.backends.llamacpp.subprocess.run",
                      return_value=Mock(returncode=1, stdout="", stderr="Unit not found"))
         mocker.patch("vserve.backends.llamacpp.shutil.copy2")
-        active = tmp_path / "active.json"
+        active = tmp_path / "active.sh"
         mocker.patch.object(b, "_active_config_path", return_value=active)
 
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text('{}')
         with pytest.raises(RuntimeError, match="systemctl start"):
             b.start(cfg_path)
+
+
+class TestLlamaCppLaunchScript:
+    def test_script_content(self, mocker, tmp_path):
+        """Launch script has correct flags and is shell-safe."""
+        import json
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        active = tmp_path / "configs" / "active.sh"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        cfg = {
+            "model": "/opt/llama-cpp/models/test/model.gguf",
+            "host": "0.0.0.0",
+            "port": 8888,
+            "ctx_size": 8192,
+            "n_gpu_layers": 32,
+            "parallel": 4,
+            "flash_attn": True,
+            "jinja": True,
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert script.startswith("#!/bin/bash\nexec ")
+        assert "-m /opt/llama-cpp/models/test/model.gguf" in script
+        assert "-c 8192" in script
+        assert "-ngl 32" in script
+        assert "-np 4" in script
+        assert "-fa on" in script
+        assert "--jinja" in script
+        assert "--host 0.0.0.0" in script
+        assert "--port 8888" in script
+
+    def test_script_quoting_spaces(self, mocker, tmp_path):
+        """Model paths with spaces are properly quoted in script."""
+        import json
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        active = tmp_path / "configs" / "active.sh"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        cfg = {
+            "model": "/opt/models/My Model Dir/model file.gguf",
+            "host": "0.0.0.0",
+            "port": 8888,
+            "ctx_size": 4096,
+            "n_gpu_layers": 10,
+            "parallel": 1,
+            "flash_attn": True,
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        b.start(cfg_path)
+
+        script = active.read_text()
+        # shlex.join should quote the path with spaces using single quotes
+        assert "My Model Dir" in script
+        assert "model file.gguf" in script
+        # The path should be single-quoted by shlex
+        assert "'/opt/models/My Model Dir/model file.gguf'" in script

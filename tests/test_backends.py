@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from vserve.backends import register, get_backend, get_backend_by_name, available_backends
+from vserve.backends import register, get_backend, get_backend_by_name, available_backends, any_backend_running, running_backend
 from vserve.backends.protocol import Backend
 from vserve.backends.vllm import VllmBackend
 
@@ -243,3 +243,46 @@ def test_duplicate_registration_prevented():
     register(b2)
     from vserve.backends import _BACKENDS
     assert sum(1 for b in _BACKENDS if b.name == "dedup") == 1
+
+
+# --- any_backend_running / running_backend ---
+
+
+def test_any_backend_running_true():
+    b = _make_mock_backend("running")
+    b.is_running.return_value = True
+    register(b)
+    assert any_backend_running() is True
+
+
+def test_any_backend_running_false():
+    b = _make_mock_backend("stopped")
+    b.is_running.return_value = False
+    register(b)
+    assert any_backend_running() is False
+
+
+def test_any_backend_running_exception_handled():
+    b = _make_mock_backend("broken")
+    b.is_running.side_effect = RuntimeError("no systemctl")
+    register(b)
+    assert any_backend_running() is False
+
+
+def test_running_backend_returns_correct():
+    b1 = _make_mock_backend("idle")
+    b1.is_running.return_value = False
+    b2 = _make_mock_backend("active")
+    b2.is_running.return_value = True
+    register(b1)
+    register(b2)
+    result = running_backend()
+    assert result is not None
+    assert result.name == "active"
+
+
+def test_running_backend_none_when_all_stopped():
+    b = _make_mock_backend("stopped")
+    b.is_running.return_value = False
+    register(b)
+    assert running_backend() is None

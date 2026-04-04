@@ -208,3 +208,34 @@ def test_scan_models_finds_gguf(tmp_path, fake_gguf_model_dir):
 def test_safetensors_model_not_gguf(fake_model_dir):
     m = detect_model(fake_model_dir)
     assert m.is_gguf is False
+
+
+def test_gguf_with_config_json(tmp_path):
+    """GGUF model with config.json alongside (common in HF repos) is detected as GGUF."""
+    import json
+    model_dir = tmp_path / "models" / "user" / "Model-GGUF"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model-Q4_K_M.gguf").write_bytes(b"\0" * 8192)
+    (model_dir / "config.json").write_text(json.dumps({
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+    }))
+    m = detect_model(model_dir)
+    assert m.is_gguf is True
+    assert m.model_size_gb >= 0
+
+
+def test_mixed_safetensors_and_gguf_prefers_safetensors(tmp_path):
+    """Dir with both safetensors and GGUF — detected as safetensors (vLLM)."""
+    import json
+    model_dir = tmp_path / "models" / "user" / "Mixed"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.safetensors").write_bytes(b"\0" * 4096)
+    (model_dir / "model-Q4_K_M.gguf").write_bytes(b"\0" * 8192)
+    (model_dir / "config.json").write_text(json.dumps({
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "max_position_embeddings": 4096,
+    }))
+    m = detect_model(model_dir)
+    assert m.is_gguf is False

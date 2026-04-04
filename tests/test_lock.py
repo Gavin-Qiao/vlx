@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from vserve.lock import LockHeld, LockInfo, VserveLock, _format_elapsed, wait_for_release
+from vserve.lock import (
+    LockHeld, LockInfo, VserveLock, _format_elapsed, wait_for_release,
+    check_session, write_session, read_session, SessionHeld,
+)
 
 
 # ── Helpers ──────────────────────────────────────────
@@ -244,3 +247,49 @@ def test_wait_for_release_timeout(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+# ── check_session with backend-agnostic check ──────
+
+
+def test_check_session_clears_stale_when_no_backend_running(tmp_path, monkeypatch):
+    """Stale session (no backend running) is auto-cleared."""
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "other_user")
+
+    write_session("old-model")
+    assert read_session() is not None
+
+    monkeypatch.setenv("USER", "current_user")
+    monkeypatch.setattr("vserve.backends.any_backend_running", lambda: False)
+
+    check_session()  # should clear stale session
+    assert read_session() is None
+
+
+def test_check_session_raises_when_backend_running(tmp_path, monkeypatch):
+    """Active session with running backend raises SessionHeld."""
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+
+    write_session("running-model")
+
+    monkeypatch.setenv("USER", "bob")
+    monkeypatch.setattr("vserve.backends.any_backend_running", lambda: True)
+
+    with pytest.raises(SessionHeld):
+        check_session()
+
+
+def test_check_session_same_user_allowed(tmp_path, monkeypatch):
+    """Same user can restart their own model."""
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+
+    write_session("my-model")
+    monkeypatch.setattr("vserve.backends.any_backend_running", lambda: True)
+
+    check_session()  # should NOT raise — same user
