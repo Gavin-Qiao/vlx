@@ -287,9 +287,11 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
         _show_model_detail(m)
         return
 
+    _backend_colors = {"vLLM": "cyan", "llama.cpp": "magenta"}
+
     table = Table(title="Downloaded Models")
     table.add_column("Model", style="bold")
-    table.add_column("Backend", style="cyan")
+    table.add_column("Backend")
     table.add_column("Size", justify="right")
     table.add_column("Limits")
     table.add_column("Max Context", justify="right")
@@ -333,8 +335,9 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
             tp = tool_info.get("tool_call_parser") or ("jinja" if tool_info.get("supports_tools") else "\u2014")
             rp = tool_info.get("reasoning_parser") or ("jinja" if tool_info.get("supports_reasoning") else "\u2014")
 
+        bc = _backend_colors.get(backend_name, "white")
         table.add_row(
-            m.full_name, backend_name, f"{m.model_size_gb} GB",
+            m.full_name, f"[{bc}]{backend_name}[/{bc}]", f"{m.model_size_gb} GB",
             "\u2713" if lim else "\u2717", max_ctx, tp, rp,
         )
 
