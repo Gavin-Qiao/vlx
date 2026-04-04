@@ -156,10 +156,13 @@ class LlamaCppBackend:
 
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
         """Build llama-server JSON config."""
+        import re as _re
         gguf_files = sorted(model.path.glob("*.gguf"))
         if gguf_files:
-            # Prefer the largest file (main model or first shard)
-            model_file = str(max(gguf_files, key=lambda f: f.stat().st_size))
+            # For split shards, pick the first shard; otherwise pick the largest variant
+            shard_pattern = _re.compile(r"-\d{5}-of-\d{5}\.gguf$")
+            shards = [f for f in gguf_files if shard_pattern.search(f.name)]
+            model_file = str(shards[0]) if shards else str(max(gguf_files, key=lambda f: f.stat().st_size))
         else:
             model_file = str(model.path)
 
@@ -206,9 +209,10 @@ class LlamaCppBackend:
             args.append("--jinja")
 
         # Write launch script
+        import shlex
         active = self._active_config_path()
         active.parent.mkdir(parents=True, exist_ok=True)
-        script = "#!/bin/bash\nexec " + " ".join(args) + "\n"
+        script = "#!/bin/bash\nexec " + shlex.join(args) + "\n"
         active.write_text(script)
         active.chmod(0o755)
 

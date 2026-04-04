@@ -346,16 +346,27 @@ def _show_model_detail(m: ModelInfo):
         console.print(f"  [dim]Not probed yet.[/dim] Run: vserve tune {m.model_name.lower()}\n")
         return
 
-    table = Table(title="Context / Concurrency Limits")
-    table.add_column("Context", justify="right")
-    table.add_column("kv auto", justify="right")
-    table.add_column("kv fp8", justify="right")
+    limits = lim.get("limits", {})
+    is_flat = any(isinstance(v, (int, type(None))) for v in limits.values())
 
-    for ctx_str in sorted(lim["limits"].keys(), key=int):
-        entry = lim["limits"][ctx_str]
-        auto = str(entry.get("auto")) if entry.get("auto") is not None else "OOM"
-        fp8 = str(entry.get("fp8")) if entry.get("fp8") is not None else "OOM"
-        table.add_row(f"{int(ctx_str) // 1024}k", auto, fp8)
+    if is_flat:
+        table = Table(title="Context / Concurrency Limits")
+        table.add_column("Context", justify="right")
+        table.add_column("Parallel slots", justify="right")
+        for ctx_str in sorted(limits.keys(), key=int):
+            entry = limits[ctx_str]
+            slot_str = str(entry) if entry is not None else "OOM"
+            table.add_row(f"{int(ctx_str) // 1024}k", slot_str)
+    else:
+        table = Table(title="Context / Concurrency Limits")
+        table.add_column("Context", justify="right")
+        table.add_column("kv auto", justify="right")
+        table.add_column("kv fp8", justify="right")
+        for ctx_str in sorted(limits.keys(), key=int):
+            entry = limits[ctx_str]
+            auto = str(entry.get("auto")) if entry.get("auto") is not None else "OOM"
+            fp8 = str(entry.get("fp8")) if entry.get("fp8") is not None else "OOM"
+            table.add_row(f"{int(ctx_str) // 1024}k", auto, fp8)
 
     console.print(table)
     console.print()
@@ -1574,7 +1585,7 @@ def status():
 
     ctx = cfg.get("max-model-len") or cfg.get("ctx-size") or cfg.get("ctx_size", "?")
     ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-    seqs = cfg.get("max-num-seqs") or cfg.get("parallel") or cfg.get("n_gpu_layers", "?")
+    seqs = cfg.get("max-num-seqs") or cfg.get("parallel", "?")
     kv = cfg.get("kv-cache-dtype", "auto")
     prefix = cfg.get("enable-prefix-caching", False)
     bt = cfg.get("max-num-batched-tokens")
