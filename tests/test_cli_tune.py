@@ -14,10 +14,25 @@ def test_tune_no_model_found(mocker):
     assert "No model" in result.output
 
 
+def _mock_vllm_backend(mocker):
+    """Create a mock vLLM backend for tune tests."""
+    from unittest.mock import Mock
+    from vserve.probe import calculate_limits
+    backend = Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.tune.side_effect = lambda m, gpu, **kw: calculate_limits(
+        model_info=m, vram_total_gb=gpu.vram_total_gb, gpu_mem_util=kw.get("gpu_mem_util", 0.90),
+    )
+    mocker.patch("vserve.backends.get_backend", return_value=backend)
+    return backend
+
+
 def test_tune_calculates_limits(mocker, fake_model_dir):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    _mock_vllm_backend(mocker)
     mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
@@ -37,6 +52,7 @@ def test_tune_all_models(mocker, fake_model_dir):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    _mock_vllm_backend(mocker)
     mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.gpu.get_gpu_info", return_value=type("GPU", (), {
@@ -78,6 +94,7 @@ def test_tune_recalc_ignores_cache(mocker, fake_model_dir, fake_limits):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    _mock_vllm_backend(mocker)
     mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
