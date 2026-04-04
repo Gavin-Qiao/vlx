@@ -8,7 +8,7 @@ runner = CliRunner()
 def test_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "vLLM model manager" in result.output
+    assert "LLM inference manager" in result.output
 
 
 def test_models_command_exists():

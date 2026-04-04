@@ -1,4 +1,4 @@
-"""vserve — vLLM model manager CLI."""
+"""vserve — LLM inference manager CLI."""
 
 
 import pathlib
@@ -19,7 +19,7 @@ from vserve.lock import VserveLock, LockHeld, SessionHeld, notify_user, check_se
 
 from vserve import __version__
 
-app = typer.Typer(help="vLLM model manager")
+app = typer.Typer(help="LLM inference manager")
 cache_app = typer.Typer(help="Cache management")
 app.add_typer(cache_app, name="cache")
 console = Console()
@@ -141,7 +141,7 @@ def dashboard(ctx: typer.Context):
     except Exception:
         gpu_line = "[dim]unavailable[/dim]"
 
-    from vserve.serve import is_vllm_running
+    from vserve.backends import running_backend as _running_backend
     from vserve.config import active_yaml_path, read_profile_yaml
 
     models = scan_models(MODELS_DIR)
@@ -150,16 +150,17 @@ def dashboard(ctx: typer.Context):
     )
 
     serving_line = "[dim]not running[/dim]"
-    if is_vllm_running():
+    rb = _running_backend()
+    if rb is not None:
         active = active_yaml_path()
         if active.exists() and active.is_symlink():
             cfg = read_profile_yaml(active)
             model_path = cfg.get("model", "?") if cfg else "?"
             model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
             port = cfg.get("port", 8888) if cfg else 8888
-            serving_line = f"[green]{model_name}[/green] at :{port}"
+            serving_line = f"[green]{model_name}[/green] at :{port} ({rb.display_name})"
         else:
-            serving_line = "[green]active[/green]"
+            serving_line = f"[green]active[/green] ({rb.display_name})"
 
     lines = [
         f"  [bold]GPU[/bold]       {gpu_line}",
@@ -176,13 +177,13 @@ def dashboard(ctx: typer.Context):
     for cmd, desc in [
         ("download [model]", "Search & download from HuggingFace"),
         ("start [model]", "Start serving (interactive config picker)"),
-        ("stop", "Stop the vLLM service"),
+        ("stop", "Stop the inference server"),
         ("status", "Show what's currently serving"),
         ("models", "List models with limits & profiles"),
         ("tune [model]", "Calculate context & concurrency limits"),
         ("fan [auto|off|30-100]", "GPU fan control with temp curve"),
         ("doctor", "Check system readiness"),
-        ("init", "Auto-discover vLLM and write config"),
+        ("init", "Auto-discover backends and write config"),
     ]:
         cmd_tbl.add_row(_Txt(cmd, style="bold cyan"), desc)
 
@@ -252,6 +253,8 @@ def update():
 @app.command()
 def models(model: str = typer.Argument(None, help="Model name for detail view")):
     """List downloaded models."""
+    from vserve.backends import _BACKENDS
+
     all_models = scan_models(MODELS_DIR)
     if not all_models:
         console.print("[dim]No models found.[/dim] Run: vserve download")
@@ -262,10 +265,9 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
         _show_model_detail(m)
         return
 
-    from vserve.tools import detect_tool_parser, detect_reasoning_parser
-
     table = Table(title="Downloaded Models")
     table.add_column("Model", style="bold")
+    table.add_column("Backend", style="cyan")
     table.add_column("Size", justify="right")
     table.add_column("Limits")
     table.add_column("Max Context", justify="right")
@@ -275,19 +277,36 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     for m in all_models:
         lim = read_limits(limits_path(m.provider, m.model_name))
 
+        # Detect backend
+        backend_name = "\u2014"
+        for b in _BACKENDS:
+            if b.can_serve(m):
+                backend_name = b.display_name
+                break
+
         max_ctx = "\u2014"
         if lim:
-            for ctx_str in sorted(lim["limits"].keys(), key=int, reverse=True):
+            for ctx_str in sorted(lim.get("limits", {}).keys(), key=lambda x: int(x), reverse=True):
                 entry = lim["limits"][ctx_str]
-                if any(v is not None for v in entry.values()):
+                if isinstance(entry, dict):
+                    if any(v is not None for v in entry.values()):
+                        max_ctx = f"{int(ctx_str) // 1024}k"
+                        break
+                elif entry is not None:
                     max_ctx = f"{int(ctx_str) // 1024}k"
                     break
 
-        tp = (lim or {}).get("tool_call_parser") or detect_tool_parser(m.path) or "\u2014"
-        rp = (lim or {}).get("reasoning_parser") or detect_reasoning_parser(m.path) or "\u2014"
+        # Detect tools via backend
+        tool_info = {}
+        for b in _BACKENDS:
+            if b.can_serve(m):
+                tool_info = b.detect_tools(m.path)
+                break
+        tp = tool_info.get("tool_call_parser") or ("\u2713" if tool_info.get("supports_tools") else "\u2014")
+        rp = tool_info.get("reasoning_parser", "\u2014") or "\u2014"
 
         table.add_row(
-            m.full_name, f"{m.model_size_gb} GB",
+            m.full_name, backend_name, f"{m.model_size_gb} GB",
             "\u2713" if lim else "\u2717", max_ctx, tp, rp,
         )
 
@@ -487,7 +506,10 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         raise typer.Exit(1)
 
     provider, model_name = parts
+
+    # Determine destination — will be updated after variant selection for GGUF
     local_dir = models_dir / provider / model_name
+    is_gguf_download = False
 
     if local_dir.exists() and any(local_dir.iterdir()):
         console.print(f"[yellow]{model_id} already exists at {local_dir}[/yellow]")
@@ -536,6 +558,16 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     allow_files: list[str] = list(shared.keys())
     for v in selected_variants:
         allow_files.extend(v.files.keys())
+
+    # Check if this is a GGUF download — route to llama-cpp models dir
+    is_gguf_download = any(f.endswith(".gguf") for f in allow_files)
+    if is_gguf_download:
+        from vserve.config import cfg as _cfg2
+        lc_root = _cfg2().llamacpp_root
+        if lc_root:
+            local_dir = lc_root / "models" / provider / model_name
+        else:
+            console.print("[yellow]llama.cpp not configured — downloading GGUF to default models dir[/yellow]")
 
     console.print(f"\n[bold]Downloading[/bold] {model_id}")
     console.print(f"  To: {local_dir}\n")
@@ -592,11 +624,30 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
             raise typer.Exit(1) from None
 
     try:
-        snapshot_download(  # type: ignore[operator]
-            repo_id=model_id,
-            local_dir=local_dir,
-            allow_patterns=allow_files,
-        )
+        if is_gguf_download:
+            from huggingface_hub import hf_hub_download  # type: ignore[import-untyped]
+            gguf_files = [f for f in allow_files if f.endswith(".gguf")]
+            other_files = [f for f in allow_files if not f.endswith(".gguf")]
+            # Download GGUF files individually
+            for filename in gguf_files:
+                hf_hub_download(repo_id=model_id, filename=filename, local_dir=local_dir)
+            # Also grab tokenizer_config.json for tool detection
+            try:
+                hf_hub_download(repo_id=model_id, filename="tokenizer_config.json", local_dir=local_dir)
+            except Exception:
+                pass  # not all GGUF repos have it
+            # Download any shared non-GGUF files
+            for filename in other_files:
+                try:
+                    hf_hub_download(repo_id=model_id, filename=filename, local_dir=local_dir)
+                except Exception:
+                    pass
+        else:
+            snapshot_download(  # type: ignore[operator]
+                repo_id=model_id,
+                local_dir=local_dir,
+                allow_patterns=allow_files,
+            )
     except Exception as e:
         console.print(f"[red]Download failed:[/red] {e}")
         raise typer.Exit(1)
@@ -765,79 +816,77 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
     console.print()
 
 
-def _launch_vllm(cfg_path: "pathlib.Path", label: str) -> None:
-    """Stop any running vLLM, start with given config, wait for health."""
-    from vserve.config import read_profile_yaml
-    from vserve.serve import start_vllm, stop_vllm, is_vllm_running
+def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
+    """Stop any running backend, start with given config, wait for health."""
+    import json
     import time
+    from vserve.config import read_profile_yaml
 
-    lock = _lock_or_exit("gpu", f"starting vLLM ({label})")
-    cfg = read_profile_yaml(cfg_path) or {}
+    lock = _lock_or_exit("gpu", f"starting {backend.display_name} ({label})")
+
+    # Read config (YAML for vLLM, JSON for llama.cpp)
+    if str(cfg_path).endswith(".json"):
+        cfg = json.loads(cfg_path.read_text())
+    else:
+        cfg = read_profile_yaml(cfg_path) or {}
 
     try:
         _session_or_exit()
 
-        if is_vllm_running():
-            console.print("[yellow]vLLM is already running.[/yellow]")
+        if backend.is_running():
+            console.print(f"[yellow]{backend.display_name} is already running.[/yellow]")
             if not typer.confirm("Stop and restart?", default=False):
                 lock.release()
                 return
             clear_session()
             try:
-                stop_vllm()
+                backend.stop()
             except RuntimeError as e:
                 console.print(f"[red]{e}[/red]")
             time.sleep(2)
 
-        ctx = cfg.get("max-model-len", "?")
+        ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
         ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-        console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan]")
-        console.print(f"  context: {ctx_d}  kv: {cfg.get('kv-cache-dtype', 'auto')}"
-                      f"  seqs: {cfg.get('max-num-seqs', '?')}")
+        console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan] ({backend.display_name})")
+        console.print(f"  context: {ctx_d}")
 
         try:
-            start_vllm(cfg_path)
+            backend.start(cfg_path)
         except RuntimeError as e:
-            from vserve.config import cfg as _cfg
-            svc = _cfg().service_name
             console.print(f"[red]{e}[/red]")
-            console.print(f"  Check: sudo journalctl -u {svc} --no-pager -n 20")
+            console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
             raise typer.Exit(1)
 
         from urllib.request import urlopen
         port = cfg.get("port", 8888)
-        health_url = f"http://localhost:{port}/health"
+        health = backend.health_url(port)
 
-        from vserve.config import cfg as _cfg
-        fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
-        if not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so")):
-            console.print("  [yellow]First run — compiling kernels (~5-10 min). Subsequent starts will be fast.[/yellow]")
+        # Backend-specific first-run messages
+        if backend.name == "vllm":
+            from vserve.config import cfg as _cfg
+            fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
+            if not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so")):
+                console.print("  [yellow]First run — compiling kernels (~5-10 min).[/yellow]")
 
-        console.print(f"  [dim]Waiting for {health_url} ...[/dim]")
+        console.print(f"  [dim]Waiting for {health} ...[/dim]")
         for i in range(150):  # 300s max
             time.sleep(2)
             try:
-                resp = urlopen(health_url, timeout=2)
+                resp = urlopen(health, timeout=2)
                 if resp.status == 200:
                     write_session(label)
-                    console.print(f"\n[bold green]vLLM is running[/bold green] at http://localhost:{port}/v1")
+                    console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
                     console.print(f"  Config: {cfg_path}")
-                    from vserve.config import cfg as _cfg
-                    svc = _cfg().service_name
-                    console.print(f"  Logs:   sudo journalctl -u {svc} -f\n")
+                    console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
                     return
             except Exception:
                 pass
-            if i > 5 and not is_vllm_running():
-                from vserve.config import cfg as _cfg
-                svc = _cfg().service_name
-                console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
+            if i > 5 and not backend.is_running():
+                console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
                 raise typer.Exit(1)
             if i > 0 and i % 15 == 0:
                 console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-        from vserve.config import cfg as _cfg
-        svc = _cfg().service_name
-        console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {svc} --no-pager -n 50")
+        console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
         raise typer.Exit(1)
     finally:
         lock.release()
@@ -855,8 +904,114 @@ def _pick_number(prompt: str, max_val: int) -> int:
         console.print(f"[red]Enter a number 1-{max_val}.[/red]")
 
 
-def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
-    """Guide user through manual parameter selection, write a temp config."""
+def _custom_config(m: ModelInfo, backend, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
+    """Guide user through parameter selection, delegate config building to backend."""
+    if backend.name == "llamacpp":
+        return _custom_config_llamacpp(m, backend, tools=tools)
+    return _custom_config_vllm(m, backend, tools=tools, tool_parser=tool_parser)
+
+
+def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "pathlib.Path":
+    """Interactive config wizard for llama.cpp models."""
+    import json
+    from vserve.config import read_limits, write_limits as _write_limits
+    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
+
+    gpu = get_gpu_info()
+    gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+
+    lim_path_ = limits_path(m.provider, m.model_name)
+    lim = read_limits(lim_path_)
+    if not lim:
+        console.print(f"[dim]  Auto-tuning {m.model_name}...[/dim]")
+        lim = backend.tune(m, gpu, gpu_mem_util=gpu_mem_util)
+        _write_limits(lim_path_, lim)
+        console.print("[green]  Tuned.[/green]")
+
+    n_gpu_layers = lim.get("n_gpu_layers", 0)
+    num_layers = lim.get("num_layers", 0)
+    full_offload = lim.get("full_offload", True)
+    limits = lim.get("limits", {})
+
+    # 1. Context window
+    working_ctxs = sorted(int(c) for c, v in limits.items() if v is not None)
+    if not working_ctxs:
+        console.print("[red]No working configs found.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold]Configure {m.model_name}[/bold] (llama.cpp)\n")
+    console.print("  [bold]1. Context window[/bold]")
+    for i, ctx in enumerate(working_ctxs, 1):
+        slots = limits.get(str(ctx))
+        slot_str = f"({slots} slots)" if slots else ""
+        console.print(f"     {i}) {ctx // 1024}k  {slot_str}")
+    ctx_idx = _pick_number("\n  Context", len(working_ctxs))
+    chosen_ctx = working_ctxs[ctx_idx - 1]
+
+    # 2. GPU layers
+    if not full_offload:
+        console.print(f"\n  [bold]2. GPU layers[/bold] (max: {num_layers}, fits: {n_gpu_layers})")
+        console.print(f"     [yellow]Model partially fits — {n_gpu_layers}/{num_layers} layers on GPU[/yellow]")
+        layers_str = typer.prompt(f"  Layers [1-{num_layers}]", default=str(n_gpu_layers))
+        try:
+            n_gpu_layers = min(max(1, int(layers_str)), num_layers)
+        except ValueError:
+            pass
+    else:
+        console.print(f"\n  [dim]GPU layers: {n_gpu_layers}/{num_layers} (all on GPU)[/dim]")
+
+    # 3. Parallel slots
+    max_parallel = limits.get(str(chosen_ctx), 1) or 1
+    console.print(f"\n  [bold]3. Parallel slots[/bold] (max: {max_parallel})")
+    par_str = typer.prompt(f"  Slots [1-{max_parallel}]", default=str(max_parallel))
+    try:
+        chosen_parallel = min(max(1, int(par_str)), max_parallel)
+    except ValueError:
+        chosen_parallel = max_parallel
+
+    # 4. Tool calling
+    tool_info = backend.detect_tools(m.path)
+    supports = tool_info.get("supports_tools", False)
+    if supports:
+        console.print("\n  [bold]4. Tool calling[/bold]")
+        if not tools:
+            tools = typer.confirm("     Enable tool calling? (--jinja)", default=False)
+        else:
+            console.print("     [green]Enabled[/green] (--jinja)")
+
+    # Build config via backend
+    choices = {
+        "context": chosen_ctx,
+        "n_gpu_layers": n_gpu_layers,
+        "parallel": chosen_parallel,
+        "port": 8888,
+        "tools": tools,
+    }
+    cfg = backend.build_config(m, choices)
+
+    # Summary
+    console.print("\n  [bold]Summary[/bold]")
+    console.print(f"    Context:     {chosen_ctx // 1024}k")
+    console.print(f"    GPU layers:  {n_gpu_layers}/{num_layers}")
+    console.print(f"    Parallel:    {chosen_parallel}")
+    if tools:
+        console.print("    Tool calling: [green]enabled (--jinja)[/green]")
+
+    confirm = typer.prompt("\n  Start? [Y/n]", default="Y")
+    if confirm.strip().lower() == "n":
+        raise typer.Exit(0)
+
+    # Write JSON config for llama-server
+    cfg_dir = backend.root_dir / "configs" / "models"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = cfg_dir / f"{m.provider}--{m.model_name}.custom.json"
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+    console.clear()
+    return cfg_path
+
+
+def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
+    """Interactive config wizard for vLLM models."""
     from vserve.config import read_limits, write_profile_yaml
     from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
 
@@ -867,14 +1022,9 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
     lim = read_limits(lim_path_)
     if not lim:
         console.print(f"[dim]  Auto-tuning {m.model_name}...[/dim]")
-        from vserve.probe import calculate_limits
-        from vserve.config import write_limits
-        if m.num_kv_heads is None or m.head_dim is None or m.num_layers is None:
-            console.print("[red]Cannot auto-tune: missing architecture fields in config.json[/red]")
-            console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
-            raise typer.Exit(1)
-        lim = calculate_limits(model_info=m, vram_total_gb=gpu.vram_total_gb, gpu_mem_util=gpu_mem_util)
-        write_limits(lim_path_, lim)
+        from vserve.config import write_limits as _write_limits
+        lim = backend.tune(m, gpu, gpu_mem_util=gpu_mem_util)
+        _write_limits(lim_path_, lim)
         console.print("[green]  Tuned.[/green]")
     limits = lim.get("limits", {})
 
@@ -886,7 +1036,7 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
         console.print("[red]No working configs found in probe data.[/red]")
         raise typer.Exit(1)
 
-    console.print(f"\n[bold]Configure {m.model_name}[/bold]\n")
+    console.print(f"\n[bold]Configure {m.model_name}[/bold] (vLLM)\n")
     console.print("  [bold]1. Context window[/bold] (max tokens per request)")
     for i, ctx in enumerate(working_ctxs, 1):
         console.print(f"     {i}) {ctx // 1024}k")
@@ -925,42 +1075,18 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
     bt_choice = typer.prompt("\n  Batched tokens", default="1")
     chosen_bt = bt_map.get(bt_choice)
 
-    # Build config — prefix caching always on (free when unused, wins on repeated prompts)
-    cfg: dict = {
-        "model": str(m.path),
-        "host": "0.0.0.0",
-        "port": 8888,
-        "dtype": "bfloat16",
-        "trust-remote-code": True,
-        "gpu-memory-utilization": gpu_mem_util,
-        "max-model-len": chosen_ctx,
-        "max-num-seqs": chosen_seqs,
-        "kv-cache-dtype": chosen_kv,
-        "enable-prefix-caching": True,
-    }
-    if chosen_bt is not None:
-        cfg["max-num-batched-tokens"] = chosen_bt
-
-    qf = m.quant_method
-    if qf and qf not in ("none", "compressed-tensors"):
-        from vserve.models import QUANT_FLAGS
-        flag = QUANT_FLAGS.get(qf, "")
-        if flag:
-            cfg["quantization"] = flag.split()[-1]
-
     # Tool calling & reasoning
-    from vserve.tools import detect_tool_parser, detect_reasoning_parser, supports_tools as _supports_tools
+    tool_info = backend.detect_tools(m.path)
     resolved_parser: str | None = None
     resolved_reasoning: str | None = None
 
     if tool_parser:
-        # Explicit override — always enable
         resolved_parser = tool_parser
         tools = True
     else:
-        resolved_parser = lim.get("tool_call_parser") or detect_tool_parser(m.path)
+        resolved_parser = lim.get("tool_call_parser") or tool_info.get("tool_call_parser")
 
-    resolved_reasoning = lim.get("reasoning_parser") or detect_reasoning_parser(m.path)
+    resolved_reasoning = lim.get("reasoning_parser") or tool_info.get("reasoning_parser")
 
     if resolved_parser or resolved_reasoning:
         console.print("\n  [bold]5. Capabilities[/bold]")
@@ -977,16 +1103,26 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
                 console.print(f"     Reasoning: [dim]{resolved_reasoning} (enable tool calling to activate)[/dim]")
             else:
                 console.print(f"     Reasoning:    [green]{resolved_reasoning}[/green]")
-    elif _supports_tools(m.path):
-        console.print("\n  [bold]5. Capabilities[/bold]")
-        console.print("     [yellow]Tool markers found but parser unknown[/yellow]")
-        console.print("     Use --tool-parser <name> to enable")
+    else:
+        from vserve.tools import supports_tools as _supports_tools
+        if _supports_tools(m.path):
+            console.print("\n  [bold]5. Capabilities[/bold]")
+            console.print("     [yellow]Tool markers found but parser unknown[/yellow]")
+            console.print("     Use --tool-parser <name> to enable")
 
-    if tools and resolved_parser:
-        cfg["enable-auto-tool-choice"] = True
-        cfg["tool-call-parser"] = resolved_parser
-        if resolved_reasoning:
-            cfg["reasoning-parser"] = resolved_reasoning
+    # Build config via backend
+    choices = {
+        "context": chosen_ctx,
+        "kv_dtype": chosen_kv,
+        "slots": chosen_seqs,
+        "batched_tokens": chosen_bt,
+        "gpu_mem_util": gpu_mem_util,
+        "port": 8888,
+        "tools": tools and bool(resolved_parser),
+        "tool_parser": resolved_parser if tools else None,
+        "reasoning_parser": resolved_reasoning if tools else None,
+    }
+    cfg = backend.build_config(m, choices)
 
     # Summary
     console.print("\n  [bold]Summary[/bold]")
@@ -995,7 +1131,7 @@ def _custom_config(m: ModelInfo, *, tools: bool = False, tool_parser: str | None
     console.print(f"    Slots:          {chosen_seqs}")
     console.print(f"    Batched tokens: {chosen_bt or 'auto'}")
     console.print("    Prefix:         always on")
-    if resolved_parser:
+    if tools and resolved_parser:
         cap_parts = [f"tools=[green]{resolved_parser}[/green]"]
         if resolved_reasoning:
             cap_parts.append(f"reasoning=[green]{resolved_reasoning}[/green]")
@@ -1016,8 +1152,11 @@ def start(
     model: str = typer.Argument(None, help="Model name (fuzzy match)"),
     tools: bool = typer.Option(False, "--tools", help="Enable tool/function calling"),
     tool_parser: str | None = typer.Option(None, "--tool-parser", help="Override tool-call parser (e.g. hermes, qwen3_coder)"),
+    backend_name: str | None = typer.Option(None, "--backend", help="Force backend (vllm, llamacpp)"),
 ):
     """Start serving a model — interactive config picker."""
+    from vserve.backends import get_backend, get_backend_by_name
+
     # Check session lock early — before interactive config
     _session_or_exit()
 
@@ -1042,36 +1181,51 @@ def start(
     else:
         m = _resolve_model(model)
 
+    if backend_name:
+        backend = get_backend_by_name(backend_name)
+    else:
+        backend = get_backend(m)
+
     if tool_parser and not tools:
         tools = True
-    cfg_path = _custom_config(m, tools=tools, tool_parser=tool_parser)
-    _launch_vllm(cfg_path, m.model_name)
+    cfg_path = _custom_config(m, backend, tools=tools, tool_parser=tool_parser)
+    _launch_backend(backend, cfg_path, m.model_name)
 
 
 @app.command()
 def stop():
-    """Stop the vLLM service."""
-    from vserve.serve import stop_vllm, is_vllm_running
+    """Stop the inference server."""
+    from vserve.backends import _BACKENDS
 
     _session_or_exit()
 
-    lock = _lock_or_exit("gpu", "stopping vLLM")
+    # Find which backend is running
+    running_backend = None
+    for b in _BACKENDS:
+        try:
+            if b.is_running():
+                running_backend = b
+                break
+        except Exception:
+            continue
+
+    if running_backend is None:
+        clear_session()
+        console.print("[dim]No server is running.[/dim]")
+        return
+
+    lock = _lock_or_exit("gpu", f"stopping {running_backend.display_name}")
     try:
         _session_or_exit()  # re-check under flock (TOCTOU)
 
-        if not is_vllm_running():
-            clear_session()
-            console.print("[dim]vLLM is not running.[/dim]")
-            return
-
         try:
-            stop_vllm()
+            running_backend.stop()
         except RuntimeError as e:
             clear_session()
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(1)
         clear_session()
-        console.print("[green]vLLM stopped.[/green]")
+        console.print(f"[green]{running_backend.display_name} stopped.[/green]")
     finally:
         lock.release()
 
@@ -1319,27 +1473,50 @@ def fan(
 
 @app.command()
 def status():
-    """Show current vLLM serving status."""
+    """Show current serving status."""
+    from vserve.backends import _BACKENDS
     from vserve.config import active_yaml_path, read_profile_yaml
-    from vserve.serve import is_vllm_running
 
-    if not is_vllm_running():
-        console.print("[dim]vLLM is not running.[/dim] Start with: vserve start")
+    running_backend = None
+    for b in _BACKENDS:
+        try:
+            if b.is_running():
+                running_backend = b
+                break
+        except Exception:
+            continue
+
+    if running_backend is None:
+        console.print("[dim]No server is running.[/dim] Start with: vserve start")
         return
 
-    active = active_yaml_path()
-    if not (active.exists() and active.is_symlink()):
-        console.print("[bold green]vLLM is running[/bold green] (no active config link found)")
+    # Find active config — different path per backend
+    import json as _json
+    cfg = {}
+    config_source = None
+    if running_backend.name == "llamacpp":
+        active_json = running_backend._active_config_path()
+        if active_json.exists():
+            try:
+                cfg = _json.loads(active_json.read_text())
+                config_source = active_json
+            except Exception:
+                pass
+    if not cfg:
+        active = active_yaml_path()
+        if active.exists():
+            cfg = read_profile_yaml(active) or {}
+            config_source = active.resolve() if active.is_symlink() else active
+    if not cfg:
+        console.print(f"[bold green]{running_backend.display_name} is running[/bold green] (no active config found)")
         return
 
-    target = active.resolve()
-    cfg = read_profile_yaml(active) or {}
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
 
-    ctx = cfg.get("max-model-len", "?")
+    ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
     ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-    seqs = cfg.get("max-num-seqs", "?")
+    seqs = cfg.get("max-num-seqs") or cfg.get("parallel", "?")
     kv = cfg.get("kv-cache-dtype", "auto")
     prefix = cfg.get("enable-prefix-caching", False)
     bt = cfg.get("max-num-batched-tokens")
@@ -1347,7 +1524,7 @@ def status():
     gpu_util = cfg.get("gpu-memory-utilization")
     gpu_str = f"{gpu_util:.1%}" if isinstance(gpu_util, float) else str(gpu_util)
 
-    console.print("\n[bold green]vLLM is running[/bold green]")
+    console.print(f"\n[bold green]{running_backend.display_name} is running[/bold green]")
     console.print(f"  [bold]Model[/bold]      {model_name}")
     console.print(f"  [bold]Endpoint[/bold]   http://localhost:{port}/v1")
     console.print()
@@ -1361,7 +1538,8 @@ def status():
     if bt:
         console.print(f"    Batched tokens:    {bt}")
     console.print(f"    GPU memory:        {gpu_str}")
-    console.print(f"\n  [dim]{target}[/dim]\n")
+    if config_source:
+        console.print(f"\n  [dim]{config_source}[/dim]\n")
 
 
 @app.command()
@@ -1433,6 +1611,19 @@ def init():
         root_input = typer.prompt("  vLLM root path", default="/opt/vllm")
         root = _Path(root_input)
 
+    # ── llama.cpp ──
+    llamacpp_root = None
+    llamacpp_bin = shutil.which("llama-server")
+    llamacpp_candidate = _Path("/opt/llama-cpp")
+    if (llamacpp_candidate / "bin" / "llama-server").exists():
+        llamacpp_root = llamacpp_candidate
+        _ok(f"llama.cpp   found at {llamacpp_candidate}")
+    elif llamacpp_bin:
+        llamacpp_root = _Path(llamacpp_bin).resolve().parent.parent
+        _ok(f"llama.cpp   {llamacpp_bin}")
+    else:
+        _warn("llama.cpp   not found (optional — for GGUF models)")
+
     # ── Models ──
     models_dir = root / "models"
     if models_dir.is_dir():
@@ -1440,6 +1631,13 @@ def init():
         _ok(f"Models      {len(models)} found at {models_dir}")
     else:
         _warn(f"Models      {models_dir} does not exist")
+    if llamacpp_root:
+        lc_models = llamacpp_root / "models"
+        if lc_models.is_dir():
+            gguf_count = sum(1 for _ in lc_models.rglob("*.gguf"))
+            _ok(f"GGUF models {gguf_count} found at {lc_models}")
+        else:
+            _warn(f"GGUF models {lc_models} does not exist")
 
     # ── systemd ──
     svc_name, svc_user = _discover_service()
@@ -1475,12 +1673,12 @@ def init():
         if not typer.confirm("  Overwrite config?", default=True):
             console.print()
         else:
-            config = _build_config(root, cuda, svc_name, svc_user, port)
+            config = _build_config(root, cuda, svc_name, svc_user, port, llamacpp_root=llamacpp_root)
             save_config(config)
             reset_config()
             _ok(f"Config written to {CONFIG_FILE}")
     else:
-        config = _build_config(root, cuda, svc_name, svc_user, port)
+        config = _build_config(root, cuda, svc_name, svc_user, port, llamacpp_root=llamacpp_root)
         save_config(config)
         reset_config()
         _ok(f"Config written to {CONFIG_FILE}")
@@ -1538,14 +1736,14 @@ def init():
 
 @app.command()
 def doctor():
-    """Check system readiness for vLLM serving."""
+    """Check system readiness."""
     import os
     import subprocess
     import socket
     from pathlib import Path
 
     from vserve.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
-    from vserve.serve import is_vllm_running
+    from vserve.backends import any_backend_running
 
     ok_count = 0
     fail_count = 0
@@ -1605,6 +1803,19 @@ def doctor():
         _ok(f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, {mem_used} MiB used)")
     except Exception:
         _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
+
+    # -- Backends --
+    console.print("\n  [bold]Backends[/bold]")
+    from vserve.backends import _BACKENDS
+    for b in _BACKENDS:
+        for desc, check_fn in b.doctor_checks():
+            try:
+                if check_fn():
+                    _ok(desc)
+                else:
+                    _warn(desc)
+            except Exception:
+                _warn(f"{desc} (check error)")
 
     # Service user
     from vserve.config import cfg as _cfg
@@ -1701,10 +1912,10 @@ def doctor():
     _port = _c.port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         port_in_use = s.connect_ex(("127.0.0.1", _port)) == 0
-    if is_vllm_running():
-        _ok(f"vLLM serving on port {_port}")
+    if any_backend_running():
+        _ok(f"Serving on port {_port}")
     elif port_in_use:
-        _fail(f"Port {_port} in use but vLLM not running — something else is bound",
+        _fail(f"Port {_port} in use but no backend running — something else is bound",
               f"Check: sudo lsof -i :{_port}  then stop the other service or change port in ~/.config/vserve/config.yaml")
     else:
         _ok(f"Port {_port} available")

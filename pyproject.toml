@@ -1,6 +1,6 @@
 [project]
 name = "vserve"
-version = "0.3.3"
+version = "0.4.0"
 description = "CLI for managing vLLM inference on GPU workstations"
 readme = "README.md"
 license = "MIT"
@@ -24,6 +24,9 @@ dependencies = [
     "pyyaml>=6",
     "nvidia-ml-py>=13.595.45",
 ]
+
+[project.optional-dependencies]
+llamacpp = ["gguf>=0.6"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-mock>=3", "ruff>=0.15", "mypy>=1.15", "types-PyYAML>=6", "types-requests>=2.33"]
