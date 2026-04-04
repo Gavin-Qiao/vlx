@@ -284,7 +284,7 @@ def clear_session() -> None:
 def check_session() -> None:
     """Raise SessionHeld if another user owns an active session.
 
-    Clears stale sessions (vLLM not running).  No-op if the current
+    Clears stale sessions (no backend running).  No-op if the current
     user owns the session (they can restart their own model).
     """
     from vserve.backends import any_backend_running

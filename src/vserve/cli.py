@@ -1,4 +1,4 @@
-"""vserve — vLLM model manager CLI."""
+"""vserve — LLM inference manager CLI."""
 
 
 import pathlib
