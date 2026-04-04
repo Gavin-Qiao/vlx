@@ -696,8 +696,25 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         console.print(f"\n[green]Downloaded {info.full_name}[/green]")
         console.print(f"  Size: {info.model_size_gb:.1f} GB")
         console.print(f"  Quant: {info.quant_method or 'none'}")
-        console.print(f"  Context: {info.max_position_embeddings:,} tokens")
-        console.print(f"\nNext: vserve tune {model_name}")
+        if info.max_position_embeddings:
+            console.print(f"  Context: {info.max_position_embeddings:,} tokens")
+
+        # Auto-tune after download
+        try:
+            from vserve.backends import get_backend
+            from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
+            from vserve.config import write_limits
+            backend = get_backend(info)
+            gpu = get_gpu_info()
+            gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+            console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
+            limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
+            lim_path = limits_path(info.provider, info.model_name)
+            write_limits(lim_path, limits_data)
+            console.print(f"[green]Tuned.[/green] Ready: vserve start {model_name}")
+        except Exception as e:
+            console.print(f"  [yellow]Auto-tune skipped: {e}[/yellow]")
+            console.print(f"  Run: vserve tune {model_name}")
     else:
         console.print(f"\n[green]Downloaded to {local_dir}[/green]")
     return True
@@ -828,7 +845,49 @@ def tune(
                 console.print("                use --tools --tool-parser <parser> with vserve start")
             else:
                 console.print("  Capabilities: [dim]no tool calling detected[/dim]")
-        console.print(f"  [green]Saved to {lim_path}[/green]\n")
+        console.print(f"  [green]Saved to {lim_path}[/green]")
+
+        # Offer pre-caching for vLLM (flashinfer JIT compilation)
+        if backend.name == "vllm":
+            from vserve.config import cfg as _cfg2
+            fi_cache = _cfg2().vllm_root / ".cache" / "flashinfer"
+            if not fi_cache.is_dir() or not any(fi_cache.rglob("*.so")):
+                console.print("  [yellow]First vLLM start will compile flashinfer kernels (~5-10 min).[/yellow]")
+                if typer.confirm("  Pre-cache now? (starts and stops vLLM once)", default=False):
+                    console.print("  [dim]Pre-caching — this will take a few minutes...[/dim]")
+                    try:
+                        from vserve.config import write_profile_yaml
+                        # Build a minimal config just for pre-caching
+                        precache_cfg = backend.build_config(m, {
+                            "context": 4096, "kv_dtype": "auto", "slots": 1,
+                            "batched_tokens": None, "gpu_mem_util": gpu_util,
+                            "port": 8888, "tools": False, "tool_parser": None,
+                            "reasoning_parser": None,
+                        })
+                        cfg_path = profile_path(m.provider, m.model_name, "precache")
+                        write_profile_yaml(cfg_path, precache_cfg, comment="vserve tune — pre-cache")
+                        backend.start(cfg_path)
+                        import time
+                        from urllib.request import urlopen
+                        health = backend.health_url(8888)
+                        for i in range(150):
+                            time.sleep(2)
+                            try:
+                                resp = urlopen(health, timeout=2)
+                                if resp.status == 200:
+                                    console.print("  [green]Pre-cache complete.[/green]")
+                                    break
+                            except Exception:
+                                pass
+                            if i > 5 and not backend.is_running():
+                                console.print("  [yellow]Pre-cache failed — will compile on first real start.[/yellow]")
+                                break
+                            if i > 0 and i % 15 == 0:
+                                console.print(f"  [dim]compiling... ({i * 2}s)[/dim]")
+                        backend.stop()
+                    except Exception as e:
+                        console.print(f"  [yellow]Pre-cache failed: {e}[/yellow]")
+        console.print()
 
 
 def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
@@ -1235,18 +1294,14 @@ def start(
             console.print("[red]No models found.[/red] Run: vserve download")
             raise typer.Exit(1)
 
-        while True:
-            console.print("\n[bold]Select a model:[/bold]")
-            for i, m in enumerate(all_models, 1):
-                has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
-                status = "[green]tuned[/green]" if has_limits else "[dim]run vserve tune first[/dim]"
-                console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
+        console.print("\n[bold]Select a model:[/bold]")
+        for i, m in enumerate(all_models, 1):
+            has_limits = read_limits(limits_path(m.provider, m.model_name)) is not None
+            status = "[green]tuned[/green]" if has_limits else "[dim]not tuned[/dim]"
+            console.print(f"  {i}) {m.full_name}  ({m.model_size_gb} GB)  {status}")
 
-            choice = _pick_number("\nModel number", len(all_models))
-            m = all_models[choice - 1]
-            if read_limits(limits_path(m.provider, m.model_name)) is not None:
-                break
-            console.print(f"[yellow]Run vserve tune {m.model_name} first.[/yellow]")
+        choice = _pick_number("\nModel number", len(all_models))
+        m = all_models[choice - 1]
     else:
         m = _resolve_model(model)
 
