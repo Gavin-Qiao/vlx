@@ -87,7 +87,7 @@ class LlamaCppBackend:
                 parallel = 0
             limits[str(ctx)] = parallel if parallel >= 1 else None
 
-        supports_tools = self.detect_tools(model.path).get("supports_tools", False)
+        tool_info = self.detect_tools(model.path)
 
         from datetime import datetime, timezone
         return {
@@ -101,7 +101,8 @@ class LlamaCppBackend:
             "num_layers": num_layers,
             "full_offload": full_offload,
             "max_context": max_context,
-            "supports_tools": supports_tools,
+            "supports_tools": tool_info.get("supports_tools", False),
+            "supports_reasoning": tool_info.get("supports_reasoning", False),
             "limits": limits,
         }
 
@@ -246,35 +247,43 @@ class LlamaCppBackend:
         return f"http://localhost:{port}/health"
 
     def detect_tools(self, model_path: Path) -> dict:
-        """Check if model supports tool calling via chat template or GGUF metadata."""
-        from vserve.tools import supports_tools
-        if supports_tools(model_path):
-            return {"supports_tools": True}
-        # Fall back to checking GGUF embedded template
-        return {"supports_tools": self._gguf_has_tools(model_path)}
-
-    def _gguf_has_tools(self, model_path: Path) -> bool:
-        """Check GGUF file's embedded chat template for tool markers."""
+        """Check if model supports tool calling and reasoning via chat template or GGUF metadata."""
+        from vserve.tools import supports_tools, _read_chat_template
         import re
+
+        # Try tokenizer_config.json first
+        template = _read_chat_template(model_path)
+        if template is None:
+            # Fall back to GGUF embedded template
+            template = self._read_gguf_chat_template(model_path)
+
+        has_tools = bool(template and re.search(r"\btools\b", template))
+        has_reasoning = bool(template and ("<think>" in template or "<|channel>" in template))
+
+        return {
+            "supports_tools": has_tools or supports_tools(model_path),
+            "supports_reasoning": has_reasoning,
+        }
+
+    def _read_gguf_chat_template(self, model_path: Path) -> str | None:
+        """Read chat template from GGUF file metadata."""
         gguf_files = sorted(model_path.glob("*.gguf"))
         if not gguf_files:
-            return False
+            return None
         try:
             from gguf import GGUFReader  # type: ignore[import-untyped]
             reader = GGUFReader(str(gguf_files[0]))
             field = reader.fields.get("tokenizer.chat_template")
             if field is None:
-                return False
+                return None
             raw = field.parts[-1]
             if hasattr(raw, "tobytes"):
-                template = raw.tobytes().decode("utf-8", errors="replace")
-            elif isinstance(raw, bytes):
-                template = raw.decode("utf-8", errors="replace")
-            else:
-                template = str(raw)
-            return bool(re.search(r"\btools\b", template))
+                return raw.tobytes().decode("utf-8", errors="replace")
+            if isinstance(raw, bytes):
+                return raw.decode("utf-8", errors="replace")
+            return str(raw)
         except Exception:
-            return False
+            return None
 
     def doctor_checks(self) -> list[tuple[str, Callable[[], bool]]]:
         def check_binary() -> bool:

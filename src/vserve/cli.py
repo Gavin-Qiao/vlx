@@ -325,7 +325,7 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
                 tool_info = b.detect_tools(m.path)
                 break
         tp = tool_info.get("tool_call_parser") or ("\u2713" if tool_info.get("supports_tools") else "\u2014")
-        rp = tool_info.get("reasoning_parser", "\u2014") or "\u2014"
+        rp = tool_info.get("reasoning_parser") or ("\u2713" if tool_info.get("supports_reasoning") else "\u2014")
 
         table.add_row(
             m.full_name, backend_name, f"{m.model_size_gb} GB",
@@ -836,8 +836,11 @@ def tune(
                 parts.append(f"reasoning=[green]{rp}[/green]")
             console.print(f"  Capabilities: {' '.join(parts)}")
         elif supports:
-            # llama.cpp: tools supported via --jinja, no parser name needed
-            console.print("  Capabilities: [green]tool calling (--jinja)[/green]")
+            # llama.cpp: tools/reasoning supported via --jinja, no parser name needed
+            caps = ["tool calling"]
+            if limits_data.get("supports_reasoning"):
+                caps.append("reasoning")
+            console.print(f"  Capabilities: [green]{' + '.join(caps)} (--jinja)[/green]")
         else:
             from vserve.tools import supports_tools as _supports_tools
             if _supports_tools(m.path):
