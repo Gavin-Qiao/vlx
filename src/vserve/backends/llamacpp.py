@@ -181,10 +181,40 @@ class LlamaCppBackend:
         return ""
 
     def start(self, config_path: Path) -> None:
-        """Copy config to active location and start systemd service."""
+        """Write active launch script from JSON config and start systemd service."""
+        import json
+
+        # Read config and build CLI flags
+        cfg = json.loads(config_path.read_text())
+        entrypoint = self.find_entrypoint() or "llama-server"
+        args = [str(entrypoint)]
+        flag_map = {
+            "model": "-m",
+            "host": "--host",
+            "port": "--port",
+            "ctx_size": "-c",
+            "n_gpu_layers": "-ngl",
+            "parallel": "-np",
+        }
+        for key, flag in flag_map.items():
+            if key in cfg:
+                args.extend([flag, str(cfg[key])])
+        # Boolean flags
+        if cfg.get("flash_attn"):
+            args.extend(["-fa", "on"])
+        if cfg.get("jinja"):
+            args.append("--jinja")
+
+        # Write launch script
         active = self._active_config_path()
         active.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(config_path, active)
+        script = "#!/bin/bash\nexec " + " ".join(args) + "\n"
+        active.write_text(script)
+        active.chmod(0o755)
+
+        # Also save the JSON config for reference
+        json_dest = active.with_suffix(".json")
+        json_dest.write_text(config_path.read_text())
 
         result = subprocess.run(
             ["sudo", "systemctl", "start", self.service_name],
@@ -229,4 +259,4 @@ class LlamaCppBackend:
         ]
 
     def _active_config_path(self) -> Path:
-        return self.root_dir / "configs" / "active.json"
+        return self.root_dir / "configs" / "active.sh"

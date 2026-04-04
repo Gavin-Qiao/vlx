@@ -1553,7 +1553,7 @@ def status():
     cfg = {}
     config_source = None
     if running_backend.name == "llamacpp":
-        active_json = running_backend._active_config_path()
+        active_json = running_backend._active_config_path().with_suffix(".json")
         if active_json.exists():
             try:
                 cfg = _json.loads(active_json.read_text())
@@ -1572,9 +1572,9 @@ def status():
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
 
-    ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
+    ctx = cfg.get("max-model-len") or cfg.get("ctx-size") or cfg.get("ctx_size", "?")
     ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-    seqs = cfg.get("max-num-seqs") or cfg.get("parallel", "?")
+    seqs = cfg.get("max-num-seqs") or cfg.get("parallel") or cfg.get("n_gpu_layers", "?")
     kv = cfg.get("kv-cache-dtype", "auto")
     prefix = cfg.get("enable-prefix-caching", False)
     bt = cfg.get("max-num-batched-tokens")
