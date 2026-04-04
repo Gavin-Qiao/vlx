@@ -51,6 +51,7 @@ def test_tune_cached_shows_table(mocker, fake_model_dir, fake_limits):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
+    mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
     mocker.patch("vserve.cli.read_limits", return_value=fake_limits)
@@ -59,6 +60,11 @@ def test_tune_cached_shows_table(mocker, fake_model_dir, fake_limits):
         "vram_total_mb": 49152, "vram_used_mb": 0, "vram_free_mb": 49152,
         "driver": "590", "vram_used_gb": 0.0,
     })())
+    # Mock config to not have custom gpu settings (so gpu_util matches fake_limits)
+    mock_cfg = mocker.MagicMock()
+    mock_cfg.gpu_memory_utilization = fake_limits["gpu_memory_utilization"]
+    mock_cfg.gpu_overhead_gb = None
+    mocker.patch("vserve.config.cfg", return_value=mock_cfg)
 
     result = runner.invoke(app, ["tune", "TestModel"])
     assert result.exit_code == 0

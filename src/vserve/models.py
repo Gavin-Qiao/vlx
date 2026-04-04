@@ -45,8 +45,9 @@ def detect_model(model_dir: Path) -> ModelInfo:
     config_path = model_dir / "config.json"
     gguf_files = list(model_dir.glob("*.gguf"))
 
-    if gguf_files and not config_path.exists():
-        # GGUF-only model — no config.json
+    has_safetensors = any(model_dir.glob("*.safetensors"))
+    if gguf_files and not has_safetensors:
+        # GGUF model — may or may not have config.json alongside
         size_bytes = sum(f.stat().st_size for f in gguf_files)
         size_gb = round(size_bytes / (1024**3), 1)
         return ModelInfo(
