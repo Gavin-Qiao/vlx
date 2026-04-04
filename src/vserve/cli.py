@@ -505,7 +505,10 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         raise typer.Exit(1)
 
     provider, model_name = parts
+
+    # Determine destination — will be updated after variant selection for GGUF
     local_dir = models_dir / provider / model_name
+    is_gguf_download = False
 
     if local_dir.exists() and any(local_dir.iterdir()):
         console.print(f"[yellow]{model_id} already exists at {local_dir}[/yellow]")
@@ -554,6 +557,16 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     allow_files: list[str] = list(shared.keys())
     for v in selected_variants:
         allow_files.extend(v.files.keys())
+
+    # Check if this is a GGUF download — route to llama-cpp models dir
+    is_gguf_download = any(f.endswith(".gguf") for f in allow_files)
+    if is_gguf_download:
+        from vserve.config import cfg as _cfg2
+        lc_root = _cfg2().llamacpp_root
+        if lc_root:
+            local_dir = lc_root / "models" / provider / model_name
+        else:
+            console.print("[yellow]llama.cpp not configured — downloading GGUF to default models dir[/yellow]")
 
     console.print(f"\n[bold]Downloading[/bold] {model_id}")
     console.print(f"  To: {local_dir}\n")
@@ -610,11 +623,30 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
             raise typer.Exit(1) from None
 
     try:
-        snapshot_download(  # type: ignore[operator]
-            repo_id=model_id,
-            local_dir=local_dir,
-            allow_patterns=allow_files,
-        )
+        if is_gguf_download:
+            from huggingface_hub import hf_hub_download  # type: ignore[import-untyped]
+            gguf_files = [f for f in allow_files if f.endswith(".gguf")]
+            other_files = [f for f in allow_files if not f.endswith(".gguf")]
+            # Download GGUF files individually
+            for filename in gguf_files:
+                hf_hub_download(repo_id=model_id, filename=filename, local_dir=local_dir)
+            # Also grab tokenizer_config.json for tool detection
+            try:
+                hf_hub_download(repo_id=model_id, filename="tokenizer_config.json", local_dir=local_dir)
+            except Exception:
+                pass  # not all GGUF repos have it
+            # Download any shared non-GGUF files
+            for filename in other_files:
+                try:
+                    hf_hub_download(repo_id=model_id, filename=filename, local_dir=local_dir)
+                except Exception:
+                    pass
+        else:
+            snapshot_download(  # type: ignore[operator]
+                repo_id=model_id,
+                local_dir=local_dir,
+                allow_patterns=allow_files,
+            )
     except Exception as e:
         console.print(f"[red]Download failed:[/red] {e}")
         raise typer.Exit(1)
