@@ -252,6 +252,8 @@ def update():
 @app.command()
 def models(model: str = typer.Argument(None, help="Model name for detail view")):
     """List downloaded models."""
+    from vserve.backends import _BACKENDS
+
     all_models = scan_models(MODELS_DIR)
     if not all_models:
         console.print("[dim]No models found.[/dim] Run: vserve download")
@@ -262,10 +264,9 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
         _show_model_detail(m)
         return
 
-    from vserve.tools import detect_tool_parser, detect_reasoning_parser
-
     table = Table(title="Downloaded Models")
     table.add_column("Model", style="bold")
+    table.add_column("Backend", style="cyan")
     table.add_column("Size", justify="right")
     table.add_column("Limits")
     table.add_column("Max Context", justify="right")
@@ -275,19 +276,36 @@ def models(model: str = typer.Argument(None, help="Model name for detail view"))
     for m in all_models:
         lim = read_limits(limits_path(m.provider, m.model_name))
 
+        # Detect backend
+        backend_name = "\u2014"
+        for b in _BACKENDS:
+            if b.can_serve(m):
+                backend_name = b.display_name
+                break
+
         max_ctx = "\u2014"
         if lim:
-            for ctx_str in sorted(lim["limits"].keys(), key=int, reverse=True):
+            for ctx_str in sorted(lim.get("limits", {}).keys(), key=lambda x: int(x), reverse=True):
                 entry = lim["limits"][ctx_str]
-                if any(v is not None for v in entry.values()):
+                if isinstance(entry, dict):
+                    if any(v is not None for v in entry.values()):
+                        max_ctx = f"{int(ctx_str) // 1024}k"
+                        break
+                elif entry is not None:
                     max_ctx = f"{int(ctx_str) // 1024}k"
                     break
 
-        tp = (lim or {}).get("tool_call_parser") or detect_tool_parser(m.path) or "\u2014"
-        rp = (lim or {}).get("reasoning_parser") or detect_reasoning_parser(m.path) or "\u2014"
+        # Detect tools via backend
+        tool_info = {}
+        for b in _BACKENDS:
+            if b.can_serve(m):
+                tool_info = b.detect_tools(m.path)
+                break
+        tp = tool_info.get("tool_call_parser") or ("\u2713" if tool_info.get("supports_tools") else "\u2014")
+        rp = tool_info.get("reasoning_parser", "\u2014") or "\u2014"
 
         table.add_row(
-            m.full_name, f"{m.model_size_gb} GB",
+            m.full_name, backend_name, f"{m.model_size_gb} GB",
             "\u2713" if lim else "\u2717", max_ctx, tp, rp,
         )
 
@@ -1335,17 +1353,26 @@ def fan(
 
 @app.command()
 def status():
-    """Show current vLLM serving status."""
+    """Show current serving status."""
+    from vserve.backends import _BACKENDS
     from vserve.config import active_yaml_path, read_profile_yaml
-    from vserve.serve import is_vllm_running
 
-    if not is_vllm_running():
-        console.print("[dim]vLLM is not running.[/dim] Start with: vserve start")
+    running_backend = None
+    for b in _BACKENDS:
+        try:
+            if b.is_running():
+                running_backend = b
+                break
+        except Exception:
+            continue
+
+    if running_backend is None:
+        console.print("[dim]No server is running.[/dim] Start with: vserve start")
         return
 
     active = active_yaml_path()
     if not (active.exists() and active.is_symlink()):
-        console.print("[bold green]vLLM is running[/bold green] (no active config link found)")
+        console.print(f"[bold green]{running_backend.display_name} is running[/bold green] (no active config link found)")
         return
 
     target = active.resolve()
@@ -1353,9 +1380,9 @@ def status():
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
 
-    ctx = cfg.get("max-model-len", "?")
+    ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
     ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-    seqs = cfg.get("max-num-seqs", "?")
+    seqs = cfg.get("max-num-seqs") or cfg.get("parallel", "?")
     kv = cfg.get("kv-cache-dtype", "auto")
     prefix = cfg.get("enable-prefix-caching", False)
     bt = cfg.get("max-num-batched-tokens")
@@ -1363,7 +1390,7 @@ def status():
     gpu_util = cfg.get("gpu-memory-utilization")
     gpu_str = f"{gpu_util:.1%}" if isinstance(gpu_util, float) else str(gpu_util)
 
-    console.print("\n[bold green]vLLM is running[/bold green]")
+    console.print(f"\n[bold green]{running_backend.display_name} is running[/bold green]")
     console.print(f"  [bold]Model[/bold]      {model_name}")
     console.print(f"  [bold]Endpoint[/bold]   http://localhost:{port}/v1")
     console.print()
@@ -1449,6 +1476,19 @@ def init():
         root_input = typer.prompt("  vLLM root path", default="/opt/vllm")
         root = _Path(root_input)
 
+    # ── llama.cpp ──
+    llamacpp_root = None
+    llamacpp_bin = shutil.which("llama-server")
+    llamacpp_candidate = _Path("/opt/llama-cpp")
+    if (llamacpp_candidate / "bin" / "llama-server").exists():
+        llamacpp_root = llamacpp_candidate
+        _ok(f"llama.cpp   found at {llamacpp_candidate}")
+    elif llamacpp_bin:
+        llamacpp_root = _Path(llamacpp_bin).resolve().parent.parent
+        _ok(f"llama.cpp   {llamacpp_bin}")
+    else:
+        _warn("llama.cpp   not found (optional — for GGUF models)")
+
     # ── Models ──
     models_dir = root / "models"
     if models_dir.is_dir():
@@ -1456,6 +1496,13 @@ def init():
         _ok(f"Models      {len(models)} found at {models_dir}")
     else:
         _warn(f"Models      {models_dir} does not exist")
+    if llamacpp_root:
+        lc_models = llamacpp_root / "models"
+        if lc_models.is_dir():
+            gguf_count = sum(1 for _ in lc_models.rglob("*.gguf"))
+            _ok(f"GGUF models {gguf_count} found at {lc_models}")
+        else:
+            _warn(f"GGUF models {lc_models} does not exist")
 
     # ── systemd ──
     svc_name, svc_user = _discover_service()
@@ -1491,7 +1538,7 @@ def init():
         if not typer.confirm("  Overwrite config?", default=True):
             console.print()
         else:
-            config = _build_config(root, cuda, svc_name, svc_user, port)
+            config = _build_config(root, cuda, svc_name, svc_user, port, llamacpp_root=llamacpp_root)
             save_config(config)
             reset_config()
             _ok(f"Config written to {CONFIG_FILE}")
@@ -1621,6 +1668,19 @@ def doctor():
         _ok(f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, {mem_used} MiB used)")
     except Exception:
         _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
+
+    # -- Backends --
+    console.print("\n  [bold]Backends[/bold]")
+    from vserve.backends import _BACKENDS
+    for b in _BACKENDS:
+        for desc, check_fn in b.doctor_checks():
+            try:
+                if check_fn():
+                    _ok(desc)
+                else:
+                    _warn(desc)
+            except Exception:
+                _warn(f"{desc} (check error)")
 
     # Service user
     from vserve.config import cfg as _cfg
