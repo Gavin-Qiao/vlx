@@ -1,7 +1,7 @@
 [project]
 name = "vserve"
 version = "0.4.0"
-description = "CLI for managing vLLM inference on GPU workstations"
+description = "CLI for managing LLM inference on GPU workstations"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"

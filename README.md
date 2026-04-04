@@ -9,7 +9,7 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![vLLM 0.19+](https://img.shields.io/badge/vLLM-0.19%2B-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-252%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-264%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
@@ -237,7 +237,7 @@ The registry auto-detects the right backend from the model format. All CLI comma
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 252 tests
+uv run pytest tests/              # 264 tests
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/           # type check
 ```
