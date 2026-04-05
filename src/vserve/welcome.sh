@@ -25,20 +25,25 @@ fi
 # ── Gather data ──────────────────────────────────────
 
 _s="inactive"
-systemctl is-active --quiet "$_svc_name" 2>/dev/null && _s="active"
-# Also check llama-cpp service
-if [ "$_s" = "inactive" ] && [ -n "$_llamacpp_root" ]; then
-    systemctl is-active --quiet "llama-cpp" 2>/dev/null && _s="active"
+_active_backend=""
+if systemctl is-active --quiet "$_svc_name" 2>/dev/null; then
+    _s="active"
+    _active_backend="vllm"
+elif [ -n "$_llamacpp_root" ] && systemctl is-active --quiet "llama-cpp" 2>/dev/null; then
+    _s="active"
+    _active_backend="llamacpp"
 fi
 
 _m=""
-_active="$_vllm_root/configs/active.yaml"
-if [ -f "$_active" ]; then
-    _m="$(grep '^model:' "$_active" 2>/dev/null | sed "s|model: *${_vllm_root}/models/||; s|model: *||")"
-fi
-# Fall back to llama.cpp active config
-if [ -z "$_m" ] && [ -n "$_llamacpp_root" ] && [ -f "$_llamacpp_root/configs/active.json" ]; then
-    _m="$(grep -o '"model" *: *"[^"]*"' "$_llamacpp_root/configs/active.json" 2>/dev/null | sed 's/"model" *: *"//;s/"$//' | sed 's|.*/||')"
+if [ "$_active_backend" = "vllm" ]; then
+    _active="$_vllm_root/configs/active.yaml"
+    if [ -f "$_active" ]; then
+        _m="$(grep '^model:' "$_active" 2>/dev/null | sed "s|model: *${_vllm_root}/models/||; s|model: *||")"
+    fi
+elif [ "$_active_backend" = "llamacpp" ]; then
+    if [ -f "$_llamacpp_root/configs/active.json" ]; then
+        _m="$(grep -o '"model" *: *"[^"]*"' "$_llamacpp_root/configs/active.json" 2>/dev/null | sed 's/"model" *: *"//;s/"$//' | sed 's|.*/||')"
+    fi
 fi
 
 _mc=0
@@ -173,7 +178,7 @@ gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2"
 
 unset -f _lbl _mkbar
 unset _vserve_cfg _vllm_root _llamacpp_root _svc_name _port
-unset _s _m _mc _lc_mc _active _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
+unset _s _m _mc _lc_mc _active _active_backend _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
 unset _proc_data _ph _prows _row
 unset _update_cache _uc_current _uc_latest
