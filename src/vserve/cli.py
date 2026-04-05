@@ -578,7 +578,12 @@ def add(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qw
     results: list = []
     while True:
         if not query:
-            query = typer.prompt("\nSearch HuggingFace (Ctrl-C to quit)")
+            try:
+                console.print()
+                query = input("  Search HuggingFace (Ctrl-C to quit): ")
+            except (KeyboardInterrupt, EOFError):
+                console.print()
+                return
             if not query:
                 return
 
