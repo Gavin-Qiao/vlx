@@ -260,6 +260,56 @@ def test_init_reports_nvml_fan_control_without_coolbits(mocker, tmp_path):
     assert result.exit_code == 0
     assert "Fan control 1 fan(s) exposed via NVML" in result.output
     assert "Coolbits" not in result.output
+    assert "Install login banner?" not in result.output
+
+
+def test_init_llamacpp_only_skips_vllm_prompt_and_banner_install(mocker, tmp_path):
+    config_file = tmp_path / "config.yaml"
+
+    fake_gpu = mocker.Mock(name="GPU")
+    fake_gpu.name = "NVIDIA RTX PRO 5000 Blackwell"
+    fake_gpu.vram_total_gb = 48
+    fake_gpu.driver = "595.58.03"
+    fake_gpu.cuda = "13.1"
+
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=fake_gpu)
+    mocker.patch("vserve.gpu.get_fan_count", return_value=1)
+    mocker.patch("vserve.config._discover_cuda_home", return_value=tmp_path / "cuda")
+    mocker.patch("vserve.config._discover_vllm_root", return_value=None)
+    mocker.patch("vserve.config._discover_service", return_value=("vllm", "vllm"))
+    mocker.patch("vserve.config._discover_port", return_value=8888)
+    mocker.patch("vserve.config._build_config", return_value=mocker.Mock())
+    mocker.patch("vserve.config.save_config")
+    mocker.patch("vserve.config.reset_config")
+    mocker.patch("vserve.config.CONFIG_FILE", config_file)
+    mocker.patch("typer.confirm", return_value=False)
+    prompt = mocker.patch("typer.prompt")
+
+    def _which(name: str) -> str | None:
+        if name == "nvcc":
+            return "/usr/bin/nvcc"
+        if name == "llama-server":
+            return "/opt/llama-cpp/bin/llama-server"
+        return None
+
+    mocker.patch("shutil.which", side_effect=_which)
+    mocker.patch("subprocess.run", return_value=mocker.Mock(returncode=0, stdout="ok", stderr=""))
+
+    result = runner.invoke(app, ["init"])
+
+    assert result.exit_code == 0
+    prompt.assert_not_called()
+    assert "optional — needed for safetensors models" in result.output
+    assert "required for vserve run/stop" not in result.output
+    assert "Install login banner?" not in result.output
+
+
+def test_doctor_summary_label_counts_warnings():
+    from vserve.cli import _doctor_summary_label
+
+    assert _doctor_summary_label(0, 0) == "All clear"
+    assert _doctor_summary_label(1, 0) == "1 warning(s) found"
+    assert _doctor_summary_label(2, 1) == "1 issue(s) and 2 warning(s) found"
 
 
 # --- Old command names must not work ---

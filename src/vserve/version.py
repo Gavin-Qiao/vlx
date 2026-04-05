@@ -55,6 +55,7 @@ def write_cache(latest: str) -> None:
     payload = {
         "current": __version__,
         "latest": latest,
+        "update_available": _compare_versions(latest, __version__) > 0,
         "checked_at": int(time.time()),
     }
     try:

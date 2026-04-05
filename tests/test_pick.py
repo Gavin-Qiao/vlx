@@ -46,11 +46,12 @@ class TestPickManyNonInteractive:
         result = _pick_many(["a", "b", "c"], title="Select:")
         assert result == []
 
-    def test_pick_many_ignores_out_of_range(self, mocker):
+    def test_pick_many_retries_on_invalid_selection(self, mocker):
         mocker.patch("vserve.cli._is_interactive", return_value=False)
-        mocker.patch("typer.prompt", return_value="1 5 2")
+        prompt = mocker.patch("typer.prompt", side_effect=["1 5 2", "1 2"])
         result = _pick_many(["a", "b", "c"])
         assert result == [0, 1]
+        assert prompt.call_count == 2
 
 
 class TestPickWithGum:

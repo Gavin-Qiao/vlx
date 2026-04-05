@@ -91,6 +91,12 @@ class TestCache:
         V.write_cache("1.0.0")
         assert V.CACHE_FILE.exists()
 
+    def test_write_records_update_available_flag(self, monkeypatch):
+        monkeypatch.setattr(V, "__version__", "0.5.2a3")
+        V.write_cache("0.5.2")
+        cache = V.read_cache()
+        assert cache["update_available"] is True
+
 
 # ── _cache_is_stale ───────────────────────────────────
 

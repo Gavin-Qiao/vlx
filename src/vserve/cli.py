@@ -535,6 +535,32 @@ def _pick(items: list[str], title: str = "") -> int | None:
         console.print(f"[red]Enter a number 1-{len(items)}.[/red]")
 
 
+def _parse_multi_select(answer: str, item_count: int) -> list[int] | None:
+    """Parse comma/space-separated menu indices.
+
+    Returns None when any token is invalid so callers can re-prompt instead of
+    silently dropping part of the user's selection.
+    """
+    text = answer.strip()
+    if not text:
+        return []
+
+    indices: list[int] = []
+    seen: set[int] = set()
+    for part in text.replace(",", " ").split():
+        try:
+            n = int(part)
+        except ValueError:
+            return None
+        if not 1 <= n <= item_count:
+            return None
+        idx = n - 1
+        if idx not in seen:
+            seen.add(idx)
+            indices.append(idx)
+    return indices
+
+
 def _pick_many(items: list[str], title: str = "") -> list[int]:
     """Multi-select menu. Returns list of indices.
 
@@ -543,18 +569,14 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
     if not _is_interactive():
         for i, item in enumerate(items, 1):
             console.print(f"  {i}) {item}")
-        answer = typer.prompt(title or "Select (e.g. 1 or 1,2)", default="")
-        if not answer:
-            return []
-        indices: list[int] = []
-        for part in answer.replace(",", " ").split():
-            try:
-                n = int(part)
-                if 1 <= n <= len(items):
-                    indices.append(n - 1)
-            except ValueError:
-                pass
-        return indices
+        while True:
+            answer = typer.prompt(title or "Select (e.g. 1 or 1,2; blank cancels)", default="")
+            parsed = _parse_multi_select(answer, len(items))
+            if parsed is not None:
+                return parsed
+            console.print(
+                f"[red]Enter one or more numbers 1-{len(items)}, separated by commas or spaces.[/red]",
+            )
 
     if _has_gum():
         import subprocess
@@ -599,18 +621,14 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
     # Final fallback: comma-separated prompt
     for i, item in enumerate(items, 1):
         console.print(f"  {i}) {item}")
-    answer = typer.prompt(title or "Select (e.g. 1 or 1,2)", default="")
-    if not answer:
-        return []
-    indices = []
-    for part in answer.replace(",", " ").split():
-        try:
-            n = int(part)
-            if 1 <= n <= len(items):
-                indices.append(n - 1)
-        except ValueError:
-            pass
-    return indices
+    while True:
+        answer = typer.prompt(title or "Select (e.g. 1 or 1,2; blank cancels)", default="")
+        parsed = _parse_multi_select(answer, len(items))
+        if parsed is not None:
+            return parsed
+        console.print(
+            f"[red]Enter one or more numbers 1-{len(items)}, separated by commas or spaces.[/red]",
+        )
 
 
 @app.command()
@@ -1400,8 +1418,7 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     elif tools:
         console.print("    Tool calling: [green]enabled (--jinja)[/green]")
 
-    confirm = typer.prompt("\n  Start? [Y/n]", default="Y")
-    if confirm.strip().lower() == "n":
+    if not typer.confirm("\n  Start?", default=True):
         raise typer.Exit(0)
 
     # Write JSON config for llama-server
@@ -1548,8 +1565,7 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
             cap_parts.append(f"reasoning=[green]{resolved_reasoning}[/green]")
         console.print(f"    Tool calling:   {' '.join(cap_parts)}")
 
-    confirm = typer.prompt("\n  Start? [Y/n]", default="Y")
-    if confirm.strip().lower() == "n":
+    if not typer.confirm("\n  Start?", default=True):
         raise typer.Exit(0)
 
     cfg_path = profile_path(m.provider, m.model_name, "custom")
@@ -2071,9 +2087,19 @@ def init():
         _fail("            Install: sudo apt install nvidia-cuda-toolkit")
         _warn(f"            using fallback: {cuda}")
 
+    # Discover optional backends before printing backend-specific guidance.
+    detected_vllm_root = _discover_vllm_root()
+    root = detected_vllm_root or _Path("/opt/vllm")
+    llamacpp_root = None
+    llamacpp_bin = shutil.which("llama-server")
+    llamacpp_candidate = _Path("/opt/llama-cpp")
+    if (llamacpp_candidate / "bin" / "llama-server").exists():
+        llamacpp_root = llamacpp_candidate
+    elif llamacpp_bin:
+        llamacpp_root = _Path(llamacpp_bin).resolve().parent.parent
+
     # ── vLLM ──
-    root = _discover_vllm_root()
-    if root:
+    if detected_vllm_root:
         # Check vLLM version
         vllm_bin = root / "venv" / "bin" / "vllm"
         if not vllm_bin.exists():
@@ -2087,32 +2113,34 @@ def init():
             _ok(f"vLLM        {ver} ({root})")
         except Exception:
             _ok(f"vLLM        found at {root}")
+    elif llamacpp_root:
+        _warn("vLLM        not found (optional — needed for safetensors models)")
     else:
-        _fail("vLLM        not found. Install it first: pip install vllm")
-        _fail("            See: https://docs.vllm.ai/en/latest/getting_started/installation.html")
-        root_input = typer.prompt("  vLLM root path", default="/opt/vllm")
-        root = _Path(root_input)
+        _warn("vLLM        not found (install it for safetensors models)")
+        _warn("            See: https://docs.vllm.ai/en/latest/getting_started/installation.html")
 
     # ── llama.cpp ──
-    llamacpp_root = None
-    llamacpp_bin = shutil.which("llama-server")
-    llamacpp_candidate = _Path("/opt/llama-cpp")
-    if (llamacpp_candidate / "bin" / "llama-server").exists():
-        llamacpp_root = llamacpp_candidate
+    if llamacpp_root == llamacpp_candidate:
         _ok(f"llama.cpp   found at {llamacpp_candidate}")
     elif llamacpp_bin:
-        llamacpp_root = _Path(llamacpp_bin).resolve().parent.parent
         _ok(f"llama.cpp   {llamacpp_bin}")
-    else:
+    elif detected_vllm_root:
         _warn("llama.cpp   not found (optional — for GGUF models)")
+    else:
+        _warn("llama.cpp   not found (install it for GGUF models)")
+
+    if not detected_vllm_root and not llamacpp_root:
+        _warn("Backends    no serving backend detected yet")
+        _warn("            Install vLLM and/or llama.cpp, then rerun vserve init")
 
     # ── Models ──
-    models_dir = root / "models"
-    if models_dir.is_dir():
-        models = list(models_dir.glob("*/*/config.json"))
-        _ok(f"Models      {len(models)} found at {models_dir}")
-    else:
-        _warn(f"Models      {models_dir} does not exist")
+    if detected_vllm_root:
+        models_dir = root / "models"
+        if models_dir.is_dir():
+            models = list(models_dir.glob("*/*/config.json"))
+            _ok(f"Models      {len(models)} found at {models_dir}")
+        else:
+            _warn(f"Models      {models_dir} does not exist")
     if llamacpp_root:
         lc_models = llamacpp_root / "models"
         if lc_models.is_dir():
@@ -2123,13 +2151,16 @@ def init():
 
     # ── systemd (vLLM) ──
     svc_name, svc_user = _discover_service()
-    svc_path = _Path(f"/etc/systemd/system/{svc_name}.service")
-    if svc_path.exists():
-        _ok(f"systemd     {svc_name}.service (user: {svc_user})")
+    if detected_vllm_root:
+        svc_path = _Path(f"/etc/systemd/system/{svc_name}.service")
+        if svc_path.exists():
+            _ok(f"systemd     {svc_name}.service (user: {svc_user})")
+        else:
+            _fail("systemd     no vLLM systemd service found (required for vLLM runs)")
+            _fail(f"            Create /etc/systemd/system/{svc_name}.service with:")
+            _fail("            [Service] ExecStart=/opt/vllm/venv/bin/vllm serve ...")
     else:
-        _fail("systemd     no vLLM systemd service found (required for vserve run/stop)")
-        _fail(f"            Create /etc/systemd/system/{svc_name}.service with:")
-        _fail("            [Service] ExecStart=/opt/vllm/venv/bin/vllm serve ...")
+        _warn("systemd     vLLM service not checked (vLLM not installed)")
 
     # ── systemd (llama.cpp) ──
     if llamacpp_root:
@@ -2171,7 +2202,8 @@ def init():
         _warn("Fan control NVML unavailable")
 
     # ── gum (interactive UI) ──
-    if shutil.which("gum"):
+    gum_available = _has_gum()
+    if gum_available:
         _ok("gum         installed (enhanced interactive menus)")
     else:
         _warn("gum         not installed (using built-in menus)")
@@ -2214,6 +2246,11 @@ def init():
 
     if _shell == "fish":
         console.print("  [yellow]Login banner not supported for fish shell.[/yellow]")
+    elif not gum_available:
+        if has_banner:
+            console.print("  [yellow]Login banner is installed but inactive until gum is installed.[/yellow]")
+        else:
+            console.print("  [dim]Login banner unavailable until gum is installed.[/dim]")
     elif has_banner:
         console.print(f"  [dim]Login banner already installed ({_rc.name} → {banner_dest})[/dim]")
         if typer.confirm("  Reinstall login banner?", default=False):
@@ -2238,10 +2275,22 @@ def init():
     # ── Next steps ──
     console.print()
     console.print("[bold]Next steps[/bold]")
+    if not detected_vllm_root and not llamacpp_root:
+        console.print("  Install vLLM and/or llama.cpp, then rerun vserve init")
     console.print("  vserve add      Search & download a model")
     console.print("  vserve doctor   Full system check")
     console.print("  vserve          Dashboard")
     console.print()
+
+
+def _doctor_summary_label(warn_count: int, fail_count: int) -> str:
+    if fail_count == 0 and warn_count == 0:
+        return "All clear"
+    if fail_count == 0:
+        return f"{warn_count} warning(s) found"
+    if warn_count == 0:
+        return f"{fail_count} issue(s) found"
+    return f"{fail_count} issue(s) and {warn_count} warning(s) found"
 
 
 @app.command()
@@ -2256,6 +2305,7 @@ def doctor():
     from vserve.backends import any_backend_running
 
     ok_count = 0
+    warn_count = 0
     fail_count = 0
 
     def _ok(msg: str) -> None:
@@ -2271,9 +2321,11 @@ def doctor():
         fail_count += 1
 
     def _warn(msg: str, fix: str = "") -> None:
+        nonlocal warn_count
         console.print(f"  [yellow]WARN[/yellow]  {msg}")
         if fix:
             console.print(f"          Fix: {fix}")
+        warn_count += 1
 
     console.print("\n[bold]vserve doctor[/bold]\n")
 
@@ -2571,8 +2623,10 @@ def doctor():
     probed = sum(1 for m in all_models if read_limits(limits_path(m.provider, m.model_name)))
     _ok(f"{len(all_models)} models downloaded, {probed} probed")
 
-    console.print(f"\n  [bold]{'All clear' if fail_count == 0 else f'{fail_count} issue(s) found'}[/bold]  "
-                  f"({ok_count} ok, {fail_count} fail)\n")
+    console.print(
+        f"\n  [bold]{_doctor_summary_label(warn_count, fail_count)}[/bold]  "
+        f"({ok_count} ok, {warn_count} warn, {fail_count} fail)\n",
+    )
 
 
 # ── Cache management ──
