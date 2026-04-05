@@ -263,16 +263,28 @@ def update():
         if "vserve" in result.stdout:
             console.print("[dim]Upgrading via uv...[/dim]")
             subprocess.run([uv, "tool", "upgrade", "vserve"])
+            _refresh_banner()
             return
 
     pip = shutil.which("pip") or shutil.which("pip3")
     if pip:
         console.print("[dim]Upgrading via pip...[/dim]")
         subprocess.run([pip, "install", "--upgrade", "vserve"])
+        _refresh_banner()
         return
 
     console.print("[red]Could not find uv or pip to perform upgrade.[/red]")
     console.print("Run manually: [cyan]uv tool upgrade vserve[/cyan] or [cyan]pip install -U vserve[/cyan]")
+
+
+def _refresh_banner() -> None:
+    """Silently update the login banner if installed."""
+    from pathlib import Path as _P
+    banner_src = _P(__file__).parent / "welcome.sh"
+    banner_dest = CONFIG_FILE.parent / "welcome.sh"
+    if banner_dest.exists() and banner_src.exists():
+        import shutil
+        shutil.copy2(banner_src, banner_dest)
 
 
 @app.command(name="list")
