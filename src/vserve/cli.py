@@ -266,7 +266,7 @@ def update(
         if "vserve" in result.stdout:
             if nightly:
                 console.print("[dim]Upgrading to latest pre-release via uv...[/dim]")
-                subprocess.run([uv, "tool", "upgrade", "vserve", "--prereleases", "allow"])
+                subprocess.run([uv, "tool", "upgrade", "vserve", "--prerelease", "allow"])
             else:
                 console.print("[dim]Upgrading via uv...[/dim]")
                 subprocess.run([uv, "tool", "upgrade", "vserve"])
@@ -1935,16 +1935,7 @@ def status():
 
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
-
-    ctx = cfg.get("max-model-len") or cfg.get("ctx-size") or cfg.get("ctx_size", "?")
-    ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-    seqs = cfg.get("max-num-seqs") or cfg.get("parallel", "?")
-    kv = cfg.get("kv-cache-dtype", "auto")
-    prefix = cfg.get("enable-prefix-caching", False)
-    bt = cfg.get("max-num-batched-tokens")
     port = cfg.get("port", 8888)
-    gpu_util = cfg.get("gpu-memory-utilization")
-    gpu_str = f"{gpu_util:.1%}" if isinstance(gpu_util, float) else str(gpu_util)
 
     console.print(f"\n[bold green]{running_backend.display_name} is running[/bold green]")
     console.print(f"  [bold]Model[/bold]      {model_name}")
@@ -1952,14 +1943,54 @@ def status():
     console.print()
 
     console.print("  [bold]Serving config[/bold]")
-    console.print(f"    Context window:    {ctx_display}")
-    console.print(f"    Concurrent slots:  {seqs}  (max in-flight requests)")
-    console.print(f"    KV cache dtype:    {kv}")
-    if prefix:
-        console.print("    Prefix caching:    enabled  (reuses system prompt KV cache)")
-    if bt:
-        console.print(f"    Batched tokens:    {bt}")
-    console.print(f"    GPU memory:        {gpu_str}")
+
+    if running_backend.name == "llamacpp":
+        ctx = cfg.get("ctx_size", "?")
+        ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
+        console.print(f"    Context window:    {ctx_display}")
+        console.print(f"    Concurrent slots:  {cfg.get('parallel', '?')}  (max in-flight requests)")
+        ngl = cfg.get("n_gpu_layers")
+        if ngl is not None:
+            console.print(f"    GPU layers:        {ngl}")
+        if cfg.get("flash_attn"):
+            console.print("    Flash attention:   on")
+        if cfg.get("embedding"):
+            pooling = cfg.get("pooling", "mean")
+            console.print(f"    Mode:              embedding (pooling: {pooling})")
+        if cfg.get("jinja"):
+            console.print("    Tool calling:      enabled (--jinja)")
+    else:
+        # vLLM
+        ctx = cfg.get("max-model-len", "?")
+        ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
+        console.print(f"    Context window:    {ctx_display}")
+        console.print(f"    Concurrent slots:  {cfg.get('max-num-seqs', '?')}  (max in-flight requests)")
+        console.print(f"    KV cache dtype:    {cfg.get('kv-cache-dtype', 'auto')}")
+        if cfg.get("enable-prefix-caching"):
+            console.print("    Prefix caching:    enabled")
+        bt = cfg.get("max-num-batched-tokens")
+        if bt:
+            console.print(f"    Batched tokens:    {bt}")
+        gpu_util = cfg.get("gpu-memory-utilization")
+        if isinstance(gpu_util, float):
+            console.print(f"    GPU memory:        {gpu_util:.1%}")
+
+    # GPU memory bar (shared for both backends)
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            timeout=5,
+        ).decode().strip().split("\n")[0]
+        used, total = [int(x.strip()) for x in out.split(",")]
+        pct = used * 100 // total if total else 0
+        bar_w = 20
+        filled = pct * bar_w // 100
+        bar = "[green]" + "█" * filled + "[/green][dim]" + "░" * (bar_w - filled) + "[/dim]"
+        console.print(f"\n  [bold]GPU[/bold]        {bar}  {used / 1024:.1f} / {total / 1024:.1f} GB ({pct}%)")
+    except Exception:
+        pass
+
     if config_source:
         console.print(f"\n  [dim]{config_source}[/dim]\n")
 
