@@ -413,6 +413,32 @@ def _has_gum() -> bool:
     return shutil.which("gum") is not None
 
 
+def _restore_terminal() -> None:
+    """Reset terminal to sane state after menu tools may have altered it."""
+    import sys
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        termios.tcsetattr(fd, termios.TCSADRAIN, _SAVED_TERM_ATTRS)
+    except Exception:
+        pass
+
+
+# Save terminal state at import time so we can restore after menus
+try:
+    import sys as _sys
+    import termios as _termios
+    _SAVED_TERM_ATTRS = _termios.tcgetattr(_sys.stdin.fileno())
+except Exception:
+    _SAVED_TERM_ATTRS = None  # type: ignore[assignment]
+
+# Enable readline for input() — arrow keys, history, backspace
+try:
+    import readline as _readline  # noqa: F401
+except ImportError:
+    pass
+
+
 def _pick(items: list[str], title: str = "") -> int | None:
     """Single-select menu. Returns index or None on cancel.
 
@@ -439,6 +465,7 @@ def _pick(items: list[str], title: str = "") -> int | None:
             cmd.extend(["--header", title])
         cmd.extend(items)
         r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        _restore_terminal()
         if r.returncode != 0 or not r.stdout.strip():
             return None
         selected = r.stdout.strip()
@@ -459,9 +486,10 @@ def _pick(items: list[str], title: str = "") -> int | None:
             status_bar_style=("fg_gray",),
         )
         idx = menu.show()
+        _restore_terminal()
         return idx  # type: ignore[return-value]
     except Exception:
-        pass
+        _restore_terminal()
 
     # Final fallback: numbered prompt
     for i, item in enumerate(items, 1):
@@ -509,6 +537,7 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
             cmd.extend(["--header", title])
         cmd.extend(items)
         r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        _restore_terminal()
         if r.returncode != 0 or not r.stdout.strip():
             return []
         selected_lines = r.stdout.strip().split("\n")
@@ -529,10 +558,12 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
             status_bar_style=("fg_gray",),
         )
         result = menu.show()
+        _restore_terminal()
         if result is None:
             return []
         return list(result) if isinstance(result, tuple) else [result]
     except Exception:
+        _restore_terminal()
         pass
 
     # Final fallback: comma-separated prompt
