@@ -92,7 +92,7 @@ class TestCache:
         assert V.CACHE_FILE.exists()
 
     def test_write_records_update_available_flag(self, monkeypatch):
-        monkeypatch.setattr(V, "__version__", "0.5.2a4")
+        monkeypatch.setattr(V, "__version__", "0.5.2b1")
         V.write_cache("0.5.2")
         cache = V.read_cache()
         assert cache["update_available"] is True
@@ -256,7 +256,7 @@ class TestUpdateCommand:
         with patch("vserve.version.check_pypi", return_value="0.5.2"), \
              patch("shutil.which", return_value=None):
             result = runner.invoke(app, ["update"])
-            assert result.exit_code == 0
+            assert result.exit_code == 1
             assert "Already up to date" not in result.output
             assert "New version available: 0.5.2" in result.output
 
@@ -326,5 +326,5 @@ class TestUpdateCommand:
         with patch("vserve.version.check_pypi", return_value="9.9.9"), \
              patch("shutil.which", return_value=None):
             result = runner.invoke(app, ["update"])
-            assert result.exit_code == 0
+            assert result.exit_code == 1
             assert "Could not find" in result.output

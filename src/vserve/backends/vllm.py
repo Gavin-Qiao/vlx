@@ -15,8 +15,18 @@ if TYPE_CHECKING:
 class VllmBackend:
     name = "vllm"
     display_name = "vLLM"
-    service_name = "vllm"
-    service_user = "vllm"
+
+    @property
+    def service_name(self) -> str:
+        from vserve.config import cfg
+
+        return cfg().service_name
+
+    @property
+    def service_user(self) -> str:
+        from vserve.config import cfg
+
+        return cfg().service_user
 
     @property
     def root_dir(self) -> Path:
@@ -107,11 +117,13 @@ class VllmBackend:
         }
 
     def doctor_checks(self) -> list[tuple[str, Callable[[], bool]]]:
+        from vserve.config import find_systemd_unit_path
+
         def check_binary() -> bool:
             return self.find_entrypoint() is not None
 
         def check_service() -> bool:
-            return Path(f"/etc/systemd/system/{self.service_name}.service").exists()
+            return find_systemd_unit_path(self.service_name) is not None
 
         return [
             (f"{self.display_name} binary", check_binary),

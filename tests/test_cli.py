@@ -216,9 +216,87 @@ def test_status_handles_unreadable_active_config(mocker, tmp_path):
     assert str(active) in result.output
 
 
+def test_status_handles_non_mapping_active_config(mocker, tmp_path):
+    active = tmp_path / "active.yaml"
+    active.write_text("- one\n- two\n")
+
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.is_running.return_value = True
+
+    mocker.patch("vserve.backends._BACKENDS", [backend])
+    mocker.patch("vserve.config.active_yaml_path", return_value=active)
+
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "active config unreadable" in result.output
+
+
+def test_safe_resolve_path_returns_none_for_symlink_loop(tmp_path):
+    from vserve.cli import _safe_resolve_path
+
+    active = tmp_path / "active.yaml"
+    target = tmp_path / "profile.yaml"
+    active.symlink_to(target)
+    target.symlink_to(active)
+
+    assert _safe_resolve_path(active) is None
+
+
 def test_doctor_command_exists():
     result = runner.invoke(app, ["doctor", "--help"])
     assert result.exit_code == 0
+
+
+def test_doctor_handles_invalid_utf8_systemd_unit(mocker, tmp_path):
+    unit_path = tmp_path / "vllm.service"
+    unit_path.write_bytes(b"\x80\x81")
+
+    fake_cfg = mocker.Mock()
+    fake_cfg.service_user = "vllm"
+    fake_cfg.service_name = "vllm"
+    fake_cfg.llamacpp_root = None
+    fake_cfg.port = 8888
+    fake_cfg.logs_dir = tmp_path / "logs"
+    fake_cfg.logs_dir.mkdir()
+
+    fake_gpu = mocker.Mock()
+    fake_gpu.name = "NVIDIA Test GPU"
+    fake_gpu.vram_total_gb = 48
+
+    vllm_bin = tmp_path / "vllm"
+    vllm_root = tmp_path / "vllm-root"
+    vllm_root.mkdir()
+
+    def fake_run(cmd, *args, **kwargs):
+        exe = str(cmd[0])
+        if exe == "nvcc":
+            return mocker.Mock(returncode=0, stdout="Cuda compilation tools, release 13.0, V13.0.0\n", stderr="")
+        if exe == str(vllm_bin):
+            return mocker.Mock(returncode=0, stdout="vllm 0.0.0\n", stderr="")
+        if exe == "id":
+            return mocker.Mock(returncode=0, stdout="uid=1000(vllm)\n", stderr="")
+        return mocker.Mock(returncode=0, stdout="", stderr="")
+
+    mocker.patch("subprocess.run", side_effect=fake_run)
+    mocker.patch("subprocess.check_output", return_value=b"0\n")
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=fake_gpu)
+    mocker.patch("vserve.config.VLLM_BIN", vllm_bin)
+    mocker.patch("vserve.config.VLLM_ROOT", vllm_root)
+    mocker.patch("vserve.config.LOGS_DIR", fake_cfg.logs_dir)
+    mocker.patch("vserve.config.active_yaml_path", return_value=tmp_path / "active.yaml")
+    mocker.patch("vserve.config.try_read_profile_yaml", return_value=None)
+    mocker.patch("vserve.config.find_systemd_unit_path", return_value=unit_path)
+    mocker.patch("vserve.config.cfg", return_value=fake_cfg)
+    mocker.patch("vserve.backends.any_backend_running", return_value=False)
+    mocker.patch("vserve.backends._BACKENDS", [])
+    mocker.patch("vserve.cli._all_models", return_value=[])
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "Could not read systemd unit" in result.output
 
 
 def test_init_command_exists():
@@ -487,6 +565,7 @@ def test_launch_backend_aborts_on_restart_stop_failure(mocker, tmp_path):
     clear_session = mocker.patch("vserve.cli.clear_session")
     mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
     mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([backend], False))
     mocker.patch("vserve.config.read_profile_yaml", return_value={"port": 8888, "max-model-len": 4096})
     mocker.patch("typer.confirm", return_value=True)
     mocker.patch("time.sleep")
@@ -497,3 +576,380 @@ def test_launch_backend_aborts_on_restart_stop_failure(mocker, tmp_path):
     backend.start.assert_not_called()
     clear_session.assert_not_called()
     lock.release.assert_called_once()
+
+
+def test_launch_backend_aborts_on_invalid_yaml_profile(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("- not\n- a mapping\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    backend.service_name = "vllm"
+    backend.name = "vllm"
+
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+
+    with pytest.raises(click.exceptions.Exit):
+        _launch_backend(backend, cfg_path, "test-model")
+
+    backend.start.assert_not_called()
+    lock.release.assert_called_once()
+
+
+def test_launch_backend_restart_keeps_session_until_new_start(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nmax-model-len: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    backend.service_name = "vllm"
+    backend.name = "vllm"
+    backend.is_running.side_effect = [True, False]
+    backend.health_url.return_value = "http://localhost:8888/health"
+
+    lock = mocker.Mock()
+    clear_session = mocker.patch("vserve.cli.clear_session")
+    write_session = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([backend], False), ([], False)])
+    mocker.patch("vserve.config.read_profile_yaml", return_value={"port": 8888, "max-model-len": 4096})
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("time.sleep")
+    resp = mocker.MagicMock()
+    resp.status = 200
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = False
+    mocker.patch("urllib.request.urlopen", return_value=resp)
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(vllm_root=tmp_path))
+
+    _launch_backend(backend, cfg_path, "test-model")
+
+    backend.stop.assert_called_once()
+    clear_session.assert_not_called()
+    write_session.assert_called_once_with("test-model")
+
+
+def test_launch_backend_restart_times_out_if_service_never_stops(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+    import typer
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nmax-model-len: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    backend.service_name = "vllm"
+    backend.name = "vllm"
+    backend.is_running.side_effect = [True] + [True] * 20
+
+    lock = mocker.Mock()
+    clear_session = mocker.patch("vserve.cli.clear_session")
+    write_session = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch(
+        "vserve.backends.probe_running_backends",
+        side_effect=[([backend], False)] + [([backend], False)] * 15,
+    )
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("time.sleep")
+
+    with pytest.raises(typer.Exit) as exc:
+        _launch_backend(backend, cfg_path, "test-model")
+
+    assert exc.value.exit_code == 1
+    backend.stop.assert_called_once()
+    backend.start.assert_not_called()
+    write_session.assert_not_called()
+    clear_session.assert_not_called()
+
+
+def test_launch_backend_stops_other_running_backend_before_start(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nctx_size: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "llama.cpp"
+    backend.service_name = "llama-cpp"
+    backend.name = "llamacpp"
+    backend.health_url.return_value = "http://localhost:8888/health"
+
+    active = mocker.Mock()
+    active.display_name = "vLLM"
+    active.service_name = "vllm"
+    active.name = "vllm"
+
+    lock = mocker.Mock()
+    write_session = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([active], False), ([], False)])
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("time.sleep")
+    resp = mocker.MagicMock()
+    resp.status = 200
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = False
+    mocker.patch("urllib.request.urlopen", return_value=resp)
+
+    _launch_backend(backend, cfg_path, "profile")
+
+    active.stop.assert_called_once()
+    backend.start.assert_called_once_with(cfg_path)
+    write_session.assert_called_once_with("profile")
+
+
+def test_launch_backend_probe_uncertainty_stops_all_known_backends(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nctx_size: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "llama.cpp"
+    backend.service_name = "llama-cpp"
+    backend.name = "llamacpp"
+    backend.health_url.return_value = "http://localhost:8888/health"
+
+    active = mocker.Mock()
+    active.display_name = "vLLM"
+    active.service_name = "vllm"
+    active.name = "vllm"
+
+    uncertain = mocker.Mock()
+    uncertain.display_name = "llama.cpp"
+    uncertain.service_name = "llama-cpp"
+    uncertain.name = "llamacpp"
+
+    lock = mocker.Mock()
+    write_session = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.backends._BACKENDS", [active, uncertain])
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([active], True), ([], False)])
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("time.sleep")
+    resp = mocker.MagicMock()
+    resp.status = 200
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = False
+    mocker.patch("urllib.request.urlopen", return_value=resp)
+
+    _launch_backend(backend, cfg_path, "profile")
+
+    active.stop.assert_called_once()
+    uncertain.stop.assert_called_once()
+    backend.start.assert_called_once_with(cfg_path)
+    write_session.assert_called_once_with("profile")
+
+
+def test_launch_backend_timeout_returns_when_service_stays_running(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nctx_size: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "llama.cpp"
+    backend.service_name = "llama-cpp"
+    backend.name = "llamacpp"
+    backend.is_running.side_effect = [True] * 200
+    backend.health_url.return_value = "http://localhost:8888/health"
+
+    lock = mocker.Mock()
+    clear_session = mocker.patch("vserve.cli.clear_session")
+    write_session = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([], False))
+    mocker.patch("vserve.cli._is_interactive", return_value=True)
+    mocker.patch("time.sleep")
+    mocker.patch("urllib.request.urlopen", side_effect=RuntimeError("not ready"))
+
+    _launch_backend(backend, cfg_path, "profile")
+
+    write_session.assert_called_once_with("profile")
+    clear_session.assert_not_called()
+
+
+def test_launch_backend_timeout_noninteractive_requires_health(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+    import typer
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nctx_size: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "llama.cpp"
+    backend.service_name = "llama-cpp"
+    backend.name = "llamacpp"
+    backend.is_running.side_effect = [True] * 200
+    backend.health_url.return_value = "http://localhost:8888/health"
+
+    lock = mocker.Mock()
+    clear_session = mocker.patch("vserve.cli.clear_session")
+    write_session = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([], False))
+    mocker.patch("vserve.cli._is_interactive", return_value=False)
+    mocker.patch("time.sleep")
+    mocker.patch("urllib.request.urlopen", side_effect=RuntimeError("not ready"))
+
+    with pytest.raises(typer.Exit) as exc:
+        _launch_backend(backend, cfg_path, "profile")
+
+    assert exc.value.exit_code == 1
+    write_session.assert_called_once_with("profile")
+    clear_session.assert_not_called()
+
+
+def test_stop_probe_failure_uses_fallback_stop(mocker):
+    first = mocker.Mock()
+    first.display_name = "vLLM"
+    second = mocker.Mock()
+    second.display_name = "llama.cpp"
+    second.stop.side_effect = ValueError("systemctl stop llama-cpp failed")
+
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([], True), ([], False)])
+    mocker.patch("vserve.backends._BACKENDS", [first, second])
+    clear_session = mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    assert "Backend state was uncertain" in result.output
+    first.stop.assert_called_once()
+    second.stop.assert_called_once()
+    clear_session.assert_called_once()
+
+
+def test_stop_stops_all_running_backends(mocker):
+    first = mocker.Mock()
+    first.display_name = "vLLM"
+    second = mocker.Mock()
+    second.display_name = "llama.cpp"
+
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([first, second], False), ([], False)])
+    clear_session = mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    assert "Stopped: vLLM, llama.cpp." in result.output
+    first.stop.assert_called_once()
+    second.stop.assert_called_once()
+    clear_session.assert_called_once()
+
+
+def test_stop_probe_failure_with_running_backend_stops_all_known_backends(mocker):
+    first = mocker.Mock()
+    first.display_name = "vLLM"
+    second = mocker.Mock()
+    second.display_name = "llama.cpp"
+
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.backends._BACKENDS", [first, second])
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([first], True), ([], False)])
+    clear_session = mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    assert "Stopped: vLLM, llama.cpp." in result.output
+    first.stop.assert_called_once()
+    second.stop.assert_called_once()
+    clear_session.assert_called_once()
+
+
+def test_stop_probe_failure_exits_when_state_remains_uncertain(mocker):
+    first = mocker.Mock()
+    first.display_name = "vLLM"
+
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.backends.probe_running_backends", side_effect=[([], True), ([], True)])
+    mocker.patch("vserve.backends._BACKENDS", [first])
+    clear_session = mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 1
+    assert "Could not verify backend state after fallback stop attempts" in result.output
+    first.stop.assert_called_once()
+    clear_session.assert_not_called()
+
+
+def test_update_aborts_when_latest_version_unknown(mocker):
+    mocker.patch("vserve.version.check_pypi", return_value=None)
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 1
+    assert "Could not determine the latest published version" in result.output
+
+
+def test_update_aborts_when_no_updater_is_available(mocker):
+    mocker.patch("vserve.version.check_pypi", return_value="9999.0.0")
+    mocker.patch("vserve.version.write_cache")
+    mocker.patch("shutil.which", return_value=None)
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 1
+    assert "Could not find uv or pip to perform upgrade" in result.output
+
+
+def test_update_falls_back_to_pip_when_uv_inspection_fails(mocker):
+    import sys
+
+    check_pypi = mocker.patch("vserve.version.check_pypi", return_value="9999.0.0")
+    write_cache = mocker.patch("vserve.version.write_cache")
+    mocker.patch("shutil.which", side_effect=["/usr/bin/uv", "/usr/bin/pip"])
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["/usr/bin/uv", "tool", "list"]:
+            return mocker.Mock(returncode=1, stdout="", stderr="uv failed")
+        if cmd[:3] == [sys.executable, "-m", "pip"] and cmd[3:5] == ["install", "--upgrade"]:
+            return mocker.Mock(returncode=0, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+    mocker.patch("subprocess.run", side_effect=fake_run)
+    refresh = mocker.patch("vserve.cli._refresh_banner")
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "uv inspection failed; trying pip fallback" in result.output
+    check_pypi.assert_called_once()
+    write_cache.assert_called_once()
+    refresh.assert_called_once()
+
+
+def test_llamacpp_slots_helper_accepts_nested_schema():
+    from vserve.cli import _llamacpp_slots_from_limits_entry
+
+    assert _llamacpp_slots_from_limits_entry({"auto": 4, "fp8": 8}) == 8
+
+
+def test_vllm_limits_helper_accepts_flat_schema():
+    from vserve.cli import _vllm_limits_entry
+
+    assert _vllm_limits_entry(6) == {"auto": 6}

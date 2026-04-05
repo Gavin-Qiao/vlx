@@ -27,6 +27,20 @@ class TestLlamaCppIdentity:
         assert b.service_name == "llama-cpp"
         assert b.service_user == "llama-cpp"
 
+    def test_configured_service_identity(self, mocker):
+        b = LlamaCppBackend()
+        mocker.patch(
+            "vserve.config.cfg",
+            return_value=Mock(
+                llamacpp_service_name="custom-llama",
+                llamacpp_service_user="svc-llama",
+                llamacpp_root=None,
+            ),
+        )
+
+        assert b.service_name == "custom-llama"
+        assert b.service_user == "svc-llama"
+
 
 class TestLlamaCppHealthUrl:
     def test_health_url(self):
@@ -203,17 +217,85 @@ class TestLlamaCppLifecycle:
         calls = [c for c in mock_run.call_args_list if "start" in str(c)]
         assert len(calls) >= 1
 
+    def test_start_rejects_invalid_json_config(self, tmp_path):
+        import pytest
+
+        b = LlamaCppBackend()
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text("{not json")
+
+        with pytest.raises(RuntimeError, match="Invalid llama.cpp config"):
+            b.start(cfg_path)
+
     def test_stop_calls_systemctl(self, mocker):
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
-                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        mock_run = mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                                return_value=Mock(returncode=0, stdout="", stderr=""))
         b.stop()
+        assert mock_run.call_args[0][0][-1] == "llama-cpp"
 
     def test_is_running(self, mocker):
         b = LlamaCppBackend()
         mocker.patch("vserve.backends.llamacpp.subprocess.run",
                      return_value=Mock(returncode=0, stdout="active", stderr=""))
         assert b.is_running() is True
+
+    def test_is_running_raises_on_service_error(self, mocker):
+        import pytest
+
+        b = LlamaCppBackend()
+        mocker.patch(
+            "vserve.backends.llamacpp.subprocess.run",
+            return_value=Mock(returncode=1, stdout="", stderr="dbus error"),
+        )
+        with pytest.raises(RuntimeError, match="systemctl is-active"):
+            b.is_running()
+
+    def test_is_running_missing_unit_is_false(self, mocker):
+        b = LlamaCppBackend()
+        mocker.patch(
+            "vserve.backends.llamacpp.subprocess.run",
+            return_value=Mock(returncode=1, stdout="", stderr="Unit llama-cpp.service could not be found."),
+        )
+        assert b.is_running() is False
+
+    def test_is_running_activating_is_uncertain(self, mocker):
+        import pytest
+
+        b = LlamaCppBackend()
+        mocker.patch(
+            "vserve.backends.llamacpp.subprocess.run",
+            return_value=Mock(returncode=3, stdout="activating", stderr=""),
+        )
+        with pytest.raises(RuntimeError, match="is transitional"):
+            b.is_running()
+
+    def test_start_uses_configured_service_name(self, mocker, tmp_path):
+        b = LlamaCppBackend()
+        mock_run = mocker.patch(
+            "vserve.backends.llamacpp.subprocess.run",
+            return_value=Mock(returncode=0, stdout="", stderr=""),
+        )
+        mocker.patch(
+            "vserve.config.cfg",
+            return_value=Mock(
+                llamacpp_service_name="custom-llama",
+                llamacpp_service_user="svc-llama",
+                llamacpp_root=None,
+            ),
+        )
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text('{"model": "test"}')
+        active = tmp_path / "configs" / "active.json"
+        active.parent.mkdir(parents=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+
+        b.start(cfg_path)
+
+        start_calls = [call for call in mock_run.call_args_list if "start" in call.args[0]]
+        assert start_calls
+        assert start_calls[-1].args[0][-1] == "custom-llama"
 
     def test_is_not_running(self, mocker):
         b = LlamaCppBackend()

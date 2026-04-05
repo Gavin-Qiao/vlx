@@ -58,9 +58,21 @@ def read_state() -> dict | None:
         return None
     import json
     try:
-        return json.loads(STATE_PATH.read_text())
+        data = json.loads(STATE_PATH.read_text())
     except (ValueError, OSError):
         return None
+    if not isinstance(data, dict):
+        return None
+    fixed = data.get("fixed")
+    if fixed is not None:
+        if isinstance(fixed, bool) or not isinstance(fixed, int):
+            return None
+        return data
+    for key in ("quiet_start", "quiet_end", "quiet_max"):
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+    return data
 
 
 def _interpolate_curve(temp: int, cap: int) -> int:
@@ -183,13 +195,29 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
         _log.error("Lock permission denied: %s", exc)
         return
 
-    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PID_PATH.write_text(str(os.getpid()))
-    STATE_PATH.write_text(json.dumps({
-        "quiet_start": quiet_start,
-        "quiet_end": quiet_end,
-        "quiet_max": quiet_max,
-    }))
+    def _cleanup_state_files() -> None:
+        try:
+            PID_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            STATE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PID_PATH.write_text(str(os.getpid()))
+        STATE_PATH.write_text(json.dumps({
+            "quiet_start": quiet_start,
+            "quiet_end": quiet_end,
+            "quiet_max": quiet_max,
+        }))
+    except OSError:
+        _cleanup_state_files()
+        _fan_lock.release()
+        _log.exception("Failed to initialize fan daemon state files")
+        return
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -274,8 +302,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
             pynvml.nvmlShutdown()
         except Exception:
             pass
-        PID_PATH.unlink(missing_ok=True)
-        STATE_PATH.unlink(missing_ok=True)
+        _cleanup_state_files()
         _fan_lock.release()
         if restored:
             _log.info("Fan daemon stopped, auto control restored")
@@ -301,9 +328,25 @@ def run_fixed_daemon(speed: int) -> None:
         _log.error("Lock permission denied: %s", exc)
         return
 
-    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PID_PATH.write_text(str(os.getpid()))
-    STATE_PATH.write_text(json.dumps({"fixed": speed}))
+    def _cleanup_state_files() -> None:
+        try:
+            PID_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            STATE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PID_PATH.write_text(str(os.getpid()))
+        STATE_PATH.write_text(json.dumps({"fixed": speed}))
+    except OSError:
+        _cleanup_state_files()
+        _fan_lock.release()
+        _log.exception("Failed to initialize fixed fan daemon state files")
+        return
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -335,8 +378,7 @@ def run_fixed_daemon(speed: int) -> None:
             pynvml.nvmlShutdown()
         except Exception:
             pass
-        PID_PATH.unlink(missing_ok=True)
-        STATE_PATH.unlink(missing_ok=True)
+        _cleanup_state_files()
         _fan_lock.release()
         if restored:
             _log.info("Fan fixed daemon stopped, auto control restored")

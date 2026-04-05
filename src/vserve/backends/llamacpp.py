@@ -15,8 +15,18 @@ if TYPE_CHECKING:
 class LlamaCppBackend:
     name = "llamacpp"
     display_name = "llama.cpp"
-    service_name = "llama-cpp"
-    service_user = "llama-cpp"
+
+    @property
+    def service_name(self) -> str:
+        from vserve.config import cfg
+
+        return cfg().llamacpp_service_name
+
+    @property
+    def service_user(self) -> str:
+        from vserve.config import cfg
+
+        return cfg().llamacpp_service_user
 
     @property
     def root_dir(self) -> Path:
@@ -224,7 +234,12 @@ class LlamaCppBackend:
         import json
 
         # Read config and build CLI flags
-        cfg = json.loads(config_path.read_text())
+        try:
+            cfg = json.loads(config_path.read_text())
+        except Exception as exc:
+            raise RuntimeError(f"Invalid llama.cpp config {config_path}: {exc}") from None
+        if not isinstance(cfg, dict):
+            raise RuntimeError(f"Invalid llama.cpp config {config_path}: expected JSON object")
         entrypoint = self.find_entrypoint() or "llama-server"
         args = [str(entrypoint)]
         flag_map = {
@@ -295,7 +310,18 @@ class LlamaCppBackend:
             ["systemctl", "is-active", self.service_name],
             capture_output=True, text=True, timeout=10,
         )
-        return result.returncode == 0 and result.stdout.strip() == "active"
+        status = result.stdout.strip().lower()
+        if result.returncode == 0 and status == "active":
+            return True
+        if status in {"inactive", "failed"}:
+            return False
+        if status in {"activating", "deactivating", "reloading"}:
+            raise RuntimeError(f"systemctl is-active {self.service_name} is transitional: {status}")
+        if "could not be found" in result.stderr.lower():
+            return False
+        if result.stderr.strip():
+            raise RuntimeError(f"systemctl is-active {self.service_name} failed: {result.stderr.strip()}")
+        return False
 
     def health_url(self, port: int) -> str:
         return f"http://localhost:{port}/health"
@@ -340,11 +366,13 @@ class LlamaCppBackend:
             return None
 
     def doctor_checks(self) -> list[tuple[str, Callable[[], bool]]]:
+        from vserve.config import find_systemd_unit_path
+
         def check_binary() -> bool:
             return self.find_entrypoint() is not None
 
         def check_service() -> bool:
-            return Path(f"/etc/systemd/system/{self.service_name}.service").exists()
+            return find_systemd_unit_path(self.service_name) is not None
 
         return [
             (f"{self.display_name} binary (llama-server)", check_binary),

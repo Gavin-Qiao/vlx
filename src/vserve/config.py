@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -10,6 +11,96 @@ from pathlib import Path
 import yaml
 
 _log = logging.getLogger(__name__)
+
+SYSTEMD_UNIT_DIRS = (
+    Path("/etc/systemd/system"),
+    Path("/run/systemd/system"),
+    Path("/lib/systemd/system"),
+    Path("/usr/local/lib/systemd/system"),
+    Path("/usr/lib/systemd/system"),
+)
+
+
+def find_systemd_unit_path(service_name: str) -> Path | None:
+    """Return the first existing systemd unit path for a service."""
+    unit_name = f"{service_name}.service"
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", unit_name, "--property=FragmentPath", "--property=LoadState"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            fragment_path = ""
+            for line in result.stdout.splitlines():
+                if line.startswith("FragmentPath="):
+                    fragment_path = line.removeprefix("FragmentPath=").strip()
+                    break
+            if fragment_path:
+                path = Path(fragment_path)
+                if path.exists():
+                    return path
+    except Exception:
+        pass
+    for unit_dir in SYSTEMD_UNIT_DIRS:
+        unit_path = unit_dir / unit_name
+        try:
+            if unit_path.exists():
+                return unit_path
+        except OSError:
+            continue
+    return None
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_json_mapping(path: Path, *, warn: bool, label: str) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as exc:
+        if warn:
+            _log.warning("Failed to parse %s JSON %s: %s", label, path, exc)
+        return None
+    if not isinstance(data, dict):
+        if warn:
+            _log.warning("Ignoring invalid %s JSON %s: expected object", label, path)
+        return None
+    return data
+
+
+def _read_yaml_mapping(path: Path, *, warn: bool, label: str) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except Exception as exc:
+        if warn:
+            _log.warning("Failed to parse %s YAML %s: %s", label, path, exc)
+        return None
+    if not isinstance(data, dict):
+        if warn:
+            _log.warning("Ignoring invalid %s YAML %s: expected mapping", label, path)
+        return None
+    return data
 
 CONFIG_FILE = Path.home() / ".config" / "vserve" / "config.yaml"
 
@@ -84,8 +175,13 @@ def _discover_service() -> tuple[str, str]:
             capture_output=True, text=True, timeout=5,
         )
         for line in result.stdout.splitlines():
-            if "vllm" in line.lower():
-                name = line.split()[0].removesuffix(".service")
+            parts = line.split()
+            if not parts:
+                continue
+            unit = parts[0]
+            name = unit.removesuffix(".service")
+            lowered = name.lower()
+            if lowered == "vllm" or lowered.endswith("-vllm") or lowered.endswith("_vllm"):
                 # Try to read User= from the unit
                 show = subprocess.run(
                     ["systemctl", "show", name, "--property=User"],
@@ -139,27 +235,49 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
     )
 
 
+def _coerce_config_int(value: object, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_config_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def load_config() -> VserveConfig:
     """Load config: file > auto-discovery > defaults."""
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            data: dict[str, str] = yaml.safe_load(f) or {}
-        root = Path(str(data.get("vllm_root", _DEFAULT_VLLM_ROOT)))
-        gpu_util_raw = data.get("gpu_memory_utilization")
-        gpu_overhead_raw = data.get("gpu_overhead_gb")
-        llamacpp_root_raw = data.get("llamacpp_root")
-        return _build_config(
-            vllm_root=root,
-            cuda_home=Path(str(data.get("cuda_home", _DEFAULT_CUDA_HOME))),
-            service_name=str(data.get("service_name", _DEFAULT_SERVICE_NAME)),
-            service_user=str(data.get("service_user", _DEFAULT_SERVICE_USER)),
-            port=int(str(data.get("port", _DEFAULT_PORT))),
-            gpu_memory_utilization=float(gpu_util_raw) if gpu_util_raw is not None else None,
-            gpu_overhead_gb=float(gpu_overhead_raw) if gpu_overhead_raw is not None else None,
-            llamacpp_root=Path(str(llamacpp_root_raw)) if llamacpp_root_raw else None,
-            llamacpp_service_name=str(data.get("llamacpp_service_name", "llama-cpp")),
-            llamacpp_service_user=str(data.get("llamacpp_service_user", "llama-cpp")),
-        )
+        try:
+            with open(CONFIG_FILE) as f:
+                raw = yaml.safe_load(f) or {}
+        except Exception as exc:
+            _log.warning("Failed to parse config YAML %s: %s", CONFIG_FILE, exc)
+        else:
+            if isinstance(raw, dict):
+                root = Path(str(raw.get("vllm_root", _DEFAULT_VLLM_ROOT)))
+                gpu_util_raw = raw.get("gpu_memory_utilization")
+                gpu_overhead_raw = raw.get("gpu_overhead_gb")
+                llamacpp_root_raw = raw.get("llamacpp_root")
+                return _build_config(
+                    vllm_root=root,
+                    cuda_home=Path(str(raw.get("cuda_home", _DEFAULT_CUDA_HOME))),
+                    service_name=str(raw.get("service_name", _DEFAULT_SERVICE_NAME)),
+                    service_user=str(raw.get("service_user", _DEFAULT_SERVICE_USER)),
+                    port=_coerce_config_int(raw.get("port"), _DEFAULT_PORT),
+                    gpu_memory_utilization=_coerce_config_float(gpu_util_raw),
+                    gpu_overhead_gb=_coerce_config_float(gpu_overhead_raw),
+                    llamacpp_root=Path(str(llamacpp_root_raw)) if llamacpp_root_raw else None,
+                    llamacpp_service_name=str(raw.get("llamacpp_service_name", "llama-cpp")),
+                    llamacpp_service_user=str(raw.get("llamacpp_service_user", "llama-cpp")),
+                )
+            _log.warning("Ignoring invalid config format in %s: expected mapping", CONFIG_FILE)
 
     # Auto-discover
     root = _discover_vllm_root() or Path(_DEFAULT_VLLM_ROOT)
@@ -189,9 +307,9 @@ def save_config(cfg: VserveConfig) -> Path:
         data["llamacpp_service_name"] = cfg.llamacpp_service_name
     if cfg.llamacpp_service_user != "llama-cpp":
         data["llamacpp_service_user"] = cfg.llamacpp_service_user
-    with open(CONFIG_FILE, "w") as f:
-        f.write("# vserve configuration — generated by vserve init\n")
-        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    content = "# vserve configuration — generated by vserve init\n"
+    content += yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+    _atomic_write_text(CONFIG_FILE, content)
     return CONFIG_FILE
 
 
@@ -251,17 +369,43 @@ def active_yaml_path() -> Path:
 
 
 def read_limits(path: Path) -> dict | None:
-    if not path.exists():
+    data = _read_json_mapping(path, warn=True, label="limits")
+    if data is None:
         return None
-    with open(path) as f:
-        return json.load(f)
+    limits = data.get("limits")
+    if not isinstance(limits, dict):
+        _log.warning("Ignoring invalid limits JSON %s: missing limits object", path)
+        return None
+    normalized = dict(data)
+    normalized_limits: dict[str, object] = {}
+    for ctx, per_dtype in limits.items():
+        try:
+            ctx_key = str(int(str(ctx)))
+        except (TypeError, ValueError):
+            _log.warning("Ignoring invalid limits JSON %s: context keys must be integers", path)
+            return None
+        if isinstance(per_dtype, dict):
+            inner: dict[str, int | None] = {}
+            for dtype, value in per_dtype.items():
+                if not isinstance(dtype, str):
+                    _log.warning("Ignoring invalid limits JSON %s: dtype keys must be strings", path)
+                    return None
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                    _log.warning("Ignoring invalid limits JSON %s: limits values must be integers or null", path)
+                    return None
+                inner[dtype] = value
+            normalized_limits[ctx_key] = inner
+            continue
+        if per_dtype is not None and (isinstance(per_dtype, bool) or not isinstance(per_dtype, int)):
+            _log.warning("Ignoring invalid limits JSON %s: flat limits values must be integers or null", path)
+            return None
+        normalized_limits[ctx_key] = per_dtype
+    normalized["limits"] = normalized_limits
+    return normalized
 
 
 def write_limits(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
 
 
 def timing_path(provider: str, model_name: str) -> Path:
@@ -270,27 +414,23 @@ def timing_path(provider: str, model_name: str) -> Path:
 
 def read_timing(provider: str, model_name: str) -> dict:
     p = timing_path(provider, model_name)
-    if not p.exists():
-        return {}
-    with open(p) as f:
-        return json.load(f)
+    return _read_json_mapping(p, warn=True, label="timing") or {}
 
 
 def write_timing(provider: str, model_name: str, phase: str, seconds: float) -> None:
     p = timing_path(provider, model_name)
-    p.parent.mkdir(parents=True, exist_ok=True)
     data = read_timing(provider, model_name)
     data[phase] = round(seconds, 1)
-    with open(p, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    _atomic_write_text(p, json.dumps(data, indent=2) + "\n")
 
 
 def read_profile_yaml(path: Path) -> dict | None:
     if not path.exists():
         return None
-    with open(path) as f:
-        return yaml.safe_load(f)
+    data = _read_yaml_mapping(path, warn=False, label="profile")
+    if data is None:
+        raise ValueError(f"Invalid profile YAML: {path}")
+    return data
 
 
 def try_read_profile_yaml(path: Path) -> dict | None:
@@ -303,9 +443,9 @@ def try_read_profile_yaml(path: Path) -> dict | None:
 
 
 def write_profile_yaml(path: Path, data: dict, comment: str = "") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        if comment:
-            for line in comment.splitlines():
-                f.write(f"# {line}\n")
-        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    parts: list[str] = []
+    if comment:
+        for line in comment.splitlines():
+            parts.append(f"# {line}\n")
+    parts.append(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
+    _atomic_write_text(path, "".join(parts))

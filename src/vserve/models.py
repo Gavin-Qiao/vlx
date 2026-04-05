@@ -141,17 +141,27 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
     models: list[ModelInfo] = []
     if not models_root.exists():
         return models
-    for provider_dir in sorted(models_root.iterdir()):
+    try:
+        provider_dirs = sorted(models_root.iterdir())
+    except OSError as exc:
+        _log.warning("Skipping models root %s: %s", models_root, exc)
+        return models
+    for provider_dir in provider_dirs:
         if not provider_dir.is_dir():
             continue
-        for model_dir in sorted(provider_dir.iterdir()):
+        try:
+            model_dirs = sorted(provider_dir.iterdir())
+        except OSError as exc:
+            _log.warning("Skipping provider directory %s: %s", provider_dir, exc)
+            continue
+        for model_dir in model_dirs:
             if not model_dir.is_dir():
                 continue
-            has_config = (model_dir / "config.json").exists()
-            has_gguf = any(model_dir.glob("*.gguf"))
-            if not has_config and not has_gguf:
-                continue
             try:
+                has_config = (model_dir / "config.json").exists()
+                has_gguf = any(model_dir.glob("*.gguf"))
+                if not has_config and not has_gguf:
+                    continue
                 models.append(detect_model(model_dir))
             except Exception as exc:
                 _log.warning("Skipping model directory %s: %s", model_dir, exc)

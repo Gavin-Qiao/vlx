@@ -127,7 +127,9 @@ def _read_chat_template(model_path: Path) -> str | None:
         return None
     try:
         data = json.loads(tok_config.read_text())
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
         return None
 
     ct = data.get("chat_template")
@@ -136,17 +138,29 @@ def _read_chat_template(model_path: Path) -> str | None:
     if isinstance(ct, str):
         return ct
     if isinstance(ct, list):
+        def _template_from_entry(entry: object) -> str | None:
+            if not isinstance(entry, dict):
+                return None
+            template = entry.get("template")
+            if isinstance(template, str) and template:
+                return template
+            return None
+
         # Multi-template format — prefer 'tool_use' template if present.
         for entry in ct:
             if isinstance(entry, dict) and entry.get("name") == "tool_use":
-                return entry.get("template") or None
+                template = _template_from_entry(entry)
+                if template is not None:
+                    return template
         # Fall back to 'default' template only (avoid merging unrelated variants).
         for entry in ct:
             if isinstance(entry, dict) and entry.get("name") in ("default", None):
-                return entry.get("template") or None
+                template = _template_from_entry(entry)
+                if template is not None:
+                    return template
         # Last resort: first template
-        if ct and isinstance(ct[0], dict):
-            return ct[0].get("template") or None
+        if ct:
+            return _template_from_entry(ct[0])
     return None
 
 

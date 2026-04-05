@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 LOCK_DIR = Path("/run/lock/vserve")
+SESSION_PATH = LOCK_DIR / "vserve-session.json"
 
 
 @dataclass
@@ -195,9 +196,6 @@ def notify_user(username: str, message: str) -> bool:
     return sent
 
 
-SESSION_PATH = LOCK_DIR / "vserve-session.json"
-
-
 @dataclass
 class SessionInfo:
     user: str
@@ -221,81 +219,181 @@ class SessionHeld(Exception):
         )
 
 
-def write_session(model: str) -> None:
-    """Record current user as the GPU session owner.
+class SessionUnknown(Exception):
+    """Raised when a backend is active but no reliable owner marker exists."""
 
-    Uses open+write on a world-writable file (not atomic rename) so that
-    any user can overwrite the session in a sticky-bit directory.
-    """
-    LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
-    try:
-        os.chmod(str(LOCK_DIR), 0o1777)
-    except PermissionError:
-        pass
-    info = SessionInfo(
-        user=os.environ.get("USER", "?"),
-        since=time.strftime("%Y-%m-%d %H:%M:%S"),
-        model=model,
-    )
-    payload = json.dumps(asdict(info)).encode() + b"\n"
-    # Create or overwrite with world-writable permissions so any user
-    # can update the session in a sticky-bit directory.
-    fd = os.open(str(SESSION_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
-    try:
-        os.write(fd, payload)
-    finally:
-        os.close(fd)
-    try:
-        os.chmod(str(SESSION_PATH), 0o666)
-    except PermissionError:
-        pass
+    def __init__(self, reason: str = "A backend is running, but the owning user is unknown.") -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+    def message(self) -> str:
+        return self.reason
 
 
-def read_session() -> SessionInfo | None:
+def _safe_session_user(user: str) -> str:
+    return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in user)
+
+
+def _session_path(user: str | None = None) -> Path:
+    user = user or os.environ.get("USER", "?")
+    safe_user = _safe_session_user(user)
+    return SESSION_PATH.with_name(f"{SESSION_PATH.stem}-{safe_user}{SESSION_PATH.suffix}")
+
+
+def _session_candidates() -> list[Path]:
+    paths: list[Path] = []
+    if SESSION_PATH.exists():
+        paths.append(SESSION_PATH)
+    if LOCK_DIR.exists():
+        paths.extend(LOCK_DIR.glob(f"{SESSION_PATH.stem}-*{SESSION_PATH.suffix}"))
+    uniq: dict[str, Path] = {}
+    for path in paths:
+        uniq[str(path)] = path
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(uniq.values(), key=_mtime, reverse=True)
+
+
+def _read_session_file(path: Path) -> SessionInfo | None:
     try:
-        text = SESSION_PATH.read_text().strip()
+        with open(path) as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                text = f.read().strip()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         if not text:
-            return None  # truncated (cleared by another user)
+            return None
         data = json.loads(text)
         return SessionInfo(**data)
     except FileNotFoundError:
         return None
     except Exception:
-        # Corrupt or partially-written session file
         import sys
-        print(f"[vserve] warning: corrupt session file {SESSION_PATH}", file=sys.stderr)
+        print(f"[vserve] warning: corrupt session file {path}", file=sys.stderr)
         return None
 
 
-def clear_session() -> None:
+def write_session(model: str) -> None:
+    """Record current user as the advisory GPU session owner."""
+    LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
     try:
-        SESSION_PATH.unlink(missing_ok=True)
+        os.chmod(str(LOCK_DIR), 0o1777)
     except PermissionError:
-        # Sticky-bit dir: can't unlink another user's file. Truncate instead.
+        pass
+    user = os.environ.get("USER", "?")
+    info = SessionInfo(
+        user=user,
+        since=time.strftime("%Y-%m-%d %H:%M:%S"),
+        model=model,
+    )
+    payload = json.dumps(asdict(info)).encode() + b"\n"
+    session_path = _session_path(user)
+    fd = os.open(str(session_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
         try:
-            fd = os.open(str(SESSION_PATH), os.O_WRONLY | os.O_TRUNC)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
             os.close(fd)
-        except OSError:
-            pass
-    except OSError:
+    try:
+        os.chmod(str(session_path), 0o644)
+    except PermissionError:
         pass
 
 
-def check_session() -> None:
-    """Raise SessionHeld if another user owns an active session.
+def read_session() -> SessionInfo | None:
+    for path in _session_candidates():
+        info = _read_session_file(path)
+        if info is not None:
+            return info
+    return None
 
-    Clears stale sessions (no backend running).  No-op if the current
-    user owns the session (they can restart their own model).
-    """
-    from vserve.backends import any_backend_running
 
-    info = read_session()
-    if info is None:
+def clear_session() -> None:
+    session_path = _session_path()
+    try:
+        session_path.unlink(missing_ok=True)
         return
-    if not any_backend_running():
-        clear_session()
+    except PermissionError:
+        pass
+    except OSError:
         return
+
+    try:
+        fd = os.open(str(session_path), os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _clear_all_session_markers() -> None:
+    for path in _session_candidates():
+        try:
+            path.unlink(missing_ok=True)
+            continue
+        except PermissionError:
+            pass
+        except OSError:
+            continue
+
+        try:
+            fd = os.open(str(path), os.O_WRONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.ftruncate(fd, 0)
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def check_session(*, fail_on_probe_uncertainty: bool = False) -> None:
+    """Raise only when a backend is confirmed running for another user."""
+    from vserve.backends import probe_running_backend
+
     current_user = os.environ.get("USER", "?")
+    running_backend, probe_failed = probe_running_backend()
+    info = read_session()
+    if running_backend is None:
+        if not probe_failed:
+            _clear_all_session_markers()
+            return
+        if info is not None and fail_on_probe_uncertainty:
+            if info.user == current_user:
+                return
+            raise SessionHeld(info)
+        if info is not None and info.user == current_user:
+            return
+        return
+    if info is None:
+        backend_name = getattr(running_backend, "display_name", "A backend")
+        raise SessionUnknown(f"{backend_name} is running, but the owning user is unknown.")
     if info.user == current_user:
         return
     raise SessionHeld(info)

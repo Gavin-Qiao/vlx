@@ -16,8 +16,16 @@ class Backend(Protocol):
 
     name: str
     display_name: str
-    service_name: str
-    service_user: str
+
+    @property
+    def service_name(self) -> str:
+        """Systemd unit name for this backend."""
+        ...
+
+    @property
+    def service_user(self) -> str:
+        """System user that owns this backend service."""
+        ...
 
     @property
     def root_dir(self) -> Path:

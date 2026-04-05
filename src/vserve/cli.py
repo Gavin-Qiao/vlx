@@ -15,7 +15,16 @@ from vserve.config import (
     read_limits,
 )
 from vserve.models import scan_models, fuzzy_match, ModelInfo
-from vserve.lock import VserveLock, LockHeld, SessionHeld, notify_user, check_session, write_session, clear_session
+from vserve.lock import (
+    VserveLock,
+    LockHeld,
+    SessionHeld,
+    SessionUnknown,
+    notify_user,
+    check_session,
+    write_session,
+    clear_session,
+)
 
 from vserve import __version__
 
@@ -27,11 +36,15 @@ _TITLE = f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]"
 
 
 
-def _session_or_exit() -> None:
+def _session_or_exit(
+    *,
+    fail_on_probe_uncertainty: bool = True,
+    allow_unknown_owner: bool = False,
+) -> None:
     """Block if another user owns the active GPU session, DM the holder."""
     import os
     try:
-        check_session()
+        check_session(fail_on_probe_uncertainty=fail_on_probe_uncertainty)
     except SessionHeld as exc:
         console.print(Panel(
             f"[bold]{exc.message()}[/bold]"
@@ -46,6 +59,40 @@ def _session_or_exit() -> None:
                 f"{me} wants the GPU (you: {exc.info.model})",
             )
         raise typer.Exit(1) from None
+    except SessionUnknown as exc:
+        if allow_unknown_owner:
+            console.print(f"[yellow]{exc.message()}[/yellow]")
+            return
+        console.print(Panel(
+            f"[bold]{exc.message()}[/bold]"
+            "\n\nUse [cyan]vserve status[/cyan] or inspect the backend service before starting another model.",
+            title=f"[red]vserve {__version__}: session owner unknown[/red]",
+            border_style="red",
+        ))
+        raise typer.Exit(1) from None
+
+
+def _safe_path_exists(path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _safe_resolve_path(path):
+    try:
+        path.stat()
+    except FileNotFoundError:
+        try:
+            return path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return None
+    except (OSError, RuntimeError):
+        return None
+    try:
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
 
 
 def _lock_or_exit(name: str, description: str) -> VserveLock:
@@ -175,7 +222,7 @@ def dashboard(ctx: typer.Context):
     rb = _running_backend()
     if rb is not None:
         active = active_yaml_path()
-        if active.exists() and active.is_symlink():
+        if active.is_symlink():
             cfg = try_read_profile_yaml(active)
             model_path = cfg.get("model", "?") if cfg else "?"
             model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
@@ -251,9 +298,14 @@ def update(
     import subprocess
 
     from vserve.version import check_pypi, write_cache, _compare_versions
+    command_timeout = 300
 
     def _run_checked(cmd: list[str], label: str) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=command_timeout)
+        except subprocess.TimeoutExpired:
+            console.print(f"[red]{label} timed out after {command_timeout}s.[/red]")
+            raise typer.Exit(1)
         if result.returncode != 0:
             console.print(f"[red]{label} failed.[/red]")
             details = result.stderr.strip() or result.stdout.strip()
@@ -266,23 +318,30 @@ def update(
 
     if not nightly:
         latest = check_pypi()
-        if latest:
-            write_cache(latest)
-            if _compare_versions(latest, __version__) <= 0:
-                console.print("[green]Already up to date.[/green]")
-                return
-            console.print(f"[yellow]New version available: {latest}[/yellow]\n")
+        if not latest:
+            console.print("[red]Could not determine the latest published version.[/red]")
+            console.print("  Retry later, or use [cyan]vserve update --nightly[/cyan] if you intentionally want a pre-release.")
+            raise typer.Exit(1)
+        write_cache(latest)
+        if _compare_versions(latest, __version__) <= 0:
+            console.print("[green]Already up to date.[/green]")
+            return
+        console.print(f"[yellow]New version available: {latest}[/yellow]\n")
 
     uv = shutil.which("uv")
     if uv:
-        result = subprocess.run([uv, "tool", "list"], capture_output=True, text=True)
-        if result.returncode != 0:
-            console.print("[red]uv inspection failed.[/red]")
+        try:
+            result = subprocess.run([uv, "tool", "list"], capture_output=True, text=True, timeout=command_timeout)
+        except subprocess.TimeoutExpired:
+            console.print(f"[yellow]uv inspection timed out after {command_timeout}s; trying pip fallback if available.[/yellow]")
+            result = None
+        if result is not None and result.returncode != 0:
+            console.print("[yellow]uv inspection failed; trying pip fallback if available.[/yellow]")
             details = result.stderr.strip() or result.stdout.strip()
             if details:
                 console.print(f"  {details}")
-            raise typer.Exit(1)
-        if "vserve" in result.stdout:
+            result = None
+        if result is not None and "vserve" in result.stdout:
             if nightly:
                 console.print("[dim]Upgrading to latest pre-release via uv...[/dim]")
                 _run_checked([uv, "tool", "upgrade", "vserve", "--prerelease", "allow"], "uv upgrade")
@@ -294,17 +353,20 @@ def update(
 
     pip = shutil.which("pip") or shutil.which("pip3")
     if pip:
+        import sys
+        pip_cmd = [sys.executable, "-m", "pip"]
         if nightly:
             console.print("[dim]Upgrading to latest pre-release via pip...[/dim]")
-            _run_checked([pip, "install", "--upgrade", "--pre", "vserve"], "pip install")
+            _run_checked([*pip_cmd, "install", "--upgrade", "--pre", "vserve"], "pip install")
         else:
             console.print("[dim]Upgrading via pip...[/dim]")
-            _run_checked([pip, "install", "--upgrade", "vserve"], "pip install")
+            _run_checked([*pip_cmd, "install", "--upgrade", "vserve"], "pip install")
         _refresh_banner()
         return
 
     console.print("[red]Could not find uv or pip to perform upgrade.[/red]")
     console.print("Run manually: [cyan]uv tool upgrade vserve[/cyan] or [cyan]pip install -U vserve[/cyan]")
+    raise typer.Exit(1)
 
 
 def _refresh_banner() -> None:
@@ -1120,6 +1182,8 @@ def tune(
                 console.print("  [yellow]First vLLM start will compile flashinfer kernels (~5-10 min).[/yellow]")
                 if typer.confirm("  Pre-cache now? (starts and stops vLLM once)", default=False):
                     console.print("  [dim]Pre-caching — this will take a few minutes...[/dim]")
+                    lock = _lock_or_exit("gpu", f"pre-caching {backend.display_name}")
+                    started_here = False
                     try:
                         from vserve.config import write_profile_yaml
                         # Build a minimal config just for pre-caching
@@ -1131,7 +1195,17 @@ def tune(
                         })
                         cfg_path = profile_path(m.provider, m.model_name, "precache")
                         write_profile_yaml(cfg_path, precache_cfg, comment="vserve tune — pre-cache")
+                        _session_or_exit()
+                        try:
+                            if backend.is_running():
+                                console.print("  [yellow]vLLM is already running — skipping pre-cache warmup.[/yellow]")
+                                continue
+                        except Exception as e:
+                            console.print(f"  [yellow]Could not determine backend state for pre-cache: {e}[/yellow]")
+                            continue
                         backend.start(cfg_path)
+                        started_here = True
+                        write_session(f"{m.full_name} precache")
                         import time
                         from urllib.request import urlopen
                         health = backend.health_url(8888)
@@ -1149,9 +1223,16 @@ def tune(
                                 break
                             if i > 0 and i % 15 == 0:
                                 console.print(f"  [dim]compiling... ({i * 2}s)[/dim]")
-                        backend.stop()
                     except Exception as e:
                         console.print(f"  [yellow]Pre-cache failed: {e}[/yellow]")
+                    finally:
+                        if started_here:
+                            try:
+                                backend.stop()
+                            except Exception as e:
+                                console.print(f"  [yellow]Could not stop pre-cache backend cleanly: {e}[/yellow]")
+                            clear_session()
+                        lock.release()
         console.print()
 
 
@@ -1212,37 +1293,125 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
 def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
     """Stop any running backend, start with given config, wait for health."""
     import json
+    import subprocess
     import time
+    from vserve.backends import _BACKENDS, probe_running_backends
     from vserve.config import read_profile_yaml
 
     lock = _lock_or_exit("gpu", f"starting {backend.display_name} ({label})")
 
     # Read config (YAML for vLLM, JSON for llama.cpp)
-    if str(cfg_path).endswith(".json"):
-        cfg = json.loads(cfg_path.read_text())
-    else:
-        cfg = read_profile_yaml(cfg_path) or {}
-
+    needs_precache = False
+    health_timeout_s = 300
+    health_poll_s = 3
     try:
-        _session_or_exit()
-
-        if backend.is_running():
-            console.print(f"[yellow]{backend.display_name} is already running.[/yellow]")
-            if not typer.confirm("Stop and restart?", default=False):
-                lock.release()
-                return
+        def _service_running_state() -> bool | None:
             try:
-                backend.stop()
-            except RuntimeError as e:
-                console.print(f"[red]{e}[/red]")
-                console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
-                raise typer.Exit(1)
-            time.sleep(2)
+                return backend.is_running()
+            except Exception:
+                return None
 
-        ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
+        def _recent_service_log_tail() -> str | None:
+            try:
+                result = subprocess.run(
+                    [
+                        "journalctl",
+                        "-u",
+                        backend.service_name,
+                        "--no-pager",
+                        "-n",
+                        "5",
+                        "-o",
+                        "cat",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=1,
+                )
+            except Exception:
+                return None
+            if result.returncode != 0:
+                return None
+            tail = result.stdout.strip()
+            return tail or None
+
+        if str(cfg_path).endswith(".json"):
+            try:
+                cfg = json.loads(cfg_path.read_text())
+            except Exception as exc:
+                console.print(f"[red]Launch config unreadable:[/red] {exc}")
+                console.print(f"  Config: {cfg_path}")
+                raise typer.Exit(1)
+            if not isinstance(cfg, dict):
+                console.print("[red]Launch config unreadable:[/red] expected a JSON object")
+                console.print(f"  Config: {cfg_path}")
+                raise typer.Exit(1)
+        else:
+            try:
+                cfg = read_profile_yaml(cfg_path) or {}
+            except ValueError as exc:
+                console.print(f"[red]Launch config unreadable:[/red] {exc}")
+                console.print(f"  Config: {cfg_path}")
+                raise typer.Exit(1)
+
+        _session_or_exit(fail_on_probe_uncertainty=True)
+
+        running_backends, probe_failed = probe_running_backends()
+        if not running_backends and probe_failed:
+            console.print("[red]Could not determine whether another backend is already running.[/red]")
+            console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
+            raise typer.Exit(1)
+
+        if running_backends:
+            stop_candidates = list(running_backends)
+            running_names = ", ".join(candidate.display_name for candidate in running_backends)
+            same_backend_only = (
+                len(running_backends) == 1
+                and getattr(running_backends[0], "name", None) == backend.name
+            )
+            if probe_failed:
+                stop_candidates = list(_BACKENDS)
+                running_names = ", ".join(candidate.display_name for candidate in stop_candidates)
+                console.print("[yellow]Backend state is uncertain; stopping all known backends before restart.[/yellow]")
+                prompt = f"Stop {running_names} and start {backend.display_name}?"
+            elif same_backend_only:
+                console.print(f"[yellow]{backend.display_name} is already running.[/yellow]")
+                prompt = "Stop and restart?"
+            else:
+                console.print(f"[yellow]Running backend(s): {running_names}.[/yellow]")
+                prompt = f"Stop {running_names} and start {backend.display_name}?"
+            if not typer.confirm(prompt, default=False):
+                return
+            for candidate in stop_candidates:
+                try:
+                    candidate.stop()
+                except Exception as e:
+                    console.print(f"[red]{e}[/red]")
+                    console.print(f"  Check: sudo journalctl -u {candidate.service_name} --no-pager -n 20")
+                    raise typer.Exit(1)
+            for _ in range(15):
+                time.sleep(2)
+                remaining_backends, remaining_probe_failed = probe_running_backends()
+                if not remaining_backends and not remaining_probe_failed:
+                    break
+            else:
+                console.print("[red]Timed out waiting for running backends to stop before restart.[/red]")
+                console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+                raise typer.Exit(1)
+
+        ctx = cfg.get("max-model-len") or cfg.get("ctx_size") or cfg.get("ctx-size", "?")
         ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
         console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan] ({backend.display_name})")
         console.print(f"  context: {ctx_d}")
+
+        if backend.name == "vllm":
+            from vserve.config import cfg as _cfg
+            fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
+            needs_precache = not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so"))
+            if needs_precache:
+                health_timeout_s = 600
+                console.print("  [yellow]First run — compiling kernels (~5-10 min).[/yellow]")
 
         try:
             backend.start(cfg_path)
@@ -1250,37 +1419,67 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
             console.print(f"[red]{e}[/red]")
             console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
             raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"[red]Failed to start {backend.display_name}: {e}[/red]")
+            console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
+            raise typer.Exit(1)
+
+        write_session(label)
 
         from urllib.request import urlopen
         port = cfg.get("port", 8888)
         health = backend.health_url(port)
 
-        # Backend-specific first-run messages
-        if backend.name == "vllm":
-            from vserve.config import cfg as _cfg
-            fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
-            if not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so")):
-                console.print("  [yellow]First run — compiling kernels (~5-10 min).[/yellow]")
-
         console.print(f"  [dim]Waiting for {health} ...[/dim]")
-        for i in range(150):  # 300s max
-            time.sleep(2)
+        for i in range(max(1, (health_timeout_s + health_poll_s - 1) // health_poll_s)):
+            time.sleep(health_poll_s)
+            elapsed_s = (i + 1) * health_poll_s
             try:
-                resp = urlopen(health, timeout=2)
-                if resp.status == 200:
-                    write_session(label)
-                    console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
-                    console.print(f"  Config: {cfg_path}")
-                    console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
-                    return
+                with urlopen(health, timeout=2) as resp:
+                    if resp.status == 200:
+                        console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
+                        console.print(f"  Config: {cfg_path}")
+                        console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
+                        return
             except Exception:
                 pass
-            if i > 5 and not backend.is_running():
-                console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+
+            log_tail = _recent_service_log_tail()
+            if log_tail:
+                console.print("  [dim]Latest service logs:[/dim]")
+                for line in log_tail.splitlines():
+                    console.print(f"    [dim]{line}[/dim]")
+
+            if elapsed_s > 10:
+                service_running = _service_running_state()
+                if service_running is False:
+                    clear_session()
+                    console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+                    raise typer.Exit(1)
+
+            if elapsed_s % 30 == 0:
+                console.print(f"  [dim]still starting... ({elapsed_s}s)[/dim]")
+
+        service_running = _service_running_state()
+
+        if service_running is False:
+            clear_session()
+            console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+            raise typer.Exit(1)
+        if service_running is True:
+            console.print("[yellow]Health endpoint is still warming up, but the service remains active.[/yellow]")
+            if needs_precache:
+                console.print("  [yellow]First run kernel compilation may still be in progress.[/yellow]")
+            if not _is_interactive():
+                console.print("  [yellow]Non-interactive run requires the API health check to pass.[/yellow]")
+                console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f")
+                console.print(f"  Health: {health}")
                 raise typer.Exit(1)
-            if i > 0 and i % 15 == 0:
-                console.print(f"  [dim]still starting... ({i * 2}s)[/dim]")
-        console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+            console.print(f"  Returning while startup finishes in the background for {label}.")
+            console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f")
+            console.print(f"  Health: {health}")
+            return
+        console.print(f"[red]Timed out waiting for health endpoint, and service state could not be confirmed.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
         raise typer.Exit(1)
     finally:
         lock.release()
@@ -1292,6 +1491,29 @@ def _custom_config(m: ModelInfo, backend, *, tools: bool = False, tool_parser: s
     if backend.name == "llamacpp":
         return _custom_config_llamacpp(m, backend, tools=tools)
     return _custom_config_vllm(m, backend, tools=tools, tool_parser=tool_parser)
+
+
+def _llamacpp_slots_from_limits_entry(entry: object) -> int | None:
+    if isinstance(entry, dict):
+        values = [v for v in entry.values() if v is not None]
+        return max(values) if values else None
+    if entry is None or isinstance(entry, bool) or not isinstance(entry, int):
+        return None
+    return entry
+
+
+def _vllm_limits_entry(entry: object) -> dict[str, int | None]:
+    if isinstance(entry, dict):
+        cleaned: dict[str, int | None] = {}
+        for key, value in entry.items():
+            if not isinstance(key, str):
+                continue
+            if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+                cleaned[key] = value
+        return cleaned
+    if entry is None or isinstance(entry, bool) or not isinstance(entry, int):
+        return {}
+    return {"auto": entry}
 
 
 def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "pathlib.Path":
@@ -1317,7 +1539,11 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     limits = lim.get("limits", {})
 
     # 1. Context window
-    working_ctxs = sorted(int(c) for c, v in limits.items() if v is not None)
+    working_ctxs = sorted(
+        int(str(c))
+        for c, v in limits.items()
+        if _llamacpp_slots_from_limits_entry(v) is not None
+    )
     if not working_ctxs:
         console.print("[red]No working configs found.[/red]")
         raise typer.Exit(1)
@@ -1325,7 +1551,7 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     console.print(f"\n[bold]Configure {m.model_name}[/bold] (llama.cpp)\n")
     ctx_items = []
     for ctx in working_ctxs:
-        slots = limits.get(str(ctx))
+        slots = _llamacpp_slots_from_limits_entry(limits.get(str(ctx)))
         slot_str = f"({slots} slots)" if slots else ""
         ctx_items.append(f"{ctx // 1024}k  {slot_str}")
     console.print("  [bold]1. Context window[/bold]")
@@ -1347,7 +1573,7 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
         console.print(f"\n  [dim]GPU layers: {n_gpu_layers}/{num_layers} (all on GPU)[/dim]")
 
     # 3. Parallel slots
-    max_parallel = limits.get(str(chosen_ctx), 1) or 1
+    max_parallel = _llamacpp_slots_from_limits_entry(limits.get(str(chosen_ctx), 1)) or 1
     console.print(f"\n  [bold]3. Parallel slots[/bold] (max: {max_parallel})")
     par_str = typer.prompt(f"  Slots [1-{max_parallel}]", default=str(max_parallel))
     try:
@@ -1450,7 +1676,7 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
 
     # 1. Context window
     working_ctxs = sorted(
-        (int(c) for c, d in limits.items() if any(v is not None for v in d.values())),
+        (int(str(c)) for c, d in limits.items() if any(v is not None for v in _vllm_limits_entry(d).values())),
     )
     if not working_ctxs:
         console.print("[red]No working configs found in probe data.[/red]")
@@ -1467,7 +1693,7 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
     chosen_ctx = working_ctxs[ctx_idx]
 
     # 2. KV cache dtype
-    ctx_entry = limits.get(str(chosen_ctx), {})
+    ctx_entry = _vllm_limits_entry(limits.get(str(chosen_ctx), {}))
     working_kvs = [k for k, v in ctx_entry.items() if v is not None]
 
     kv_labels = {
@@ -1482,7 +1708,7 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
     chosen_kv = working_kvs[kv_idx]
 
     # 3. Concurrent slots
-    max_seqs = ctx_entry.get(chosen_kv, 1)
+    max_seqs = int(ctx_entry.get(chosen_kv, 1) or 1)
     console.print(f"\n  [bold]3. Concurrent slots[/bold] (max: {max_seqs})")
     console.print("     How many simultaneous requests?")
     seqs_str = typer.prompt(f"  Slots [1-{max_seqs}]", default=str(max_seqs))
@@ -1653,36 +1879,78 @@ def run(
 @app.command()
 def stop():
     """Stop the inference server."""
-    from vserve.backends import _BACKENDS
+    from vserve.backends import _BACKENDS, probe_running_backends
 
-    _session_or_exit()
+    _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)
 
-    # Find which backend is running
-    running_backend = None
-    for b in _BACKENDS:
-        try:
-            if b.is_running():
-                running_backend = b
-                break
-        except Exception:
-            continue
+    running_backends, probe_failed = probe_running_backends()
+    if not running_backends:
+        if probe_failed:
+            from vserve.backends import _BACKENDS
 
-    if running_backend is None:
+            lock = _lock_or_exit("gpu", "stopping backend (probe uncertain)")
+            try:
+                _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)
+                stop_errors: list[str] = []
+                for candidate in _BACKENDS:
+                    try:
+                        candidate.stop()
+                    except Exception as exc:
+                        stop_errors.append(f"{candidate.display_name}: {exc}")
+                confirmed_backends, confirmed_probe_failed = probe_running_backends()
+                if confirmed_backends:
+                    remaining_names = ", ".join(candidate.display_name for candidate in confirmed_backends)
+                    console.print(f"[red]{remaining_names} still appear to be running after fallback stop attempts.[/red]")
+                    for detail in stop_errors:
+                        console.print(f"  {detail}")
+                    raise typer.Exit(1)
+                if confirmed_probe_failed:
+                    console.print("[red]Could not verify backend state after fallback stop attempts.[/red]")
+                    for detail in stop_errors:
+                        console.print(f"  {detail}")
+                    raise typer.Exit(1)
+                clear_session()
+                console.print("[yellow]Backend state was uncertain; issued stop requests to all known backends.[/yellow]")
+                for detail in stop_errors:
+                    console.print(f"  [dim]{detail}[/dim]")
+                console.print("[green]Stop request completed.[/green]")
+                return
+            finally:
+                lock.release()
         clear_session()
         console.print("[dim]No server is running.[/dim]")
         return
 
-    lock = _lock_or_exit("gpu", f"stopping {running_backend.display_name}")
+    stop_candidates = list(_BACKENDS) if probe_failed else list(running_backends)
+    running_names = ", ".join(candidate.display_name for candidate in stop_candidates)
+    lock = _lock_or_exit("gpu", f"stopping {running_names}")
     try:
-        _session_or_exit()  # re-check under flock (TOCTOU)
+        _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)  # re-check under flock (TOCTOU)
 
-        try:
-            running_backend.stop()
-        except RuntimeError as e:
-            console.print(f"[red]{e}[/red]")
+        stop_errors: list[str] = []
+        for candidate in stop_candidates:
+            try:
+                candidate.stop()
+            except Exception as e:
+                stop_errors.append(f"{candidate.display_name}: {e}")
+
+        confirmed_backends, confirmed_probe_failed = probe_running_backends()
+        if confirmed_backends:
+            remaining_names = ", ".join(candidate.display_name for candidate in confirmed_backends)
+            console.print(f"[red]{remaining_names} still appear to be running after stop.[/red]")
+            for detail in stop_errors:
+                console.print(f"  {detail}")
+            raise typer.Exit(1)
+        if confirmed_probe_failed:
+            console.print("[red]Could not verify backend state after stop.[/red]")
+            for detail in stop_errors:
+                console.print(f"  {detail}")
             raise typer.Exit(1)
         clear_session()
-        console.print(f"[green]{running_backend.display_name} stopped.[/green]")
+        if stop_errors:
+            for detail in stop_errors:
+                console.print(f"  [dim]{detail}[/dim]")
+        console.print(f"[green]Stopped: {running_names}.[/green]")
     finally:
         lock.release()
 
@@ -1711,6 +1979,12 @@ def fan(
     PID_PATH = _fan.PID_PATH
     STATE_PATH = _fan.STATE_PATH
 
+    def _safe_unlink(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _daemon_pid() -> int | None:
         if not PID_PATH.exists():
             return None
@@ -1720,13 +1994,13 @@ def fan(
             # Verify it's actually our daemon, not a recycled PID
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
             if "vserve.fan" not in cmdline:
-                PID_PATH.unlink(missing_ok=True)
-                STATE_PATH.unlink(missing_ok=True)
+                _safe_unlink(PID_PATH)
+                _safe_unlink(STATE_PATH)
                 return None
             return pid
         except (ValueError, OSError):
-            PID_PATH.unlink(missing_ok=True)
-            STATE_PATH.unlink(missing_ok=True)
+            _safe_unlink(PID_PATH)
+            _safe_unlink(STATE_PATH)
             return None
 
     def _stop_daemon() -> bool:
@@ -1740,8 +2014,8 @@ def fan(
                 time.sleep(0.1)
             except OSError:
                 break
-        PID_PATH.unlink(missing_ok=True)
-        STATE_PATH.unlink(missing_ok=True)
+        _safe_unlink(PID_PATH)
+        _safe_unlink(STATE_PATH)
         return True
 
     def _start_daemon(qs: int, qe: int, qm: int) -> None:
@@ -1804,8 +2078,8 @@ def fan(
     def _clean_orphaned_fan() -> None:
         """Remove stale PID/state files from crashed daemon."""
         _fan._resolve_paths()
-        _fan.PID_PATH.unlink(missing_ok=True)
-        _fan.STATE_PATH.unlink(missing_ok=True)
+        _safe_unlink(_fan.PID_PATH)
+        _safe_unlink(_fan.STATE_PATH)
         from vserve.gpu import restore_fan_auto
         try:
             restore_fan_auto()
@@ -1814,7 +2088,10 @@ def fan(
             console.print("[yellow]Could not restore auto fan control via NVML.[/yellow]")
 
     def _show_status() -> None:
-        speed = get_fan_speed()
+        try:
+            speed: int | str = get_fan_speed()
+        except Exception:
+            speed = "?"
         pid = _daemon_pid()
         state = read_state() if pid else None
         try:
@@ -1824,7 +2101,8 @@ def fan(
             temp = None
 
         temp_str = f"{temp}°C" if temp is not None else "?"
-        console.print(f"\n[bold]GPU Fan[/bold]  {speed}% @ {temp_str}")
+        speed_str = f"{speed}%" if isinstance(speed, int) else "?"
+        console.print(f"\n[bold]GPU Fan[/bold]  {speed_str} @ {temp_str}")
 
         if _is_orphaned_fan():
             console.print("  [red]Warning: fan daemon crashed — fan may be stuck in manual mode[/red]")
@@ -1904,7 +2182,7 @@ def fan(
         return
 
     # action == "curve"
-    defaults = state or {"quiet_start": 9, "quiet_end": 18, "quiet_max": 60}
+    defaults = state if state and "fixed" not in state else {"quiet_start": 9, "quiet_end": 18, "quiet_max": 60}
     qs = defaults["quiet_start"]
     qe = defaults["quiet_end"]
     qm = defaults["quiet_max"]
@@ -1956,15 +2234,22 @@ def status():
         active_json = running_backend._active_config_path().with_suffix(".json")
         if active_json.exists():
             try:
-                cfg = _json.loads(active_json.read_text())
-                config_source = active_json
+                data = _json.loads(active_json.read_text())
+                if isinstance(data, dict):
+                    cfg = data
+                    config_source = active_json
+                else:
+                    invalid_source = active_json
+                    config_source = active_json
             except Exception:
                 invalid_source = active_json
                 config_source = active_json
     if not cfg:
         active = active_yaml_path()
-        if active.exists():
-            config_source = active.resolve() if active.is_symlink() else active
+        active_is_symlink = active.is_symlink()
+        if active_is_symlink or _safe_path_exists(active):
+            resolved = _safe_resolve_path(active) if active_is_symlink else active
+            config_source = resolved or active
             cfg_data = try_read_profile_yaml(active)
             if cfg_data:
                 cfg = cfg_data
@@ -2050,7 +2335,7 @@ def init():
     from vserve.config import (
         CONFIG_FILE, save_config,
         _discover_vllm_root, _discover_cuda_home, _discover_service, _discover_port,
-        _build_config, reset_config,
+        _build_config, reset_config, find_systemd_unit_path,
     )
 
     def _ok(msg: str) -> None:
@@ -2152,8 +2437,8 @@ def init():
     # ── systemd (vLLM) ──
     svc_name, svc_user = _discover_service()
     if detected_vllm_root:
-        svc_path = _Path(f"/etc/systemd/system/{svc_name}.service")
-        if svc_path.exists():
+        svc_path = find_systemd_unit_path(svc_name)
+        if svc_path is not None:
             _ok(f"systemd     {svc_name}.service (user: {svc_user})")
         else:
             _fail("systemd     no vLLM systemd service found (required for vLLM runs)")
@@ -2166,8 +2451,8 @@ def init():
     if llamacpp_root:
         lc_svc_name = "llama-cpp"
         lc_svc_user = "llama-cpp"
-        lc_svc_path = _Path(f"/etc/systemd/system/{lc_svc_name}.service")
-        if lc_svc_path.exists():
+        lc_svc_path = find_systemd_unit_path(lc_svc_name)
+        if lc_svc_path is not None:
             _ok(f"systemd     {lc_svc_name}.service")
         else:
             _warn(f"systemd     no {lc_svc_name}.service found")
@@ -2301,7 +2586,14 @@ def doctor():
     import socket
     from pathlib import Path
 
-    from vserve.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, try_read_profile_yaml, LOGS_DIR
+    from vserve.config import (
+        VLLM_BIN,
+        VLLM_ROOT,
+        active_yaml_path,
+        try_read_profile_yaml,
+        LOGS_DIR,
+        find_systemd_unit_path,
+    )
     from vserve.backends import any_backend_running
 
     ok_count = 0
@@ -2347,7 +2639,12 @@ def doctor():
     # vLLM
     try:
         r = subprocess.run([str(VLLM_BIN), "--version"], capture_output=True, text=True, timeout=10)
-        _ok(f"vLLM {r.stdout.strip()}")
+        if r.returncode == 0:
+            ver = r.stdout.strip() or r.stderr.strip() or "found"
+            _ok(f"vLLM {ver}")
+        else:
+            details = r.stderr.strip() or r.stdout.strip()
+            _fail(f"vLLM not working at {VLLM_BIN}", details or "Check the vLLM installation and environment")
     except Exception:
         _fail(f"vLLM not found at {VLLM_BIN}")
 
@@ -2397,19 +2694,23 @@ def doctor():
         _fail("Cannot check service user")
 
     # systemd unit
-    svc_path = Path(f"/etc/systemd/system/{_c.service_name}.service")
-    if svc_path.exists():
-        svc_content = svc_path.read_text()
-        if "ProtectSystem=strict" in svc_content:
-            _fail("systemd unit has ProtectSystem=strict",
-                  "Remove it — breaks nvcc JIT compilation")
-        elif "TimeoutStartSec" not in svc_content:
-            _warn("No TimeoutStartSec in service — default 90s may be too short for JIT",
-                  "Add TimeoutStartSec=600")
+    svc_path = find_systemd_unit_path(_c.service_name)
+    if svc_path is not None:
+        try:
+            svc_content = svc_path.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            _warn(f"Could not read systemd unit: {svc_path.name}", str(exc))
         else:
-            _ok("systemd unit configured correctly")
+            if "ProtectSystem=strict" in svc_content:
+                _fail("systemd unit has ProtectSystem=strict",
+                      "Remove it — breaks nvcc JIT compilation")
+            elif "TimeoutStartSec" not in svc_content:
+                _warn("No TimeoutStartSec in service — default 90s may be too short for JIT",
+                      "Add TimeoutStartSec=600")
+            else:
+                _ok("systemd unit configured correctly")
     else:
-        _fail(f"No systemd unit at {svc_path}",
+        _fail(f"No systemd unit found for {_c.service_name}.service",
               "Create one: https://docs.vllm.ai  or see vserve docs/troubleshooting.md")
 
     # .env
@@ -2424,14 +2725,20 @@ def doctor():
                 _ok(".env has required variables")
         except PermissionError:
             _ok(".env exists (not readable — OK, contains secrets)")
+        except (OSError, UnicodeDecodeError) as exc:
+            _warn(f".env unreadable: {env_path}", str(exc))
     else:
         _fail(f"No .env at {env_path}")
 
     # Models directory
     vllm_models = VLLM_ROOT / "models"
     if vllm_models.exists():
-        vllm_mc = sum(1 for p in vllm_models.glob("*/*/config.json"))
-        _ok(f"Models dir: {vllm_models} ({vllm_mc} models)")
+        try:
+            vllm_mc = sum(1 for p in vllm_models.glob("*/*/config.json"))
+        except OSError as exc:
+            _warn(f"Models dir unreadable: {vllm_models}", str(exc))
+        else:
+            _ok(f"Models dir: {vllm_models} ({vllm_mc} models)")
     else:
         _warn(f"Models dir {vllm_models} does not exist")
 
@@ -2441,31 +2748,51 @@ def doctor():
         (VLLM_ROOT / ".cache" / "vllm" / "torch_compile_cache", "torch.compile"),
     ]
     for cdir, label in cache_checks:
-        if cdir.exists() and any(f.is_file() for f in cdir.rglob("*")):
-            size_mb = sum(f.stat().st_size for f in cdir.rglob("*") if f.is_file()) / (1024 * 1024)
-            _ok(f"{label} cache ({size_mb:.0f} MB)")
-        elif cdir.exists():
-            _warn(f"{label} cache dir exists but is empty — first start may be slow")
-        else:
+        if not cdir.exists():
             _warn(f"{label} cache missing — first start will JIT compile (2-10 min)")
+            continue
+        try:
+            files = []
+            for f in cdir.rglob("*"):
+                try:
+                    if f.is_file():
+                        files.append(f)
+                except OSError:
+                    continue
+        except OSError as exc:
+            _warn(f"{label} cache unreadable", str(exc))
+            continue
+        if not files:
+            _warn(f"{label} cache dir exists but is empty — first start may be slow")
+            continue
+        size_bytes = 0
+        for f in files:
+            try:
+                size_bytes += f.stat().st_size
+            except OSError:
+                continue
+        _ok(f"{label} cache ({size_bytes / (1024 * 1024):.0f} MB)")
 
     # Active config
     active = active_yaml_path()
-    if active.exists() and active.is_symlink():
-        target = active.resolve()
-        if target.exists():
+    active_is_symlink = active.is_symlink()
+    if active_is_symlink:
+        target = _safe_resolve_path(active)
+        if target is None:
+            _warn("active.yaml symlink is unreadable or recursive")
+        elif _safe_path_exists(target):
             cfg_data = try_read_profile_yaml(active)
             if cfg_data is None:
                 _warn(f"active.yaml unreadable: {target.name}")
             else:
                 model_path = cfg_data.get("model", "")
-                if model_path and Path(model_path).exists():
+                if isinstance(model_path, (str, os.PathLike)) and model_path and Path(model_path).exists():
                     _ok(f"active.yaml → {target.name}")
                 else:
                     _fail(f"active.yaml model path missing: {model_path}")
         else:
             _fail(f"active.yaml → broken symlink: {target}")
-    elif active.exists():
+    elif _safe_path_exists(active):
         _ok("active.yaml exists (not a symlink)")
     else:
         _ok("No active.yaml (clean — will be created on vserve run)")
@@ -2474,10 +2801,14 @@ def doctor():
     tmp_dir = VLLM_ROOT / "tmp"
     if tmp_dir.exists() and tmp_dir.is_dir():
         _ok(f"TMPDIR at {tmp_dir}")
-        sockets = list(tmp_dir.glob("*"))
-        stale = [s for s in sockets if s.is_socket()]
-        if len(stale) > 10:
-            _warn(f"{len(stale)} stale sockets in {tmp_dir}", f"sudo find {tmp_dir} -type s -delete")
+        try:
+            sockets = list(tmp_dir.glob("*"))
+            stale = [s for s in sockets if s.is_socket()]
+        except OSError as exc:
+            _warn(f"Could not inspect TMPDIR sockets: {tmp_dir}", str(exc))
+        else:
+            if len(stale) > 10:
+                _warn(f"{len(stale)} stale sockets in {tmp_dir}", f"sudo find {tmp_dir} -type s -delete")
     else:
         _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
 
@@ -2495,14 +2826,19 @@ def doctor():
         if lc_bin.exists():
             try:
                 r = subprocess.run([str(lc_bin), "--version"], capture_output=True, text=True, timeout=5)
-                ver_line = ""
-                for ln in (r.stdout + r.stderr).splitlines():
-                    if "version" in ln.lower() or ln.startswith("b"):
-                        ver_line = ln.strip()
-                        break
-                _ok(f"llama-server {ver_line}" if ver_line else f"llama-server at {lc_bin}")
+                if r.returncode == 0:
+                    ver_line = ""
+                    for ln in (r.stdout + r.stderr).splitlines():
+                        if "version" in ln.lower() or ln.startswith("b"):
+                            ver_line = ln.strip()
+                            break
+                    _ok(f"llama-server {ver_line}" if ver_line else f"llama-server at {lc_bin}")
+                else:
+                    details = r.stderr.strip() or r.stdout.strip()
+                    _fail(f"llama-server at {lc_bin} is not working",
+                          details or "Build or reinstall llama.cpp")
             except Exception:
-                _ok(f"llama-server at {lc_bin}")
+                _fail(f"llama-server at {lc_bin} is not working")
         elif __import__("shutil").which("llama-server"):
             _ok("llama-server found on PATH")
         else:
@@ -2523,27 +2859,35 @@ def doctor():
 
         # systemd unit (deep inspection, matching vLLM)
         lc_svc = _c.llamacpp_service_name
-        lc_svc_path = Path(f"/etc/systemd/system/{lc_svc}.service")
-        if lc_svc_path.exists():
-            lc_svc_content = lc_svc_path.read_text()
-            issues = []
-            if "CUDA_VISIBLE_DEVICES" not in lc_svc_content:
-                issues.append("missing CUDA_VISIBLE_DEVICES (may use wrong GPU)")
-            if "TimeoutStartSec" not in lc_svc_content:
-                issues.append("no TimeoutStartSec (large models need time)")
-            if issues:
-                _warn(f"{lc_svc}.service: {'; '.join(issues)}")
+        lc_svc_path = find_systemd_unit_path(lc_svc)
+        if lc_svc_path is not None:
+            try:
+                lc_svc_content = lc_svc_path.read_text()
+            except (OSError, UnicodeDecodeError) as exc:
+                _warn(f"Could not read {lc_svc}.service", str(exc))
             else:
-                _ok(f"{lc_svc}.service unit configured correctly")
+                issues = []
+                if "CUDA_VISIBLE_DEVICES" not in lc_svc_content:
+                    issues.append("missing CUDA_VISIBLE_DEVICES (may use wrong GPU)")
+                if "TimeoutStartSec" not in lc_svc_content:
+                    issues.append("no TimeoutStartSec (large models need time)")
+                if issues:
+                    _warn(f"{lc_svc}.service: {'; '.join(issues)}")
+                else:
+                    _ok(f"{lc_svc}.service unit configured correctly")
         else:
-            _fail(f"No systemd unit at {lc_svc_path}",
+            _fail(f"No systemd unit found for {lc_svc}.service",
                   f"Create /etc/systemd/system/{lc_svc}.service with ExecStart={lc_root}/configs/active.sh")
 
         # Models directory
         lc_models = lc_root / "models"
         if lc_models.exists():
-            model_count = sum(1 for p in lc_models.rglob("*.gguf") if p.is_file())
-            _ok(f"Models dir: {lc_models} ({model_count} GGUF files)")
+            try:
+                model_count = sum(1 for p in lc_models.rglob("*.gguf") if p.is_file())
+            except OSError as exc:
+                _warn(f"Models dir unreadable: {lc_models}", str(exc))
+            else:
+                _ok(f"Models dir: {lc_models} ({model_count} GGUF files)")
         else:
             _warn(f"Models dir {lc_models} does not exist",
                   f"sudo mkdir -p {lc_models} && sudo chown {lc_user}:llm {lc_models}")
@@ -2562,7 +2906,7 @@ def doctor():
                     import json as _json2
                     lc_cfg = _json2.loads(active_json.read_text())
                     lc_model = lc_cfg.get("model", "")
-                    if lc_model and Path(lc_model).exists():
+                    if isinstance(lc_model, (str, os.PathLike)) and lc_model and Path(lc_model).exists():
                         _ok(f"active.json → {Path(lc_model).name}")
                     elif lc_model:
                         _fail(f"active.json model path missing: {lc_model}")
@@ -2598,11 +2942,15 @@ def doctor():
     # Log size
     log_file = LOGS_DIR / "vllm.log"
     if log_file.exists():
-        size_mb = log_file.stat().st_size / (1024 * 1024)
-        if size_mb > 100:
-            _warn(f"vllm.log is {size_mb:.0f} MB", "Consider truncating or adding log rotation")
+        try:
+            size_mb = log_file.stat().st_size / (1024 * 1024)
+        except OSError as exc:
+            _warn(f"Could not read log metadata: {log_file}", str(exc))
         else:
-            _ok(f"vllm.log ({size_mb:.0f} MB)")
+            if size_mb > 100:
+                _warn(f"vllm.log is {size_mb:.0f} MB", "Consider truncating or adding log rotation")
+            else:
+                _ok(f"vllm.log ({size_mb:.0f} MB)")
 
     # Multi-user messaging
     import grp

@@ -6,7 +6,9 @@ from vserve.config import (
     save_config,
     reset_config,
     VserveConfig,
+    find_systemd_unit_path,
     _build_config,
+    _discover_service,
     _discover_vllm_root,
     _discover_cuda_home,
     _discover_port,
@@ -97,6 +99,39 @@ def test_read_limits_missing(tmp_path):
     assert read_limits(path) is None
 
 
+def test_read_limits_corrupt_returns_none(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("{not json")
+    assert read_limits(path) is None
+
+
+def test_read_limits_non_object_returns_none(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text('["not", "an", "object"]')
+    assert read_limits(path) is None
+
+
+def test_read_limits_invalid_nested_shape_returns_none(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text('{"limits": {"4096": {"auto": "many"}}}')
+    assert read_limits(path) is None
+
+
+def test_read_limits_accepts_flat_llamacpp_shape(tmp_path):
+    path = tmp_path / "llama.json"
+    path.write_text('{"limits": {"4096": 8, "8192": null}}')
+    loaded = read_limits(path)
+    assert loaded is not None
+    assert loaded["limits"]["4096"] == 8
+    assert loaded["limits"]["8192"] is None
+
+
+def test_read_limits_rejects_non_numeric_context_keys(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text('{"limits": {"wide": {"auto": 4}}}')
+    assert read_limits(path) is None
+
+
 def test_write_and_read_profile_yaml(tmp_path):
     data = {
         "model": "/opt/vllm/models/test/model",
@@ -115,6 +150,21 @@ def test_write_and_read_profile_yaml(tmp_path):
 def test_try_read_profile_yaml_corrupt(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text("not: valid: yaml: {{{{")
+    assert try_read_profile_yaml(path) is None
+
+
+def test_read_profile_yaml_requires_mapping(tmp_path):
+    import pytest
+
+    path = tmp_path / "bad.yaml"
+    path.write_text("- one\n- two\n")
+    with pytest.raises(ValueError, match="Invalid profile YAML"):
+        read_profile_yaml(path)
+
+
+def test_try_read_profile_yaml_non_mapping_returns_none(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text("- one\n- two\n")
     assert try_read_profile_yaml(path) is None
 
 
@@ -210,6 +260,37 @@ def test_load_config_partial_file_uses_defaults(tmp_path, mocker):
     assert c.vllm_root == Path("/my/vllm")
     assert c.service_name == "vllm"  # default
     assert c.port == 8888  # default
+
+
+def test_find_systemd_unit_path_checks_multiple_locations(tmp_path, monkeypatch):
+    from vserve import config as config_module
+
+    lib_systemd = tmp_path / "lib"
+    usr_systemd = tmp_path / "usr"
+    lib_systemd.mkdir()
+    usr_systemd.mkdir()
+    unit = usr_systemd / "vllm.service"
+    unit.write_text("[Unit]\nDescription=vLLM\n")
+
+    monkeypatch.setattr(
+        "vserve.config.SYSTEMD_UNIT_DIRS",
+        (lib_systemd, usr_systemd),
+    )
+    monkeypatch.setattr(
+        config_module.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("skip systemctl")),
+    )
+
+    assert find_systemd_unit_path("vllm") == unit
+
+
+def test_discover_service_ignores_partial_name_matches(mocker):
+    list_units = mocker.Mock(stdout="nvllm.service enabled\nmy-vllm.service enabled\n", returncode=0)
+    show_user = mocker.Mock(stdout="User=svcuser\n", returncode=0)
+    mocker.patch("vserve.config.subprocess.run", side_effect=[list_units, show_user])
+
+    assert _discover_service() == ("my-vllm", "svcuser")
 
 
 def test_reset_config_clears_singleton():

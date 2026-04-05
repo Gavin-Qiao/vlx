@@ -18,26 +18,35 @@ def register(backend: Backend) -> None:
     _BACKENDS.append(backend)
 
 
-def any_backend_running() -> bool:
-    """Check if any registered backend has a running server."""
+def probe_running_backends() -> tuple[list[Backend], bool]:
+    """Return (running_backends, probe_failed)."""
+    running: list[Backend] = []
+    probe_failed = False
     for b in _BACKENDS:
         try:
             if b.is_running():
-                return True
+                running.append(b)
         except Exception:
-            continue
-    return False
+            probe_failed = True
+    return running, probe_failed
+
+
+def probe_running_backend() -> tuple[Backend | None, bool]:
+    """Return (running_backend, probe_failed)."""
+    running, probe_failed = probe_running_backends()
+    return (running[0] if running else None), probe_failed
+
+
+def any_backend_running() -> bool:
+    """Check if any registered backend has a running server."""
+    running, _probe_failed = probe_running_backends()
+    return bool(running)
 
 
 def running_backend() -> Backend | None:
     """Return the currently running backend, or None."""
-    for b in _BACKENDS:
-        try:
-            if b.is_running():
-                return b
-        except Exception:
-            continue
-    return None
+    running, _probe_failed = probe_running_backends()
+    return running[0] if running else None
 
 
 def get_backend(model: ModelInfo) -> Backend:

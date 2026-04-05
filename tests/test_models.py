@@ -172,6 +172,29 @@ def test_scan_models_logs_invalid_candidate(tmp_path, caplog):
     assert str(bad_dir) in caplog.text
 
 
+def test_scan_models_skips_unreadable_provider(tmp_path, caplog, monkeypatch):
+    from pathlib import Path
+
+    root = tmp_path / "models"
+    provider = root / "secret"
+    provider.mkdir(parents=True)
+
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self):
+        if self == provider:
+            raise PermissionError("denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+    with caplog.at_level(logging.WARNING):
+        assert scan_models(root) == []
+
+    assert "Skipping provider directory" in caplog.text
+    assert str(provider) in caplog.text
+
+
 @pytest.mark.parametrize(
     "query,expected_count",
     [

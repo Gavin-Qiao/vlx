@@ -6,24 +6,45 @@ from pathlib import Path
 from vserve.config import cfg
 
 
-def _systemctl(action: str) -> tuple[bool, str, str]:
-    result = subprocess.run(
-        ["sudo", "systemctl", action, cfg().service_name],
-        capture_output=True,
-        text=True,
-    )
+def _systemctl(action: str, timeout: int = 30) -> tuple[bool, str, str]:
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", action, cfg().service_name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "", f"systemctl {action} timed out after {timeout}s"
+    except Exception as exc:
+        return False, "", str(exc)
     return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
 
 
 def _update_active_symlink(config_path: Path) -> None:
     active = cfg().active_yaml
-    active.unlink(missing_ok=True)
-    active.symlink_to(config_path.resolve())
+    active.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        active.unlink(missing_ok=True)
+        active.symlink_to(config_path.resolve())
+    except OSError as exc:
+        raise RuntimeError(f"failed to update active config link {active}: {exc}") from None
 
 
 def is_vllm_running() -> bool:
-    ok, output, _err = _systemctl("is-active")
-    return ok and output == "active"
+    ok, output, err = _systemctl("is-active", timeout=5)
+    status = output.strip().lower()
+    if ok and status == "active":
+        return True
+    if status in {"inactive", "failed"}:
+        return False
+    if status in {"activating", "deactivating", "reloading"}:
+        raise RuntimeError(f"systemctl is-active {cfg().service_name} is transitional: {status}")
+    if "could not be found" in err.lower():
+        return False
+    if err:
+        raise RuntimeError(f"systemctl is-active {cfg().service_name} failed: {err}")
+    return False
 
 
 def start_vllm(config_path: Path) -> None:

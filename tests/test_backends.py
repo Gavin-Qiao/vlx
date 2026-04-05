@@ -220,6 +220,15 @@ class TestVllmBackend:
         assert b.service_name == "vllm"
         assert b.service_user == "vllm"
 
+    def test_configured_service_identity(self, mocker):
+        b = VllmBackend()
+        mocker.patch(
+            "vserve.config.cfg",
+            return_value=Mock(service_name="custom-vllm", service_user="svc-vllm", vllm_root=Path("/opt/vllm")),
+        )
+        assert b.service_name == "custom-vllm"
+        assert b.service_user == "svc-vllm"
+
 
 # --- Auto-registration ---
 
@@ -267,6 +276,22 @@ def test_any_backend_running_exception_handled():
     b.is_running.side_effect = RuntimeError("no systemctl")
     register(b)
     assert any_backend_running() is False
+
+
+def test_probe_running_backend_partial_failure_with_successful_false_probe():
+    from vserve.backends import probe_running_backend
+
+    broken = _make_mock_backend("broken")
+    broken.is_running.side_effect = RuntimeError("dbus error")
+    idle = _make_mock_backend("idle")
+    idle.is_running.return_value = False
+    register(broken)
+    register(idle)
+
+    backend, probe_failed = probe_running_backend()
+
+    assert backend is None
+    assert probe_failed is True
 
 
 def test_running_backend_returns_correct():

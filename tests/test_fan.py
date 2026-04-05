@@ -183,6 +183,18 @@ class TestReadState:
         f.write_text("not json{{{")
         assert read_state() is None
 
+    def test_invalid_shape(self, tmp_path, mocker):
+        self._patch_paths(mocker, tmp_path)
+        f = tmp_path / "vserve-fan.json"
+        f.write_text('{"quiet_start": 22, "quiet_end": "late", "quiet_max": 50}')
+        assert read_state() is None
+
+    def test_fixed_mode_shape(self, tmp_path, mocker):
+        self._patch_paths(mocker, tmp_path)
+        f = tmp_path / "vserve-fan.json"
+        f.write_text('{"fixed": 55}')
+        assert read_state() == {"fixed": 55}
+
 
 class TestConstants:
     def test_failure_threshold_ordering(self):

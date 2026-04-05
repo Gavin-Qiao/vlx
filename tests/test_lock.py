@@ -11,7 +11,7 @@ import pytest
 
 from vserve.lock import (
     LockHeld, LockInfo, VserveLock, _format_elapsed, wait_for_release,
-    check_session, write_session, read_session, SessionHeld,
+    check_session, write_session, read_session, SessionHeld, SessionUnknown,
 )
 
 
@@ -253,7 +253,7 @@ def test_wait_for_release_timeout(tmp_path):
 
 
 def test_check_session_clears_stale_when_no_backend_running(tmp_path, monkeypatch):
-    """Stale session (no backend running) is auto-cleared."""
+    """Stale session markers are ignored when no backend is running."""
     monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
     monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
     monkeypatch.setenv("USER", "other_user")
@@ -262,9 +262,9 @@ def test_check_session_clears_stale_when_no_backend_running(tmp_path, monkeypatc
     assert read_session() is not None
 
     monkeypatch.setenv("USER", "current_user")
-    monkeypatch.setattr("vserve.backends.any_backend_running", lambda: False)
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (None, False))
 
-    check_session()  # should clear stale session
+    check_session()  # should ignore stale marker
     assert read_session() is None
 
 
@@ -277,7 +277,7 @@ def test_check_session_raises_when_backend_running(tmp_path, monkeypatch):
     write_session("running-model")
 
     monkeypatch.setenv("USER", "bob")
-    monkeypatch.setattr("vserve.backends.any_backend_running", lambda: True)
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (object(), False))
 
     with pytest.raises(SessionHeld):
         check_session()
@@ -290,6 +290,80 @@ def test_check_session_same_user_allowed(tmp_path, monkeypatch):
     monkeypatch.setenv("USER", "alice")
 
     write_session("my-model")
-    monkeypatch.setattr("vserve.backends.any_backend_running", lambda: True)
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (object(), False))
 
     check_session()  # should NOT raise — same user
+
+
+def test_check_session_probe_failure_degrades_safely(tmp_path, monkeypatch):
+    """Probe failures should not block advisory session checks."""
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+
+    write_session("running-model")
+
+    monkeypatch.setenv("USER", "bob")
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (None, True))
+
+    check_session()
+
+
+def test_check_session_probe_failure_strict_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+
+    write_session("running-model")
+
+    monkeypatch.setenv("USER", "bob")
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (None, True))
+
+    with pytest.raises(SessionHeld):
+        check_session(fail_on_probe_uncertainty=True)
+
+
+def test_check_session_probe_failure_strict_allows_same_user_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+
+    write_session("running-model")
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (None, True))
+
+    check_session(fail_on_probe_uncertainty=True)
+
+
+def test_check_session_probe_failure_strict_without_marker_allows(tmp_path, monkeypatch):
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (None, True))
+
+    check_session(fail_on_probe_uncertainty=True)
+
+
+def test_check_session_unknown_owner_when_backend_running_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "bob")
+    monkeypatch.setattr("vserve.backends.probe_running_backend", lambda: (object(), False))
+
+    with pytest.raises(SessionUnknown):
+        check_session()
+
+
+def test_read_session_prefers_newest_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+
+    monkeypatch.setenv("USER", "alice")
+    write_session("older-model")
+
+    monkeypatch.setenv("USER", "bob")
+    write_session("newer-model")
+
+    info = read_session()
+    assert info is not None
+    assert info.user == "bob"
+    assert info.model == "newer-model"

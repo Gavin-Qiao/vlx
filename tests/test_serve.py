@@ -24,6 +24,15 @@ def test_is_vllm_running_inactive(mocker):
     assert is_vllm_running() is False
 
 
+def test_is_vllm_running_activating_is_uncertain(mocker):
+    import pytest
+
+    _mock_cfg(mocker)
+    mocker.patch("vserve.serve._systemctl", return_value=(False, "activating", ""))
+    with pytest.raises(RuntimeError, match="is transitional"):
+        is_vllm_running()
+
+
 def test_stop_vllm(mocker):
     _mock_cfg(mocker)
     mock_run = mocker.patch("vserve.serve._systemctl", return_value=(True, "", ""))
@@ -50,6 +59,37 @@ def test_systemctl_uses_service_name(mocker):
     is_vllm_running()
     args = mock_run.call_args[0][0]
     assert "my-vllm" in args
+
+
+def test_systemctl_uses_timeout(mocker):
+    _mock_cfg(mocker)
+    mock_run = mocker.patch("vserve.serve.subprocess.run", return_value=Mock(returncode=0, stdout="active", stderr=""))
+    is_vllm_running()
+    assert mock_run.call_args.kwargs["timeout"] == 5
+
+
+def test_is_vllm_running_probe_error_is_false(mocker):
+    import pytest
+
+    _mock_cfg(mocker)
+    mocker.patch("vserve.serve._systemctl", return_value=(False, "", "dbus error"))
+    with pytest.raises(RuntimeError, match="systemctl is-active"):
+        is_vllm_running()
+
+
+def test_is_vllm_running_missing_unit_is_false(mocker):
+    _mock_cfg(mocker)
+    mocker.patch("vserve.serve._systemctl", return_value=(False, "", "Unit vllm.service could not be found."))
+    assert is_vllm_running() is False
+
+
+def test_systemctl_timeout_returns_error(mocker):
+    _mock_cfg(mocker)
+    mocker.patch("vserve.serve.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired(cmd="systemctl", timeout=5))
+    ok, out, err = __import__("vserve.serve", fromlist=["_systemctl"])._systemctl("start", timeout=5)
+    assert ok is False
+    assert out == ""
+    assert "timed out" in err
 
 
 def test_start_vllm_failure(mocker, tmp_path):
