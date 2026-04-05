@@ -435,18 +435,34 @@ def _pick(items: list[str], title: str = "") -> int | None:
                 return i
         return None
 
-    from simple_term_menu import TerminalMenu
-    menu = TerminalMenu(
-        items, title=title,
-        menu_cursor="❯ ",
-        menu_cursor_style=("fg_cyan", "bold"),
-        menu_highlight_style=("standout",),
-        cycle_cursor=True,
-        status_bar="  ↑↓ navigate · enter select · q cancel",
-        status_bar_style=("fg_gray",),
-    )
-    idx = menu.show()
-    return idx  # type: ignore[return-value]
+    try:
+        from simple_term_menu import TerminalMenu
+        menu = TerminalMenu(
+            items, title=title,
+            menu_cursor="❯ ",
+            menu_cursor_style=("fg_cyan", "bold"),
+            menu_highlight_style=("standout",),
+            cycle_cursor=True,
+            status_bar="  ↑↓ navigate · enter select · q cancel",
+            status_bar_style=("fg_gray",),
+        )
+        idx = menu.show()
+        return idx  # type: ignore[return-value]
+    except Exception:
+        pass
+
+    # Final fallback: numbered prompt
+    for i, item in enumerate(items, 1):
+        console.print(f"  {i}) {item}")
+    while True:
+        choice = typer.prompt(title or "Choice")
+        try:
+            n = int(choice)
+            if 1 <= n <= len(items):
+                return n - 1
+        except ValueError:
+            pass
+        console.print(f"[red]Enter a number 1-{len(items)}.[/red]")
 
 
 def _pick_many(items: list[str], title: str = "") -> list[int]:
@@ -486,23 +502,42 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
         selected_lines = r.stdout.strip().split("\n")
         return [i for i, item in enumerate(items) if item in selected_lines]
 
-    from simple_term_menu import TerminalMenu
-    menu = TerminalMenu(
-        items, title=title,
-        multi_select=True,
-        show_multi_select_hint=True,
-        menu_cursor="❯ ",
-        menu_cursor_style=("fg_cyan", "bold"),
-        multi_select_cursor_style=("fg_green", "bold"),
-        menu_highlight_style=("standout",),
-        cycle_cursor=True,
-        status_bar="  ↑↓ navigate · space toggle · enter confirm · q cancel",
-        status_bar_style=("fg_gray",),
-    )
-    result = menu.show()
-    if result is None:
+    try:
+        from simple_term_menu import TerminalMenu
+        menu = TerminalMenu(
+            items, title=title,
+            multi_select=True,
+            show_multi_select_hint=True,
+            menu_cursor="❯ ",
+            menu_cursor_style=("fg_cyan", "bold"),
+            multi_select_cursor_style=("fg_green", "bold"),
+            menu_highlight_style=("standout",),
+            cycle_cursor=True,
+            status_bar="  ↑↓ navigate · space toggle · enter confirm · q cancel",
+            status_bar_style=("fg_gray",),
+        )
+        result = menu.show()
+        if result is None:
+            return []
+        return list(result) if isinstance(result, tuple) else [result]
+    except Exception:
+        pass
+
+    # Final fallback: comma-separated prompt
+    for i, item in enumerate(items, 1):
+        console.print(f"  {i}) {item}")
+    answer = typer.prompt(title or "Select (e.g. 1 or 1,2)", default="")
+    if not answer:
         return []
-    return list(result) if isinstance(result, tuple) else [result]
+    indices = []
+    for part in answer.replace(",", " ").split():
+        try:
+            n = int(part)
+            if 1 <= n <= len(items):
+                indices.append(n - 1)
+        except ValueError:
+            pass
+    return indices
 
 
 @app.command()
@@ -577,7 +612,7 @@ def _pick_variants(variants: list) -> list:
 
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
     """Download a single model by its HuggingFace ID. Returns True if download happened."""
-    from vserve.variants import fetch_repo_variants, format_variant_line, _format_bytes
+    from vserve.variants import fetch_repo_variants, _format_bytes
 
     parts = model_id.split("/")
     if len(parts) != 2:
@@ -616,13 +651,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         shared_names += ", ..."
     console.print(f"  Shared: {shared_names} ({_format_bytes(shared_size)}, {len(shared)} files)\n")
 
-    # Show variants
-    for i, v in enumerate(variants, 1):
-        console.print(format_variant_line(v, index=i))
-
-    console.print()
-
-    # Selection
+    # Selection (variants shown inside _pick_variants via _pick_many)
     selected_variants = _pick_variants(variants)
     if not selected_variants:
         return False  # user backed out — navigate back
@@ -1234,12 +1263,23 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
             pool_idx = default_idx
         chosen_pooling = pooling_options[pool_idx]
     else:
-        tool_info = backend.detect_tools(m.path)
-        supports = tool_info.get("supports_tools", False)
-        if supports:
-            console.print("\n  [bold]4. Tool calling[/bold]")
+        # Use cached limits first, fall back to live detection
+        supports_tools = lim.get("supports_tools", False)
+        supports_reasoning = lim.get("supports_reasoning", False)
+        if not supports_tools and not supports_reasoning:
+            tool_info = backend.detect_tools(m.path)
+            supports_tools = tool_info.get("supports_tools", False)
+            supports_reasoning = tool_info.get("supports_reasoning", False)
+
+        if supports_tools or supports_reasoning:
+            caps = []
+            if supports_tools:
+                caps.append("tool calling")
+            if supports_reasoning:
+                caps.append("reasoning")
+            console.print(f"\n  [bold]4. Capabilities[/bold] ({' + '.join(caps)} via --jinja)")
             if not tools:
-                tools = typer.confirm("     Enable tool calling? (--jinja)", default=False)
+                tools = typer.confirm("     Enable? (--jinja)", default=False)
             else:
                 console.print("     [green]Enabled[/green] (--jinja)")
 

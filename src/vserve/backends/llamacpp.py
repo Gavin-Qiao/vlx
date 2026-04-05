@@ -248,17 +248,32 @@ class LlamaCppBackend:
         if cfg.get("jinja"):
             args.append("--jinja")
 
-        # Write launch script
+        # Write per-model launch script + JSON alongside the config,
+        # then symlink active.sh/active.json to them.
+        # Symlink pattern (matching vLLM's active.yaml) avoids permission
+        # issues — any user in the llm group can unlink + recreate symlinks
+        # in the group-writable configs dir.
         import shlex
         active = self._active_config_path()
         active.parent.mkdir(parents=True, exist_ok=True)
-        script = "#!/bin/bash\nexec " + shlex.join(args) + "\n"
-        active.write_text(script)
-        active.chmod(0o755)
 
-        # Also save the JSON config for reference
-        json_dest = active.with_suffix(".json")
-        json_dest.write_text(config_path.read_text())
+        # Per-model script in configs/models/
+        model_script = config_path.with_suffix(".sh")
+        script = "#!/bin/bash\nexec " + shlex.join(args) + "\n"
+        model_script.write_text(script)
+        model_script.chmod(0o755)
+
+        # Per-model JSON
+        model_json = config_path
+
+        # Symlink active.sh → per-model script
+        active.unlink(missing_ok=True)
+        active.symlink_to(model_script.resolve())
+
+        # Symlink active.json → per-model JSON
+        json_link = active.with_suffix(".json")
+        json_link.unlink(missing_ok=True)
+        json_link.symlink_to(model_json.resolve())
 
         result = subprocess.run(
             ["sudo", "systemctl", "start", self.service_name],

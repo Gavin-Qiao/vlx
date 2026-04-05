@@ -105,12 +105,14 @@ def background_refresh() -> None:
 def _compare_versions(a: str, b: str) -> int:
     """Compare version strings. Returns >0 if a > b, 0 if equal, <0 if a < b.
 
-    Uses simple tuple comparison of integer parts — sufficient for our
-    semver-style versions without pulling in packaging.
+    Strips pre-release suffixes (a1, b2, rc1) before comparing numeric parts.
     """
+    import re
     try:
-        pa = tuple(int(x) for x in a.split("."))
-        pb = tuple(int(x) for x in b.split("."))
+        pa = tuple(int(x) for x in re.split(r"[^0-9]+", re.sub(r"(a|b|rc)\d*$", "", str(a))) if x)
+        pb = tuple(int(x) for x in re.split(r"[^0-9]+", re.sub(r"(a|b|rc)\d*$", "", str(b))) if x)
+        if not pa or not pb:
+            return 0
         return (pa > pb) - (pa < pb)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return 0
