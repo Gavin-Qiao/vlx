@@ -1,7 +1,7 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
-from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_speed, set_fan_speed, restore_fan_auto
+from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_count, get_fan_speed, set_fan_speed, restore_fan_auto
 
 
 def test_parse_gpu_info(mocker):
@@ -37,6 +37,7 @@ def _mock_pynvml():
     """Create a mock pynvml module for testing."""
     mock = MagicMock()
     mock.NVML_TEMPERATURE_GPU = 0
+    mock.nvmlDeviceSetDefaultFanSpeed_v2 = None
     handle = MagicMock()
     mock.nvmlDeviceGetHandleByIndex.return_value = handle
     return mock, handle
@@ -52,11 +53,22 @@ def test_get_fan_speed():
     mock_nvml.nvmlShutdown.assert_called_once()
 
 
+def test_get_fan_count():
+    mock_nvml, handle = _mock_pynvml()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        assert get_fan_count() == 2
+
+
 def test_set_fan_speed_valid():
     mock_nvml, handle = _mock_pynvml()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
     with patch.dict("sys.modules", {"pynvml": mock_nvml}):
         set_fan_speed(80)
-    mock_nvml.nvmlDeviceSetFanSpeed_v2.assert_called_once_with(handle, 0, 80)
+    assert mock_nvml.nvmlDeviceSetFanSpeed_v2.call_args_list == [
+        call(handle, 0, 80),
+        call(handle, 1, 80),
+    ]
 
 
 def test_set_fan_speed_rejects_out_of_range():
@@ -68,7 +80,35 @@ def test_set_fan_speed_rejects_out_of_range():
 
 def test_restore_fan_auto():
     mock_nvml, handle = _mock_pynvml()
-    mock_nvml.nvmlDeviceGetNumFans.return_value = 1
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
     with patch.dict("sys.modules", {"pynvml": mock_nvml}):
         restore_fan_auto()
-    mock_nvml.nvmlDeviceSetFanControlPolicy.assert_called_once_with(handle, 0, 0)
+    assert mock_nvml.nvmlDeviceSetFanControlPolicy.call_args_list == [
+        call(handle, 0, 0),
+        call(handle, 1, 0),
+    ]
+
+
+def test_restore_fan_auto_prefers_default_api():
+    mock_nvml, handle = _mock_pynvml()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    mock_nvml.nvmlDeviceSetDefaultFanSpeed_v2 = MagicMock()
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        restore_fan_auto()
+    assert mock_nvml.nvmlDeviceSetDefaultFanSpeed_v2.call_args_list == [
+        call(handle, 0),
+        call(handle, 1),
+    ]
+    mock_nvml.nvmlDeviceSetFanControlPolicy.assert_not_called()
+
+
+def test_restore_fan_auto_falls_back_when_default_api_fails():
+    mock_nvml, handle = _mock_pynvml()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    mock_nvml.nvmlDeviceSetDefaultFanSpeed_v2 = MagicMock(side_effect=RuntimeError("unsupported"))
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        restore_fan_auto()
+    assert mock_nvml.nvmlDeviceSetFanControlPolicy.call_args_list == [
+        call(handle, 0, 0),
+        call(handle, 1, 0),
+    ]

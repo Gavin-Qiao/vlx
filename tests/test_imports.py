@@ -61,7 +61,7 @@ def test_fan_resolve_paths_idempotent():
 def test_gpu_module_imports():
     from vserve.gpu import (  # noqa: F401
         get_gpu_info, compute_gpu_memory_utilization,
-        get_fan_speed, set_fan_speed, GpuInfo,
+        get_fan_count, get_fan_speed, set_fan_speed, restore_fan_auto, GpuInfo,
     )
     assert callable(get_gpu_info)
     assert callable(set_fan_speed)

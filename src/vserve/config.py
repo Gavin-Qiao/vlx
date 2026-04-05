@@ -1,12 +1,15 @@
 """Paths, YAML/JSON read/write, and configuration discovery."""
 
 import json
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+_log = logging.getLogger(__name__)
 
 CONFIG_FILE = Path.home() / ".config" / "vserve" / "config.yaml"
 
@@ -288,6 +291,15 @@ def read_profile_yaml(path: Path) -> dict | None:
         return None
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def try_read_profile_yaml(path: Path) -> dict | None:
+    """Read profile YAML for diagnostics; return None on parse failure."""
+    try:
+        return read_profile_yaml(path)
+    except Exception as exc:
+        _log.warning("Failed to parse profile YAML %s: %s", path, exc)
+        return None
 
 
 def write_profile_yaml(path: Path, data: dict, comment: str = "") -> None:

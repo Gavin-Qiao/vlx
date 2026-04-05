@@ -1,4 +1,6 @@
 from pathlib import Path
+import click
+import pytest
 from typer.testing import CliRunner
 from vserve.cli import app
 
@@ -46,6 +48,24 @@ def test_run_command_exists():
 def test_stop_command_exists():
     result = runner.invoke(app, ["stop", "--help"])
     assert result.exit_code == 0
+
+
+def test_stop_failure_preserves_session(mocker):
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    backend.is_running.return_value = True
+    backend.stop.side_effect = RuntimeError("stop failed")
+    lock = mocker.Mock()
+
+    mocker.patch("vserve.backends._BACKENDS", [backend])
+    mocker.patch("vserve.cli._session_or_exit")
+    clear_session = mocker.patch("vserve.cli.clear_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+
+    result = runner.invoke(app, ["stop"])
+    assert result.exit_code == 1
+    clear_session.assert_not_called()
+    lock.release.assert_called_once()
 
 
 
@@ -178,6 +198,24 @@ def test_status_command_exists():
     assert result.exit_code == 0
 
 
+def test_status_handles_unreadable_active_config(mocker, tmp_path):
+    active = tmp_path / "active.yaml"
+    active.write_text("not: valid: yaml: {{{{")
+
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.is_running.return_value = True
+
+    mocker.patch("vserve.backends._BACKENDS", [backend])
+    mocker.patch("vserve.config.active_yaml_path", return_value=active)
+
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "active config unreadable" in result.output
+    assert str(active) in result.output
+
+
 def test_doctor_command_exists():
     result = runner.invoke(app, ["doctor", "--help"])
     assert result.exit_code == 0
@@ -186,6 +224,42 @@ def test_doctor_command_exists():
 def test_init_command_exists():
     result = runner.invoke(app, ["init", "--help"])
     assert result.exit_code == 0
+
+
+def test_init_reports_nvml_fan_control_without_coolbits(mocker, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    vllm_root = tmp_path / "vllm"
+
+    fake_gpu = mocker.Mock(name="GPU")
+    fake_gpu.name = "NVIDIA RTX PRO 5000 Blackwell"
+    fake_gpu.vram_total_gb = 48
+    fake_gpu.driver = "595.58.03"
+    fake_gpu.cuda = "13.1"
+
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=fake_gpu)
+    mocker.patch("vserve.gpu.get_fan_count", return_value=1)
+    mocker.patch("vserve.config._discover_cuda_home", return_value=tmp_path / "cuda")
+    mocker.patch("vserve.config._discover_vllm_root", return_value=vllm_root)
+    mocker.patch("vserve.config._discover_service", return_value=("vllm", "vllm"))
+    mocker.patch("vserve.config._discover_port", return_value=8888)
+    mocker.patch("vserve.config._build_config", return_value=mocker.Mock())
+    mocker.patch("vserve.config.save_config")
+    mocker.patch("vserve.config.reset_config")
+    mocker.patch("vserve.config.CONFIG_FILE", config_file)
+    mocker.patch("typer.confirm", return_value=False)
+
+    def _which(name: str) -> str | None:
+        if name == "nvcc":
+            return "/usr/bin/nvcc"
+        return None
+
+    mocker.patch("shutil.which", side_effect=_which)
+    mocker.patch("subprocess.run", return_value=mocker.Mock(returncode=0, stdout="vLLM 0.1.0", stderr=""))
+
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0
+    assert "Fan control 1 fan(s) exposed via NVML" in result.output
+    assert "Coolbits" not in result.output
 
 
 # --- Old command names must not work ---
@@ -344,3 +418,32 @@ def test_run_backend_override(mocker):
 
     runner.invoke(app, ["run", "Model-7B", "--backend", "nope"])
     mock_get.assert_called_once_with("nope")
+
+
+def test_launch_backend_aborts_on_restart_stop_failure(mocker, tmp_path):
+    from vserve.cli import _launch_backend
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("port: 8888\nmax-model-len: 4096\n")
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    backend.service_name = "vllm"
+    backend.name = "vllm"
+    backend.is_running.return_value = True
+    backend.stop.side_effect = RuntimeError("stop failed")
+
+    lock = mocker.Mock()
+    clear_session = mocker.patch("vserve.cli.clear_session")
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.config.read_profile_yaml", return_value={"port": 8888, "max-model-len": 4096})
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("time.sleep")
+
+    with pytest.raises(click.exceptions.Exit):
+        _launch_backend(backend, cfg_path, "test-model")
+
+    backend.start.assert_not_called()
+    clear_session.assert_not_called()
+    lock.release.assert_called_once()

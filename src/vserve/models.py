@@ -1,8 +1,11 @@
 """Model scanning, detection, and fuzzy matching."""
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -150,7 +153,8 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
                 continue
             try:
                 models.append(detect_model(model_dir))
-            except Exception:
+            except Exception as exc:
+                _log.warning("Skipping model directory %s: %s", model_dir, exc)
                 continue
     return models
 

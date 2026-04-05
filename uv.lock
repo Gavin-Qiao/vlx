@@ -719,11 +719,12 @@ wheels = [
 
 [[package]]
 name = "vserve"
-version = "0.5.2a2"
+version = "0.5.2a3"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "nvidia-ml-py" },
+    { name = "packaging" },
     { name = "pyyaml" },
     { name = "rich" },
     { name = "simple-term-menu" },
@@ -750,6 +751,7 @@ requires-dist = [
     { name = "gguf", marker = "extra == 'llamacpp'", specifier = ">=0.6" },
     { name = "huggingface-hub", specifier = ">=0.30" },
     { name = "nvidia-ml-py", specifier = ">=13.595.45" },
+    { name = "packaging", specifier = ">=24" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "rich", specifier = ">=14" },
     { name = "simple-term-menu", specifier = ">=1.6" },

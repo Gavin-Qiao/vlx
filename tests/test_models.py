@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from vserve.models import (
@@ -156,6 +158,18 @@ def test_scan_models_empty(tmp_path):
     empty_root = tmp_path / "models"
     empty_root.mkdir()
     assert scan_models(empty_root) == []
+
+
+def test_scan_models_logs_invalid_candidate(tmp_path, caplog):
+    bad_dir = tmp_path / "models" / "broken" / "BadModel"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "config.json").write_text("{broken")
+
+    with caplog.at_level(logging.WARNING):
+        assert scan_models(tmp_path / "models") == []
+
+    assert "Skipping model directory" in caplog.text
+    assert str(bad_dir) in caplog.text
 
 
 @pytest.mark.parametrize(

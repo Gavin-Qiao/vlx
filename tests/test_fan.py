@@ -1,9 +1,14 @@
 """Tests for vserve.fan — piecewise-linear fan curve with quiet hours."""
 
+from unittest.mock import MagicMock, call, patch
+
 from vserve.fan import (
     compute_fan_speed,
     read_state,
     _interpolate_curve,
+    _apply_fan,
+    _set_manual_control,
+    _restore_auto_control,
     EMERGENCY_TEMP,
     MIN_FAN,
     HYSTERESIS,
@@ -255,6 +260,57 @@ def test_run_daemon_exists():
     """run_daemon is importable and callable."""
     from vserve.fan import run_daemon
     assert callable(run_daemon)
+
+
+def test_apply_fan_sets_all_fans():
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    handle = object()
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        _apply_fan(70, handle)
+    assert mock_nvml.nvmlDeviceSetFanSpeed_v2.call_args_list == [
+        call(handle, 0, 70),
+        call(handle, 1, 70),
+    ]
+
+
+def test_set_manual_control_sets_all_fans():
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    handle = object()
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        _set_manual_control(handle)
+    assert mock_nvml.nvmlDeviceSetFanControlPolicy.call_args_list == [
+        call(handle, 0, 1),
+        call(handle, 1, 1),
+    ]
+
+
+def test_restore_auto_control_prefers_default_api():
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    mock_nvml.nvmlDeviceSetDefaultFanSpeed_v2 = MagicMock()
+    handle = object()
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        _restore_auto_control(handle)
+    assert mock_nvml.nvmlDeviceSetDefaultFanSpeed_v2.call_args_list == [
+        call(handle, 0),
+        call(handle, 1),
+    ]
+    mock_nvml.nvmlDeviceSetFanControlPolicy.assert_not_called()
+
+
+def test_restore_auto_control_falls_back_when_default_api_fails():
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlDeviceGetNumFans.return_value = 2
+    mock_nvml.nvmlDeviceSetDefaultFanSpeed_v2 = MagicMock(side_effect=RuntimeError("unsupported"))
+    handle = object()
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        _restore_auto_control(handle)
+    assert mock_nvml.nvmlDeviceSetFanControlPolicy.call_args_list == [
+        call(handle, 0, 0),
+        call(handle, 1, 0),
+    ]
 
 
 def test_fan_main_block_fixed_flag():

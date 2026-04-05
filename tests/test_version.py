@@ -61,6 +61,12 @@ class TestCompareVersions:
     def test_none_input(self):
         assert V._compare_versions(None, "0.1.0") == 0
 
+    def test_final_release_beats_prerelease(self):
+        assert V._compare_versions("0.5.2", "0.5.2a3") > 0
+
+    def test_release_candidate_beats_beta(self):
+        assert V._compare_versions("0.5.2rc1", "0.5.2b1") > 0
+
 
 # ── read_cache / write_cache ───────────────────────────
 
@@ -239,16 +245,75 @@ class TestUpdateCommand:
             assert result.exit_code == 0
             assert "up to date" in result.output
 
+    def test_stable_release_not_treated_as_up_to_date(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
+        with patch("vserve.version.check_pypi", return_value="0.5.2"), \
+             patch("shutil.which", return_value=None):
+            result = runner.invoke(app, ["update"])
+            assert result.exit_code == 0
+            assert "Already up to date" not in result.output
+            assert "New version available: 0.5.2" in result.output
+
     def test_upgrade_via_uv(self, monkeypatch):
         monkeypatch.setattr(V, "background_refresh", lambda: None)
         with patch("vserve.version.check_pypi", return_value="9.9.9"), \
              patch("shutil.which", return_value="/usr/bin/uv"), \
-             patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout="vserve v0.1.0\n")
+             patch("subprocess.run") as mock_run, \
+             patch("vserve.cli._refresh_banner") as mock_refresh:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="vserve v0.1.0\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
             result = runner.invoke(app, ["update"])
             assert result.exit_code == 0
             calls = [str(c) for c in mock_run.call_args_list]
             assert any("upgrade" in c for c in calls)
+            mock_refresh.assert_called_once()
+
+    def test_uv_upgrade_failure_exits_nonzero(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
+        with patch("vserve.version.check_pypi", return_value="9.9.9"), \
+             patch("shutil.which", return_value="/usr/bin/uv"), \
+             patch("subprocess.run") as mock_run, \
+             patch("vserve.cli._refresh_banner") as mock_refresh:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="vserve v0.1.0\n", stderr=""),
+                MagicMock(returncode=1, stdout="", stderr="boom"),
+            ]
+            result = runner.invoke(app, ["update"])
+            assert result.exit_code == 1
+            assert "uv upgrade failed" in result.output
+            mock_refresh.assert_not_called()
+
+    def test_uv_tool_list_failure_exits_nonzero(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
+        with patch("vserve.version.check_pypi", return_value="9.9.9"), \
+             patch("shutil.which", return_value="/usr/bin/uv"), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="broken uv")), \
+             patch("vserve.cli._refresh_banner") as mock_refresh:
+            result = runner.invoke(app, ["update"])
+            assert result.exit_code == 1
+            assert "uv inspection failed" in result.output
+            mock_refresh.assert_not_called()
+
+    def test_pip_upgrade_failure_exits_nonzero(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
+
+        def _which(name: str) -> str | None:
+            if name == "uv":
+                return None
+            if name in {"pip", "pip3"}:
+                return "/usr/bin/pip"
+            return None
+
+        with patch("vserve.version.check_pypi", return_value="9.9.9"), \
+             patch("shutil.which", side_effect=_which), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="fail")), \
+             patch("vserve.cli._refresh_banner") as mock_refresh:
+            result = runner.invoke(app, ["update"])
+            assert result.exit_code == 1
+            assert "pip install failed" in result.output
+            mock_refresh.assert_not_called()
 
     def test_no_package_manager(self, monkeypatch):
         monkeypatch.setattr(V, "background_refresh", lambda: None)

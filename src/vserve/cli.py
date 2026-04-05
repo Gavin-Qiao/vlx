@@ -164,7 +164,7 @@ def dashboard(ctx: typer.Context):
         gpu_line = "[dim]unavailable[/dim]"
 
     from vserve.backends import running_backend as _running_backend
-    from vserve.config import active_yaml_path, read_profile_yaml
+    from vserve.config import active_yaml_path, try_read_profile_yaml
 
     models = _all_models()
     probed = sum(
@@ -176,11 +176,14 @@ def dashboard(ctx: typer.Context):
     if rb is not None:
         active = active_yaml_path()
         if active.exists() and active.is_symlink():
-            cfg = read_profile_yaml(active)
+            cfg = try_read_profile_yaml(active)
             model_path = cfg.get("model", "?") if cfg else "?"
             model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
             port = cfg.get("port", 8888) if cfg else 8888
-            serving_line = f"[green]{model_name}[/green] at :{port} ({rb.display_name})"
+            if cfg:
+                serving_line = f"[green]{model_name}[/green] at :{port} ({rb.display_name})"
+            else:
+                serving_line = f"[yellow]config unreadable[/yellow] ({rb.display_name})"
         else:
             serving_line = f"[green]active[/green] ({rb.display_name})"
 
@@ -249,6 +252,16 @@ def update(
 
     from vserve.version import check_pypi, write_cache, _compare_versions
 
+    def _run_checked(cmd: list[str], label: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            console.print(f"[red]{label} failed.[/red]")
+            details = result.stderr.strip() or result.stdout.strip()
+            if details:
+                console.print(f"  {details}")
+            raise typer.Exit(1)
+        return result
+
     console.print(f"[dim]Current version: {__version__}[/dim]")
 
     if not nightly:
@@ -263,13 +276,19 @@ def update(
     uv = shutil.which("uv")
     if uv:
         result = subprocess.run([uv, "tool", "list"], capture_output=True, text=True)
+        if result.returncode != 0:
+            console.print("[red]uv inspection failed.[/red]")
+            details = result.stderr.strip() or result.stdout.strip()
+            if details:
+                console.print(f"  {details}")
+            raise typer.Exit(1)
         if "vserve" in result.stdout:
             if nightly:
                 console.print("[dim]Upgrading to latest pre-release via uv...[/dim]")
-                subprocess.run([uv, "tool", "upgrade", "vserve", "--prerelease", "allow"])
+                _run_checked([uv, "tool", "upgrade", "vserve", "--prerelease", "allow"], "uv upgrade")
             else:
                 console.print("[dim]Upgrading via uv...[/dim]")
-                subprocess.run([uv, "tool", "upgrade", "vserve"])
+                _run_checked([uv, "tool", "upgrade", "vserve"], "uv upgrade")
             _refresh_banner()
             return
 
@@ -277,10 +296,10 @@ def update(
     if pip:
         if nightly:
             console.print("[dim]Upgrading to latest pre-release via pip...[/dim]")
-            subprocess.run([pip, "install", "--upgrade", "--pre", "vserve"])
+            _run_checked([pip, "install", "--upgrade", "--pre", "vserve"], "pip install")
         else:
             console.print("[dim]Upgrading via pip...[/dim]")
-            subprocess.run([pip, "install", "--upgrade", "vserve"])
+            _run_checked([pip, "install", "--upgrade", "vserve"], "pip install")
         _refresh_banner()
         return
 
@@ -1194,11 +1213,12 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
             if not typer.confirm("Stop and restart?", default=False):
                 lock.release()
                 return
-            clear_session()
             try:
                 backend.stop()
             except RuntimeError as e:
                 console.print(f"[red]{e}[/red]")
+                console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
+                raise typer.Exit(1)
             time.sleep(2)
 
         ctx = cfg.get("max-model-len") or cfg.get("ctx-size", "?")
@@ -1643,7 +1663,6 @@ def stop():
         try:
             running_backend.stop()
         except RuntimeError as e:
-            clear_session()
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(1)
         clear_session()
@@ -1897,7 +1916,7 @@ def fan(
 def status():
     """Show current serving status."""
     from vserve.backends import _BACKENDS
-    from vserve.config import active_yaml_path, read_profile_yaml
+    from vserve.config import active_yaml_path, try_read_profile_yaml
 
     running_backend = None
     for b in _BACKENDS:
@@ -1916,6 +1935,7 @@ def status():
     import json as _json
     cfg = {}
     config_source = None
+    invalid_source = None
     if running_backend.name == "llamacpp":
         active_json = running_backend._active_config_path().with_suffix(".json")
         if active_json.exists():
@@ -1923,13 +1943,22 @@ def status():
                 cfg = _json.loads(active_json.read_text())
                 config_source = active_json
             except Exception:
-                pass
+                invalid_source = active_json
+                config_source = active_json
     if not cfg:
         active = active_yaml_path()
         if active.exists():
-            cfg = read_profile_yaml(active) or {}
             config_source = active.resolve() if active.is_symlink() else active
+            cfg_data = try_read_profile_yaml(active)
+            if cfg_data:
+                cfg = cfg_data
+            else:
+                invalid_source = config_source
     if not cfg:
+        if invalid_source is not None:
+            console.print(f"[bold green]{running_backend.display_name} is running[/bold green] (active config unreadable)")
+            console.print(f"  [dim]{invalid_source}[/dim]\n")
+            return
         console.print(f"[bold green]{running_backend.display_name} is running[/bold green] (no active config found)")
         return
 
@@ -2129,12 +2158,17 @@ def init():
     port = _discover_port(root)
     _ok(f"Port        {port}")
 
-    # ── Coolbits (fan control) ──
-    xorg_conf = _Path("/etc/X11/xorg.conf")
-    if xorg_conf.exists() and "Coolbits" in xorg_conf.read_text():
-        _ok("Coolbits    enabled (fan control available)")
-    else:
-        _warn("Coolbits    not configured (vserve fan requires it)")
+    # ── NVML fan control ──
+    try:
+        from vserve.gpu import get_fan_count
+
+        fan_count = get_fan_count()
+        if fan_count > 0:
+            _ok(f"Fan control {fan_count} fan(s) exposed via NVML (root required)")
+        else:
+            _warn("Fan control no controllable fans exposed via NVML")
+    except Exception:
+        _warn("Fan control NVML unavailable")
 
     # ── gum (interactive UI) ──
     if shutil.which("gum"):
@@ -2218,7 +2252,7 @@ def doctor():
     import socket
     from pathlib import Path
 
-    from vserve.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, read_profile_yaml, LOGS_DIR
+    from vserve.config import VLLM_BIN, VLLM_ROOT, active_yaml_path, try_read_profile_yaml, LOGS_DIR
     from vserve.backends import any_backend_running
 
     ok_count = 0
@@ -2368,12 +2402,15 @@ def doctor():
     if active.exists() and active.is_symlink():
         target = active.resolve()
         if target.exists():
-            cfg_data = read_profile_yaml(active) or {}
-            model_path = cfg_data.get("model", "")
-            if model_path and Path(model_path).exists():
-                _ok(f"active.yaml → {target.name}")
+            cfg_data = try_read_profile_yaml(active)
+            if cfg_data is None:
+                _warn(f"active.yaml unreadable: {target.name}")
             else:
-                _fail(f"active.yaml model path missing: {model_path}")
+                model_path = cfg_data.get("model", "")
+                if model_path and Path(model_path).exists():
+                    _ok(f"active.yaml → {target.name}")
+                else:
+                    _fail(f"active.yaml model path missing: {model_path}")
         else:
             _fail(f"active.yaml → broken symlink: {target}")
     elif active.exists():

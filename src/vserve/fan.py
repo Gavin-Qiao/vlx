@@ -125,9 +125,32 @@ def _get_gpu_temp() -> int:
 
 
 def _apply_fan(percent: int, handle: object) -> None:
-    """Set fan speed via NVML."""
+    """Set fan speed via NVML for all exposed fans."""
     import pynvml
-    pynvml.nvmlDeviceSetFanSpeed_v2(handle, 0, percent)  # type: ignore[arg-type]
+    for i in range(pynvml.nvmlDeviceGetNumFans(handle)):
+        pynvml.nvmlDeviceSetFanSpeed_v2(handle, i, percent)  # type: ignore[arg-type]
+
+
+def _set_manual_control(handle: object) -> None:
+    """Switch all exposed fans to manual control."""
+    import pynvml
+    for i in range(pynvml.nvmlDeviceGetNumFans(handle)):
+        pynvml.nvmlDeviceSetFanControlPolicy(handle, i, 1)  # type: ignore[arg-type]
+
+
+def _restore_auto_control(handle: object) -> None:
+    """Restore default fan control policy for all exposed fans."""
+    import pynvml
+
+    restore_default = getattr(pynvml, "nvmlDeviceSetDefaultFanSpeed_v2", None)
+    for i in range(pynvml.nvmlDeviceGetNumFans(handle)):
+        if restore_default is not None:
+            try:
+                restore_default(handle, i)  # type: ignore[misc]
+                continue
+            except Exception:
+                pass
+        pynvml.nvmlDeviceSetFanControlPolicy(handle, i, 0)  # type: ignore[arg-type]
 
 
 def _setup_logging() -> None:
@@ -178,7 +201,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
 
     try:
         # Enable manual fan control via NVML — no X11/Xvfb needed
-        pynvml.nvmlDeviceSetFanControlPolicy(handle, 0, 1)  # 1 = manual
+        _set_manual_control(handle)
 
         current_speed = -1
         consecutive_failures = 0
@@ -243,9 +266,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
         # Restore auto fan control via NVML — best effort
         restored = False
         try:
-            num_fans = pynvml.nvmlDeviceGetNumFans(handle)
-            for i in range(num_fans):
-                pynvml.nvmlDeviceSetFanControlPolicy(handle, i, 0)  # 0 = auto
+            _restore_auto_control(handle)
             restored = True
         except Exception:
             _log.exception("Failed to restore auto fan control")
@@ -293,7 +314,7 @@ def run_fixed_daemon(speed: int) -> None:
     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
     try:
-        pynvml.nvmlDeviceSetFanControlPolicy(handle, 0, 1)  # manual
+        _set_manual_control(handle)
         _apply_fan(speed, handle)
         _log.info("Fan fixed at %d%%", speed)
 
@@ -306,9 +327,7 @@ def run_fixed_daemon(speed: int) -> None:
     finally:
         restored = False
         try:
-            num_fans = pynvml.nvmlDeviceGetNumFans(handle)
-            for i in range(num_fans):
-                pynvml.nvmlDeviceSetFanControlPolicy(handle, i, 0)
+            _restore_auto_control(handle)
             restored = True
         except Exception:
             _log.exception("Failed to restore auto fan control")

@@ -16,6 +16,7 @@ from vserve.config import (
     read_limits,
     write_limits,
     read_profile_yaml,
+    try_read_profile_yaml,
     write_profile_yaml,
 )
 
@@ -109,6 +110,12 @@ def test_write_and_read_profile_yaml(tmp_path):
     assert "# test profile" in content
     loaded = read_profile_yaml(path)
     assert loaded["port"] == 8888
+
+
+def test_try_read_profile_yaml_corrupt(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text("not: valid: yaml: {{{{")
+    assert try_read_profile_yaml(path) is None
 
 
 # --- Discovery tests ---

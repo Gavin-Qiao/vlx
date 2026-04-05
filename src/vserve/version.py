@@ -14,6 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import NamedTuple
 
+from packaging.version import InvalidVersion, Version
+
 from vserve import __version__
 
 CACHE_DIR = Path.home() / ".cache" / "vserve"
@@ -103,16 +105,10 @@ def background_refresh() -> None:
 
 
 def _compare_versions(a: str, b: str) -> int:
-    """Compare version strings. Returns >0 if a > b, 0 if equal, <0 if a < b.
-
-    Strips pre-release suffixes (a1, b2, rc1) before comparing numeric parts.
-    """
-    import re
+    """Compare version strings using PEP 440 ordering."""
     try:
-        pa = tuple(int(x) for x in re.split(r"[^0-9]+", re.sub(r"(a|b|rc)\d*$", "", str(a))) if x)
-        pb = tuple(int(x) for x in re.split(r"[^0-9]+", re.sub(r"(a|b|rc)\d*$", "", str(b))) if x)
-        if not pa or not pb:
-            return 0
-        return (pa > pb) - (pa < pb)
-    except (ValueError, AttributeError, TypeError):
+        va = Version(str(a))
+        vb = Version(str(b))
+    except (InvalidVersion, TypeError, ValueError):
         return 0
+    return (va > vb) - (va < vb)

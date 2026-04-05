@@ -91,6 +91,17 @@ def get_fan_speed() -> int:
         pynvml.nvmlShutdown()
 
 
+def get_fan_count() -> int:
+    """Return the number of fans exposed by NVML for the primary GPU."""
+    import pynvml
+    pynvml.nvmlInit()
+    try:
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return pynvml.nvmlDeviceGetNumFans(h)
+    finally:
+        pynvml.nvmlShutdown()
+
+
 def set_fan_speed(percent: int) -> None:
     """Set GPU fan to a fixed percentage (30-100) via NVML. Requires root."""
     if not 30 <= percent <= 100:
@@ -100,7 +111,8 @@ def set_fan_speed(percent: int) -> None:
     pynvml.nvmlInit()
     try:
         h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        pynvml.nvmlDeviceSetFanSpeed_v2(h, 0, percent)
+        for i in range(pynvml.nvmlDeviceGetNumFans(h)):
+            pynvml.nvmlDeviceSetFanSpeed_v2(h, i, percent)
     finally:
         pynvml.nvmlShutdown()
 
@@ -111,8 +123,14 @@ def restore_fan_auto() -> None:
     pynvml.nvmlInit()
     try:
         h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        num_fans = pynvml.nvmlDeviceGetNumFans(h)
-        for i in range(num_fans):
+        restore_default = getattr(pynvml, "nvmlDeviceSetDefaultFanSpeed_v2", None)
+        for i in range(pynvml.nvmlDeviceGetNumFans(h)):
+            if restore_default is not None:
+                try:
+                    restore_default(h, i)
+                    continue
+                except Exception:
+                    pass
             pynvml.nvmlDeviceSetFanControlPolicy(h, i, 0)
     finally:
         pynvml.nvmlShutdown()
