@@ -169,11 +169,24 @@ class TestPickVariants:
         assert len(result) == 1
         assert result[0].label == "q4"
 
-    def test_pick_variants_empty_on_cancel(self, mocker):
+    def test_pick_variants_single_auto_selects(self, mocker):
+        """Single variant is auto-selected without a picker."""
         from vserve.cli import _pick_variants
         from vserve.variants import Variant
 
         variants = [Variant(label="fp8", files={"m.safetensors": 1000})]
+        result = _pick_variants(variants)
+        assert len(result) == 1
+        assert result[0].label == "fp8"
+
+    def test_pick_variants_empty_on_cancel(self, mocker):
+        from vserve.cli import _pick_variants
+        from vserve.variants import Variant
+
+        variants = [
+            Variant(label="fp8", files={"m.safetensors": 1000}),
+            Variant(label="q4", files={"m.gguf": 500}),
+        ]
         mocker.patch("vserve.cli._pick_many", return_value=[])
         result = _pick_variants(variants)
         assert result == []

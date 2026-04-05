@@ -240,7 +240,9 @@ def version():
 
 
 @app.command()
-def update():
+def update(
+    nightly: bool = typer.Option(False, "--nightly", help="Install latest pre-release version"),
+):
     """Update vserve to the latest version."""
     import shutil
     import subprocess
@@ -249,27 +251,36 @@ def update():
 
     console.print(f"[dim]Current version: {__version__}[/dim]")
 
-    latest = check_pypi()
-    if latest:
-        write_cache(latest)
-        if _compare_versions(latest, __version__) <= 0:
-            console.print("[green]Already up to date.[/green]")
-            return
-        console.print(f"[yellow]New version available: {latest}[/yellow]\n")
+    if not nightly:
+        latest = check_pypi()
+        if latest:
+            write_cache(latest)
+            if _compare_versions(latest, __version__) <= 0:
+                console.print("[green]Already up to date.[/green]")
+                return
+            console.print(f"[yellow]New version available: {latest}[/yellow]\n")
 
     uv = shutil.which("uv")
     if uv:
         result = subprocess.run([uv, "tool", "list"], capture_output=True, text=True)
         if "vserve" in result.stdout:
-            console.print("[dim]Upgrading via uv...[/dim]")
-            subprocess.run([uv, "tool", "upgrade", "vserve"])
+            if nightly:
+                console.print("[dim]Upgrading to latest pre-release via uv...[/dim]")
+                subprocess.run([uv, "tool", "upgrade", "vserve", "--prereleases", "allow"])
+            else:
+                console.print("[dim]Upgrading via uv...[/dim]")
+                subprocess.run([uv, "tool", "upgrade", "vserve"])
             _refresh_banner()
             return
 
     pip = shutil.which("pip") or shutil.which("pip3")
     if pip:
-        console.print("[dim]Upgrading via pip...[/dim]")
-        subprocess.run([pip, "install", "--upgrade", "vserve"])
+        if nightly:
+            console.print("[dim]Upgrading to latest pre-release via pip...[/dim]")
+            subprocess.run([pip, "install", "--upgrade", "--pre", "vserve"])
+        else:
+            console.print("[dim]Upgrading via pip...[/dim]")
+            subprocess.run([pip, "install", "--upgrade", "vserve"])
         _refresh_banner()
         return
 
@@ -539,9 +550,9 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
         _restore_terminal()
         if r.returncode != 0 or not r.stdout.strip():
-            return []
-        selected_lines = r.stdout.strip().split("\n")
-        return [i for i, item in enumerate(items) if item in selected_lines]
+            return []  # cancelled or nothing selected → back
+        selected_lines = {ln.strip() for ln in r.stdout.strip().split("\n")}
+        return [i for i, item in enumerate(items) if item.strip() in selected_lines]
 
     try:
         from simple_term_menu import TerminalMenu
@@ -554,7 +565,7 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
             multi_select_cursor_style=("fg_green", "bold"),
             menu_highlight_style=("standout",),
             cycle_cursor=True,
-            status_bar="  ↑↓ navigate · space toggle · enter confirm · q cancel",
+            status_bar="  ↑↓ navigate · x/space toggle · enter confirm · q cancel",
             status_bar_style=("fg_gray",),
         )
         result = menu.show()
@@ -640,21 +651,34 @@ def add(model_id: str = typer.Argument(None, help="HuggingFace model ID (e.g. Qw
 
         idx = _pick(lines, title=f"Results for '{query}':")
         if idx is None:
+            console.clear()
             query = ""
             results = []
             continue
 
-        if _download_model(results[idx].id, models_dir, snapshot_download, api):
+        downloaded = _download_model(results[idx].id, models_dir, snapshot_download, api)
+        if not downloaded:
+            console.clear()
+            continue  # backed out of variant picker — re-show results
+        # Offer to download another
+        if not typer.confirm("\n  Download another model?", default=False):
             return
-        # User backed out of variant picker — re-show same results
-        continue
+        console.clear()
+        query = ""
+        results = []
 
 
 def _pick_variants(variants: list) -> list:
     """Interactive variant selection. Returns list of selected Variant objects."""
     from vserve.variants import format_variant_line
+
+    # Single variant — auto-select, no picker needed
+    if len(variants) == 1:
+        console.print(f"  {format_variant_line(variants[0], index=1)}")
+        return variants
+
     lines = [format_variant_line(v, index=i) for i, v in enumerate(variants, 1)]
-    indices = _pick_many(lines, title="Select variant(s) — space to toggle, enter to confirm:")
+    indices = _pick_many(lines, title="Select variant(s) — x/space to toggle, enter to confirm:")
     return [variants[i] for i in indices]
 
 
@@ -702,6 +726,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     # Selection (variants shown inside _pick_variants via _pick_many)
     selected_variants = _pick_variants(variants)
     if not selected_variants:
+        console.clear()
         return False  # user backed out — navigate back
 
     # Confirmation

@@ -158,7 +158,13 @@ _sec_update=""
 if [ -f "$_update_cache" ]; then
     _uc_current="$(grep -o '"current" *: *"[^"]*"' "$_update_cache" | sed 's/.*: *"//;s/"//')"
     _uc_latest="$(grep -o '"latest" *: *"[^"]*"' "$_update_cache" | sed 's/.*: *"//;s/"//')"
-    if [ -n "$_uc_current" ] && [ -n "$_uc_latest" ] && [ "$_uc_current" != "$_uc_latest" ]; then
+    # Compare version tuples (strip pre-release suffixes like a1, b2, rc1)
+    _ver_strip() { echo "$1" | sed 's/[ab].*$//; s/rc.*$//'; }
+    _ver_gt() {
+        # Returns 0 (true) if $1 > $2 using sort -V
+        [ "$1" != "$2" ] && [ "$(printf '%s\n%s' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+    }
+    if [ -n "$_uc_current" ] && [ -n "$_uc_latest" ] && _ver_gt "$(_ver_strip "$_uc_latest")" "$(_ver_strip "$_uc_current")"; then
         _sec_update="$(gum join --vertical \
             "" \
             "$(gum join --horizontal \
@@ -176,7 +182,7 @@ _body="$(gum join --vertical \
 
 gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2" "$_body"
 
-unset -f _lbl _mkbar
+unset -f _lbl _mkbar _ver_strip _ver_gt
 unset _vserve_cfg _vllm_root _llamacpp_root _svc_name _port
 unset _s _m _mc _lc_mc _active _active_backend _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
