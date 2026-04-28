@@ -306,7 +306,7 @@ class TestUpdateCommand:
              patch("vserve.cli._refresh_banner") as mock_refresh:
             result = runner.invoke(app, ["update", "--nightly"])
             assert result.exit_code == 0
-            assert "--pre" in mock_run.call_args.args[0]
+            assert any("--pre" in call.args[0] for call in mock_run.call_args_list)
             mock_refresh.assert_called_once()
 
     def test_uv_upgrade_failure_exits_nonzero(self, monkeypatch):

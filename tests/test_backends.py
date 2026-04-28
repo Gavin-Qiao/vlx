@@ -150,10 +150,10 @@ class TestVllmBackend:
         cfg_path = tmp_path / "test.yaml"
         cfg_path.write_text("model: test\n")
         b.start(cfg_path)
-        mock_start.assert_called_once_with(cfg_path)
+        mock_start.assert_called_once_with(cfg_path, non_interactive=False)
 
         b.stop()
-        mock_stop.assert_called_once()
+        mock_stop.assert_called_once_with(non_interactive=False)
 
         assert b.is_running() is True
 
@@ -307,6 +307,23 @@ class TestVllmBackend:
 
         with pytest.raises(RuntimeError, match="Could not inspect installed vLLM tool parsers"):
             b.build_config(m, choices)
+
+    def test_available_parsers_use_configured_runtime_python(self, mocker, tmp_path):
+        b = VllmBackend()
+        runtime_python = tmp_path / "venv" / "bin" / "python"
+        mocker.patch("vserve.config.cfg", return_value=Mock(vllm_python=runtime_python))
+        run = mocker.patch(
+            "subprocess.run",
+            return_value=Mock(
+                returncode=0,
+                stdout='{"tool_parsers": ["hermes"], "reasoning_parsers": ["qwen3"]}',
+                stderr="",
+            ),
+        )
+
+        assert b.available_tool_parsers() == {"hermes"}
+        assert b.available_reasoning_parsers() == {"qwen3"}
+        assert run.call_args.args[0][0] == str(runtime_python)
 
     def test_find_entrypoint_missing(self, mocker):
         b = VllmBackend()

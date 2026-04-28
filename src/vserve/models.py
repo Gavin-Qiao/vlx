@@ -50,6 +50,26 @@ QUANT_FLAGS = {
 }
 
 
+def _validate_index_shards(model_dir: Path) -> None:
+    for index_path in sorted(model_dir.glob("*.index*.json")):
+        if not ("safetensors.index" in index_path.name or "bin.index" in index_path.name):
+            continue
+        try:
+            data = json.loads(index_path.read_text())
+        except Exception as exc:
+            raise ValueError(f"invalid weight index {index_path.name}: {exc}") from None
+        weight_map = data.get("weight_map") if isinstance(data, dict) else None
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"invalid weight index {index_path.name}: missing weight_map")
+        missing = sorted({
+            str(shard)
+            for shard in weight_map.values()
+            if not (index_path.parent / str(shard)).exists()
+        })
+        if missing:
+            raise ValueError(f"{model_dir} missing shard(s) referenced by {index_path.name}: {', '.join(missing)}")
+
+
 def quant_flag(method: str | None) -> str:
     if method is None:
         return ""
@@ -84,6 +104,7 @@ def detect_model(model_dir: Path) -> ModelInfo:
 
     with open(config_path) as f:
         config = json.load(f)
+    _validate_index_shards(model_dir)
 
     text_config = config.get("text_config", {})
 

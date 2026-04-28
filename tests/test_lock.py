@@ -72,6 +72,32 @@ def test_release_keeps_lock_file_stable(tmp_path):
         next_lock.release()
 
 
+def test_lock_refuses_symlink_file_without_clobbering_target(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n")
+    lock_file = tmp_path / "vserve-unsafe.lock"
+    lock_file.symlink_to(victim)
+
+    with pytest.raises(PermissionError, match="Refusing"):
+        VserveLock("unsafe", "test").acquire()
+
+    assert victim.read_text() == "keep me\n"
+
+
+def test_session_write_refuses_symlink_without_clobbering_target(tmp_path, monkeypatch):
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
+    monkeypatch.setenv("USER", "alice")
+    victim = tmp_path / "victim-session.txt"
+    victim.write_text("do not touch\n")
+    session_path = tmp_path / "vserve-session-alice.json"
+    session_path.symlink_to(victim)
+
+    with pytest.raises(PermissionError, match="Refusing"):
+        write_session("model")
+
+    assert victim.read_text() == "do not touch\n"
+
+
 # ── Contention ───────────────────────────────────────
 
 def test_second_acquire_raises(tmp_path):

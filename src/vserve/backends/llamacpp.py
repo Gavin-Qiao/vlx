@@ -267,6 +267,8 @@ class LlamaCppBackend:
 
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
         """Build llama-server JSON config."""
+        from vserve.config import cfg as vserve_cfg
+
         selected = self._select_gguf_model_files(model.path)
         if selected is None:
             raise ValueError(f"No GGUF files in {model.path}")
@@ -280,6 +282,7 @@ class LlamaCppBackend:
             "n_gpu_layers": choices["n_gpu_layers"],
             "parallel": choices.get("parallel", 1),
             "flash_attn": True,
+            "gpu_index": int(getattr(vserve_cfg(), "gpu_index", 0) or 0),
         }
         if choices.get("embedding"):
             cfg["embedding"] = True
@@ -293,7 +296,7 @@ class LlamaCppBackend:
         """llama.cpp quant is baked into GGUF — no CLI flag needed."""
         return ""
 
-    def start(self, config_path: Path) -> None:
+    def start(self, config_path: Path, *, non_interactive: bool = False) -> None:
         """Write active launch script from JSON config and start systemd service."""
         import json
 
@@ -333,6 +336,7 @@ class LlamaCppBackend:
         # issues — any user in the llm group can unlink + recreate symlinks
         # in the group-writable configs dir.
         import shlex
+        from vserve.config import cfg as vserve_cfg
         active = self._active_config_path()
         active.parent.mkdir(parents=True, exist_ok=True)
         json_link = active.with_suffix(".json")
@@ -341,7 +345,16 @@ class LlamaCppBackend:
 
         # Per-model script in configs/models/
         model_script = config_path.with_suffix(".sh")
-        script = "#!/bin/bash\nexec " + shlex.join(args) + "\n"
+        gpu_index_raw: object = cfg.get("gpu_index")
+        if gpu_index_raw is None:
+            gpu_index_raw = getattr(vserve_cfg(), "gpu_index", 0)
+        try:
+            gpu_index = int(str(gpu_index_raw))
+        except (TypeError, ValueError):
+            gpu_index = 0
+        script = "#!/bin/bash\n"
+        script += f"export CUDA_VISIBLE_DEVICES={gpu_index}\n"
+        script += "exec " + shlex.join(args) + "\n"
         model_script.write_text(script)
         model_script.chmod(0o755)
 
@@ -356,8 +369,11 @@ class LlamaCppBackend:
         json_link.unlink(missing_ok=True)
         json_link.symlink_to(model_json.resolve())
 
+        command = ["sudo", "systemctl", "start", self.service_name]
+        if non_interactive:
+            command.insert(1, "-n")
         result = subprocess.run(
-            ["sudo", "systemctl", "start", self.service_name],
+            command,
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -370,9 +386,12 @@ class LlamaCppBackend:
             self._write_failed_manifest(config_path, result.stderr.strip() or result.stdout.strip())
             raise RuntimeError(f"systemctl start {self.service_name} failed: {result.stderr}")
 
-    def stop(self) -> None:
+    def stop(self, *, non_interactive: bool = False) -> None:
+        command = ["sudo", "systemctl", "stop", self.service_name]
+        if non_interactive:
+            command.insert(1, "-n")
         result = subprocess.run(
-            ["sudo", "systemctl", "stop", self.service_name],
+            command,
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:

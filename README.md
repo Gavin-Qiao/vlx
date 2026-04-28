@@ -9,7 +9,7 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![vLLM 0.20.x](https://img.shields.io/badge/vLLM-0.20.x-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-428%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-475%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
@@ -129,7 +129,7 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 
 **vserve** manages the full lifecycle of serving LLMs on a GPU workstation:
 
-- **Download** — search HuggingFace, see available weight variants (FP8, NVFP4, BF16, GGUF) with sizes, download only what you need
+- **Download** — search HuggingFace, see available weight variants (FP8, NVFP4, BF16, GGUF) with sizes, download only one backend format at a time, and materialize each runnable variant into its own model root
 - **Auto-tune** — calculate exactly what context lengths and concurrency your GPU can handle, based on model architecture and available VRAM
 - **Tool calling** — auto-detects the correct parser from the model's chat template (vLLM) or uses `--jinja` (llama.cpp)
 - **Run/Stop** — interactive config wizard, systemd service management, health check with timeout
@@ -169,7 +169,9 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 
 Model-taking commands support **fuzzy matching** — `vserve run qwen fp8` finds the right model.
 
-Profile rules: profile names resolve inside configured vserve profile roots; explicit `--profile` paths are accepted for `run` and infer backend from YAML/JSON when possible. `profile rm` never deletes arbitrary external paths, even with `--force`.
+Profile rules: names saved with `--save-profile` must match `[A-Za-z0-9._-]+` and cannot be `.`, `..`, or include path separators. Profile names resolve inside configured vserve profile roots. Explicit external `--profile` paths are accepted only by `run` and infer backend from YAML/JSON when possible. `profile show` and `profile rm` never read or delete arbitrary external paths, even with `--force`.
+
+Automation note: `run --yes` is fully non-interactive. If it needs to stop or start systemd services it uses non-prompting service operations; configure passwordless service control for the vserve operator or run without `--yes`.
 
 ---
 
@@ -248,6 +250,8 @@ backends:
 
 Legacy top-level `vllm_root`, `service_name`, `llamacpp_root`, and GPU memory keys still load, but newly saved config uses the backend-indexed schema above.
 
+`gpu.index` is part of runtime truth, not only a tuning hint. vserve records it in active manifests and tuning fingerprints. llama.cpp launch scripts export `CUDA_VISIBLE_DEVICES=<index>`. vLLM writes `configs/.env` with the same value and `doctor` expects the systemd unit to load that environment file.
+
 ---
 
 ## Directory Layout
@@ -320,7 +324,7 @@ The registry auto-detects the right backend from the model format. Runtime check
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 428 tests
+uv run pytest tests/              # 475 tests
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
 ```

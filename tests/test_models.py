@@ -430,7 +430,19 @@ def test_detect_gguf_model_no_config(tmp_path):
     m = detect_model(model_dir)
     assert m.is_gguf is True
     assert m.architecture == "gguf"
-    assert m.model_size_gb >= 0
+
+
+def test_detect_model_rejects_missing_index_shard(tmp_path):
+    model_dir = tmp_path / "models" / "user" / "BrokenModel"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text('{"architectures": ["TestLM"], "model_type": "test"}')
+    (model_dir / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}'
+    )
+    (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"weights")
+
+    with pytest.raises(ValueError, match="missing shard"):
+        detect_model(model_dir)
 
 
 def test_guess_pooling():

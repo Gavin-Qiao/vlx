@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GpuInfo:
+    index: int
     name: str
     vram_total_mb: int
     vram_used_mb: int
@@ -77,6 +78,7 @@ def get_gpu_info(config: object | None = None) -> GpuInfo:
     driver = parts[4]
     cuda = _get_cuda_version()
     return GpuInfo(
+        index=gpu_index,
         name=name,
         vram_total_mb=vram_total,
         vram_used_mb=vram_used,
@@ -91,7 +93,7 @@ def compute_gpu_memory_utilization(
 ) -> float:
     """Reserve overhead for CUDA context, activations, CUDA graphs, and sampler."""
     if vram_total_gb <= 0:
-        return 0.90
+        raise ValueError(f"VRAM total must be positive to compute GPU memory utilization, got {vram_total_gb:.3f} GB")
     return (vram_total_gb - overhead_gb) / vram_total_gb
 
 
@@ -118,7 +120,16 @@ def resolve_gpu_memory_utilization(
             compute_gpu_memory_utilization(vram_total_gb, float(configured_overhead)),
             "gpu.overhead_gb",
         )
-    return max(0.5, min(0.99, compute_gpu_memory_utilization(vram_total_gb)))
+    return _validate(compute_gpu_memory_utilization(vram_total_gb), "gpu.overhead_gb")
+
+
+def _configured_gpu_index() -> int:
+    try:
+        from vserve.config import cfg
+
+        return int(getattr(cfg(), "gpu_index", 0) or 0)
+    except Exception:
+        return 0
 
 
 def get_fan_speed() -> int:
@@ -126,7 +137,7 @@ def get_fan_speed() -> int:
     import pynvml  # type: ignore[import-untyped]
     pynvml.nvmlInit()
     try:
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        h = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
         return pynvml.nvmlDeviceGetFanSpeed_v2(h, 0)
     finally:
         pynvml.nvmlShutdown()
@@ -137,7 +148,7 @@ def get_fan_count() -> int:
     import pynvml
     pynvml.nvmlInit()
     try:
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        h = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
         return pynvml.nvmlDeviceGetNumFans(h)
     finally:
         pynvml.nvmlShutdown()
@@ -151,7 +162,7 @@ def set_fan_speed(percent: int) -> None:
     import pynvml
     pynvml.nvmlInit()
     try:
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        h = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
         for i in range(pynvml.nvmlDeviceGetNumFans(h)):
             pynvml.nvmlDeviceSetFanSpeed_v2(h, i, percent)
     finally:
@@ -163,7 +174,7 @@ def restore_fan_auto() -> None:
     import pynvml
     pynvml.nvmlInit()
     try:
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        h = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
         restore_default = getattr(pynvml, "nvmlDeviceSetDefaultFanSpeed_v2", None)
         for i in range(pynvml.nvmlDeviceGetNumFans(h)):
             if restore_default is not None:

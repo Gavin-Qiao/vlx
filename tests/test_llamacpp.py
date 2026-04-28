@@ -500,7 +500,7 @@ class TestLlamaCppLaunchScript:
         b.start(cfg_path)
 
         script = active.read_text()
-        assert script.startswith("#!/bin/bash\nexec ")
+        assert script.startswith("#!/bin/bash\nexport CUDA_VISIBLE_DEVICES=0\nexec ")
         assert "-m /opt/llama-cpp/models/test/model.gguf" in script
         assert "-c 8192" in script
         assert "-ngl 32" in script
@@ -509,6 +509,32 @@ class TestLlamaCppLaunchScript:
         assert "--jinja" in script
         assert "--host 0.0.0.0" in script
         assert "--port 8888" in script
+
+    def test_script_exports_configured_gpu_index(self, mocker, tmp_path):
+        import json
+        b = LlamaCppBackend()
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        mocker.patch("vserve.config.cfg", return_value=Mock(gpu_index=2))
+
+        active = tmp_path / "configs" / "active.sh"
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({
+            "model": "/m/model.gguf",
+            "host": "0.0.0.0",
+            "port": 8888,
+            "ctx_size": 4096,
+            "n_gpu_layers": 10,
+            "parallel": 1,
+        }))
+
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "export CUDA_VISIBLE_DEVICES=2\n" in script
 
     def test_script_quoting_spaces(self, mocker, tmp_path):
         """Model paths with spaces are properly quoted in script."""

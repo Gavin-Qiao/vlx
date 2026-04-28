@@ -113,6 +113,8 @@ vserve cache clean --all --yes
 
 For automation, `vserve run --yes` never prompts and refuses to replace a running backend unless you pass `--replace`.
 
+When `--yes` needs systemd lifecycle changes, vserve uses non-prompting service calls. If sudo would ask for a password, automation fails fast; either configure a narrow passwordless rule for the backend service operations or run interactively.
+
 ### torch.compile cache
 
 vLLM also uses `torch.compile` which has its own cache at `$VLLM_ROOT/.cache/vllm/torch_compile_cache/`. Same ownership considerations apply.
@@ -134,6 +136,12 @@ python -c "import torch; print(torch.version.cuda)"
 ### ProtectSystem=strict breaks JIT
 
 Do NOT use `ProtectSystem=strict` in the vLLM systemd unit — it makes `/usr` read-only, preventing nvcc from writing temporary files during JIT compilation. The `gpu-fan.service` can use it (fan control doesn't need JIT), but the main `vllm.service` cannot.
+
+## Configured GPU Index
+
+Set `gpu.index` in `~/.config/vserve/config.yaml` when the serving GPU is not device 0. vserve uses that index for GPU probing, tuning fingerprints, active manifests, fan helpers, and launch-time CUDA visibility.
+
+For llama.cpp, generated `active.sh` exports `CUDA_VISIBLE_DEVICES=<index>`. For vLLM, vserve writes `$VLLM_ROOT/configs/.env` with the same value. The vLLM systemd unit must load that file with `EnvironmentFile=.../configs/.env`; otherwise `vserve doctor` reports a failure and startup refuses to pretend the configured GPU is enforced.
 
 ## Driver Management
 

@@ -219,6 +219,27 @@ def test_incomplete_split_gguf_shards_are_not_offered():
     assert "Model-Q4_K_M-00001-of-00002.gguf" not in shared
 
 
+def test_incomplete_indexed_safetensors_variant_is_not_offered():
+    files = {
+        "model.safetensors.index.json": 50_000,
+        "model-00001-of-00002.safetensors": 1_000_000,
+    }
+    index_contents = {
+        "model.safetensors.index.json": {
+            "weight_map": {
+                "a": "model-00001-of-00002.safetensors",
+                "b": "model-00002-of-00002.safetensors",
+            },
+        },
+    }
+
+    variants, shared = discover_variants(files, index_contents)
+
+    assert variants == []
+    assert "model-00001-of-00002.safetensors" not in shared
+    assert "model.safetensors.index.json" not in shared
+
+
 def test_gguf_iq_quant():
     """GGUF with IQ quant naming."""
     files = {"model-IQ4_XS.gguf": 3_000_000_000}

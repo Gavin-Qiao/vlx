@@ -10,12 +10,15 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import errno
+import stat
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 LOCK_DIR = Path("/run/lock/vserve")
 SESSION_PATH = LOCK_DIR / "vserve-session.json"
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 @dataclass
@@ -64,33 +67,21 @@ class VserveLock:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
-        # mkdir mode is masked by umask, and exist_ok skips existing dirs.
-        # Ensure sticky + world-writable so any user can create lock files.
-        try:
-            os.chmod(str(LOCK_DIR), 0o1777)
-        except PermissionError:
-            pass
-        # A prior sudo run may have left a root-owned lock file.
-        # Try to fix permissions, or delete and recreate if stale.
+        _ensure_lock_dir()
         if self._path.exists():
+            _raise_if_unsafe_file(self._path)
             try:
                 os.chmod(str(self._path), 0o666)
             except PermissionError:
-                # Can't chmod — check if the lock is actually held
                 info = _read_lock_info(self._path)
                 if info and _pid_alive(info.pid):
                     raise LockHeld(self.name, info)
-                # Stale lock from another user — try to remove
-                try:
-                    self._path.unlink()
-                except PermissionError:
-                    raise PermissionError(
-                        f"Cannot acquire lock: {self._path} is owned by another user. "
-                        f"Run: sudo rm {self._path}"
-                    )
+                raise PermissionError(
+                    f"Cannot acquire lock: {self._path} is owned by another user. "
+                    f"Run: sudo chmod 666 {self._path}"
+                )
         try:
-            self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT, 0o666)
+            self._fd = _open_regular_file(self._path, os.O_RDWR | os.O_CREAT, 0o666)
         except PermissionError:
             raise PermissionError(
                 f"Cannot create lock file: {self._path}\n"
@@ -148,12 +139,73 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _read_lock_info(path: Path) -> LockInfo | None:
+def _ensure_lock_dir() -> None:
+    LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
     try:
-        data = json.loads(path.read_text().strip())
+        os.chmod(str(LOCK_DIR), 0o1777)
+    except PermissionError:
+        pass
+
+
+def _raise_if_unsafe_file(path: Path) -> None:
+    try:
+        st = os.lstat(str(path))
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise PermissionError(f"Refusing to use symlink as vserve state file: {path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise PermissionError(f"Refusing to use non-regular vserve state file: {path}")
+
+
+def _open_regular_file(path: Path, flags: int, mode: int = 0o666) -> int:
+    _raise_if_unsafe_file(path)
+    try:
+        fd = os.open(str(path), flags | _O_NOFOLLOW, mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PermissionError(f"Refusing to use symlink as vserve state file: {path}") from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Refusing to use non-regular vserve state file: {path}")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _unlink_regular_state_file(path: Path) -> bool:
+    try:
+        _raise_if_unsafe_file(path)
+    except PermissionError:
+        raise
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return True
+
+
+def _read_lock_info(path: Path) -> LockInfo | None:
+    fd: int | None = None
+    try:
+        fd = _open_regular_file(path, os.O_RDONLY)
+        with os.fdopen(fd) as f:
+            fd = None
+            data = json.loads(f.read().strip())
         return LockInfo(**data)
     except Exception:
         return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def wait_for_release(name: str, timeout: float = 5.0) -> bool:
@@ -260,8 +312,11 @@ def _session_candidates() -> list[Path]:
 
 
 def _read_session_file(path: Path) -> SessionInfo | None:
+    fd: int | None = None
     try:
-        with open(path) as f:
+        fd = _open_regular_file(path, os.O_RDONLY)
+        with os.fdopen(fd) as f:
+            fd = None
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
                 text = f.read().strip()
@@ -277,15 +332,17 @@ def _read_session_file(path: Path) -> SessionInfo | None:
         import sys
         print(f"[vserve] warning: corrupt session file {path}", file=sys.stderr)
         return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def write_session(model: str) -> None:
     """Record current user as the advisory GPU session owner."""
-    LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
-    try:
-        os.chmod(str(LOCK_DIR), 0o1777)
-    except PermissionError:
-        pass
+    _ensure_lock_dir()
     user = os.environ.get("USER", "?")
     info = SessionInfo(
         user=user,
@@ -294,7 +351,7 @@ def write_session(model: str) -> None:
     )
     payload = json.dumps(asdict(info)).encode() + b"\n"
     session_path = _session_path(user)
-    fd = os.open(str(session_path), os.O_RDWR | os.O_CREAT, 0o644)
+    fd = _open_regular_file(session_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         os.ftruncate(fd, 0)
@@ -323,15 +380,15 @@ def read_session() -> SessionInfo | None:
 def clear_session() -> None:
     session_path = _session_path()
     try:
-        session_path.unlink(missing_ok=True)
-        return
+        if _unlink_regular_state_file(session_path):
+            return
     except PermissionError:
-        pass
+        raise
     except OSError:
         return
 
     try:
-        fd = os.open(str(session_path), os.O_WRONLY)
+        fd = _open_regular_file(session_path, os.O_WRONLY)
     except OSError:
         return
     try:
@@ -350,15 +407,15 @@ def clear_session() -> None:
 def _clear_all_session_markers() -> None:
     for path in _session_candidates():
         try:
-            path.unlink(missing_ok=True)
-            continue
+            if _unlink_regular_state_file(path):
+                continue
         except PermissionError:
-            pass
+            continue
         except OSError:
             continue
 
         try:
-            fd = os.open(str(path), os.O_WRONLY)
+            fd = _open_regular_file(path, os.O_WRONLY)
         except OSError:
             continue
         try:

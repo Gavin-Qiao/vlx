@@ -40,6 +40,7 @@ def test_parse_gpu_info_uses_selected_row(mocker):
     info = get_gpu_info(config=cfg)
 
     assert info.name == "GPU 1"
+    assert info.index == 1
     assert info.vram_total_mb == 49152
     assert info.vram_used_mb == 2048
 
@@ -55,8 +56,16 @@ def test_compute_gpu_memory_utilization_small_gpu():
 
 
 def test_compute_gpu_memory_utilization_zero_vram():
-    assert compute_gpu_memory_utilization(0.0) == 0.90
-    assert compute_gpu_memory_utilization(-1.0) == 0.90
+    with pytest.raises(ValueError, match="VRAM total"):
+        compute_gpu_memory_utilization(0.0)
+    with pytest.raises(ValueError, match="VRAM total"):
+        compute_gpu_memory_utilization(-1.0)
+
+
+def test_resolve_gpu_memory_utilization_rejects_auto_policy_below_floor():
+    cfg = MagicMock(gpu_memory_utilization=None, gpu_overhead_gb=7.0)
+    with pytest.raises(ValueError, match="gpu.overhead_gb"):
+        resolve_gpu_memory_utilization(8.0, config=cfg)
 
 
 def test_resolve_gpu_memory_utilization_uses_one_policy():

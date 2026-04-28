@@ -319,6 +319,7 @@ def build_tuning_fingerprint(
         "num_layers": model_info.num_layers,
         "model_size_gb": model_info.model_size_gb,
         "gpu_name": getattr(gpu, "name", None),
+        "gpu_index": getattr(gpu, "index", None),
         "gpu_driver": getattr(gpu, "driver", None),
         "gpu_cuda": getattr(gpu, "cuda", None),
         "vram_total_gb": getattr(gpu, "vram_total_gb", None),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -67,32 +69,73 @@ class VllmBackend:
 
     def available_tool_parsers(self) -> set[str] | None:
         """Return tool parsers supported by the installed vLLM runtime."""
-        try:
-            from vllm.entrypoints.openai.tool_parsers import ToolParserManager  # type: ignore[import-not-found, import-untyped]
-            parsers = getattr(ToolParserManager, "tool_parsers", None)
-            if isinstance(parsers, dict) and parsers:
-                return set(parsers)
-        except Exception:
-            pass
-        return None
+        registry = self._runtime_parser_registry()
+        return registry.get("tool_parsers") if registry is not None else None
 
     def available_reasoning_parsers(self) -> set[str] | None:
         """Return reasoning parsers supported by the installed vLLM runtime."""
-        try:
-            from vllm.reasoning import ReasoningParserManager  # type: ignore[import-not-found, import-untyped]
-            parsers = getattr(ReasoningParserManager, "reasoning_parsers", None)
-            if isinstance(parsers, dict) and parsers:
-                return set(parsers)
-        except Exception:
-            pass
-        try:
-            from vllm.entrypoints.openai.reasoning_parsers import ReasoningParserManager  # type: ignore[import-not-found, import-untyped]
-            parsers = getattr(ReasoningParserManager, "reasoning_parsers", None)
-            if isinstance(parsers, dict) and parsers:
-                return set(parsers)
-        except Exception:
-            pass
+        registry = self._runtime_parser_registry()
+        return registry.get("reasoning_parsers") if registry is not None else None
+
+    def _runtime_parser_registry(self) -> dict[str, set[str] | None] | None:
+        from vserve.config import cfg
+
+        script = r"""
+import json
+
+def tool_parsers():
+    try:
+        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+        parsers = getattr(ToolParserManager, "tool_parsers", None)
+        if isinstance(parsers, dict):
+            return sorted(str(key) for key in parsers)
+    except Exception:
         return None
+    return None
+
+def reasoning_parsers():
+    managers = []
+    try:
+        from vllm.reasoning import ReasoningParserManager
+        managers.append(ReasoningParserManager)
+    except Exception:
+        pass
+    try:
+        from vllm.entrypoints.openai.reasoning_parsers import ReasoningParserManager
+        managers.append(ReasoningParserManager)
+    except Exception:
+        pass
+    for manager in managers:
+        parsers = getattr(manager, "reasoning_parsers", None)
+        if isinstance(parsers, dict):
+            return sorted(str(key) for key in parsers)
+    return None
+
+print(json.dumps({
+    "tool_parsers": tool_parsers(),
+    "reasoning_parsers": reasoning_parsers(),
+}))
+"""
+        try:
+            result = subprocess.run(
+                [str(cfg().vllm_python), "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            data = json.loads(result.stdout.strip() or "{}")
+        except json.JSONDecodeError:
+            return None
+        out: dict[str, set[str] | None] = {}
+        for key in ("tool_parsers", "reasoning_parsers"):
+            value = data.get(key)
+            out[key] = set(value) if isinstance(value, list) else None
+        return out
 
     @staticmethod
     def _format_available(values: set[str] | None) -> str:
@@ -168,13 +211,13 @@ class VllmBackend:
         from vserve.models import quant_flag as _qf
         return _qf(method)
 
-    def start(self, config_path: Path) -> None:
+    def start(self, config_path: Path, *, non_interactive: bool = False) -> None:
         from vserve.serve import start_vllm
-        start_vllm(config_path)
+        start_vllm(config_path, non_interactive=non_interactive)
 
-    def stop(self) -> None:
+    def stop(self, *, non_interactive: bool = False) -> None:
         from vserve.serve import stop_vllm
-        stop_vllm()
+        stop_vllm(non_interactive=non_interactive)
 
     def is_running(self) -> bool:
         from vserve.serve import is_vllm_running

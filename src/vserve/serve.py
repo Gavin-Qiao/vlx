@@ -4,12 +4,14 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vserve.config import cfg, write_active_manifest
+from vserve.config import cfg, find_systemd_unit_path, write_active_manifest
 
 
-def _systemctl(action: str, timeout: int = 30) -> tuple[bool, str, str]:
+def _systemctl(action: str, timeout: int = 30, *, non_interactive: bool = False) -> tuple[bool, str, str]:
     command = ["systemctl", action, cfg().service_name]
     if action in {"start", "stop", "restart", "reload"}:
+        if non_interactive:
+            command.insert(0, "-n")
         command.insert(0, "sudo")
     try:
         result = subprocess.run(
@@ -66,16 +68,66 @@ def _restore_active_config(snapshot: dict) -> None:
 
 
 def _write_vllm_manifest(config_path: Path, *, status: str, error: str | None = None) -> None:
+    gpu_index = int(getattr(cfg(), "gpu_index", 0) or 0)
     manifest = {
         "backend": "vllm",
         "service_name": cfg().service_name,
         "config_path": str(config_path.resolve()),
+        "gpu_index": gpu_index,
+        "cuda_visible_devices": str(gpu_index),
         "status": status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if error:
         manifest["error"] = error
     write_active_manifest(manifest, cfg().run_dir / "active-manifest.json")
+
+
+def _upsert_env_file() -> Path:
+    c = cfg()
+    env_path = c.vllm_root / "configs" / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    values = {
+        "CUDA_HOME": str(c.cuda_home),
+        "TMPDIR": str(c.vllm_root / "tmp"),
+        "VLLM_RPC_BASE_PATH": str(c.vllm_root / "tmp"),
+        "CUDA_VISIBLE_DEVICES": str(int(getattr(c, "gpu_index", 0) or 0)),
+    }
+    lines: list[str] = []
+    seen: set[str] = set()
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError:
+            lines = []
+    updated: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            updated.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in values:
+            updated.append(f"{key}={values[key]}")
+            seen.add(key)
+        else:
+            updated.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            updated.append(f"{key}={value}")
+    env_path.write_text("\n".join(updated) + "\n")
+    return env_path
+
+
+def _service_uses_env_file(env_path: Path) -> bool:
+    unit = find_systemd_unit_path(cfg().service_name)
+    if unit is None:
+        return True
+    try:
+        content = unit.read_text()
+    except OSError:
+        return True
+    return "EnvironmentFile" in content and (str(env_path) in content or "configs/.env" in content or ".env" in content)
 
 
 def is_vllm_running() -> bool:
@@ -94,18 +146,24 @@ def is_vllm_running() -> bool:
     return False
 
 
-def start_vllm(config_path: Path) -> None:
+def start_vllm(config_path: Path, *, non_interactive: bool = False) -> None:
     snapshot = _snapshot_active_config()
+    env_path = _upsert_env_file()
+    if not _service_uses_env_file(env_path):
+        raise RuntimeError(
+            f"{cfg().service_name}.service must reference EnvironmentFile={env_path} "
+            "so CUDA_VISIBLE_DEVICES can enforce the configured GPU index."
+        )
     _update_active_symlink(config_path)
     _write_vllm_manifest(config_path, status="starting")
-    ok, _out, err = _systemctl("start")
+    ok, _out, err = _systemctl("start", non_interactive=non_interactive)
     if not ok:
         _restore_active_config(snapshot)
         _write_vllm_manifest(config_path, status="failed", error=err)
         raise RuntimeError(f"systemctl start failed: {err}")
 
 
-def stop_vllm() -> None:
-    ok, _out, err = _systemctl("stop")
+def stop_vllm(*, non_interactive: bool = False) -> None:
+    ok, _out, err = _systemctl("stop", non_interactive=non_interactive)
     if not ok:
         raise RuntimeError(f"systemctl stop failed: {err}")

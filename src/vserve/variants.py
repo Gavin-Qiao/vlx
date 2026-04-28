@@ -51,10 +51,17 @@ def discover_variants(
         if index_path in files:
             variant_files[index_path] = files[index_path]
 
+        missing_shards = False
         for shard in shard_names:
             full_path = index_dir + shard
             if full_path in files:
                 variant_files[full_path] = files[full_path]
+            else:
+                missing_shards = True
+
+        if missing_shards:
+            claimed.update(variant_files.keys())
+            continue
 
         if variant_files:
             label = _label_from_index_path(index_path)

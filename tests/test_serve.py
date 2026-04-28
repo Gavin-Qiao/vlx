@@ -9,7 +9,11 @@ def _mock_cfg(mocker, service_name="vllm", active_yaml=None):
     mock.service_name = service_name
     mock.active_yaml = active_yaml or Path("/tmp/active.yaml")
     mock.run_dir = mock.active_yaml.parent / "run"
+    mock.vllm_root = mock.active_yaml.parent.parent
+    mock.cuda_home = Path("/usr/local/cuda")
+    mock.gpu_index = 0
     mocker.patch("vserve.serve.cfg", return_value=mock)
+    mocker.patch("vserve.serve.find_systemd_unit_path", return_value=None)
     return mock
 
 
@@ -38,7 +42,14 @@ def test_stop_vllm(mocker):
     _mock_cfg(mocker)
     mock_run = mocker.patch("vserve.serve._systemctl", return_value=(True, "", ""))
     stop_vllm()
-    mock_run.assert_called_once_with("stop")
+    mock_run.assert_called_once_with("stop", non_interactive=False)
+
+
+def test_stop_vllm_noninteractive_uses_noninteractive_systemctl(mocker):
+    _mock_cfg(mocker)
+    mock_run = mocker.patch("vserve.serve._systemctl", return_value=(True, "", ""))
+    stop_vllm(non_interactive=True)
+    mock_run.assert_called_once_with("stop", non_interactive=True)
 
 
 def test_start_vllm_with_config(mocker, tmp_path):
@@ -51,7 +62,20 @@ def test_start_vllm_with_config(mocker, tmp_path):
 
     start_vllm(config_path=config_file)
     assert active.is_symlink()
-    mock_systemctl.assert_called_with("start")
+    mock_systemctl.assert_called_with("start", non_interactive=False)
+
+
+def test_systemctl_start_noninteractive_uses_sudo_n(mocker):
+    _mock_cfg(mocker)
+    mock_run = mocker.patch("vserve.serve.subprocess.run", return_value=Mock(returncode=0, stdout="", stderr=""))
+
+    ok, _out, _err = __import__("vserve.serve", fromlist=["_systemctl"])._systemctl(
+        "start",
+        non_interactive=True,
+    )
+
+    assert ok is True
+    assert mock_run.call_args.args[0][:3] == ["sudo", "-n", "systemctl"]
 
 
 def test_start_vllm_writes_active_manifest(mocker, tmp_path):

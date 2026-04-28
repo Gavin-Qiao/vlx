@@ -104,11 +104,11 @@ class Backend(Protocol):
         """Return CLI quantization flag string. Empty if N/A."""
         ...
 
-    def start(self, config_path: Path) -> None:
+    def start(self, config_path: Path, *, non_interactive: bool = False) -> None:
         """Start the inference server with the given config."""
         ...
 
-    def stop(self) -> None:
+    def stop(self, *, non_interactive: bool = False) -> None:
         """Stop the inference server."""
         ...
 

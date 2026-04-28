@@ -207,6 +207,41 @@ def test_build_tuning_fingerprint_includes_gguf_metadata_hash(tmp_path):
     assert fp["gguf_metadata_hash"]
 
 
+def test_build_tuning_fingerprint_includes_gpu_index(tmp_path):
+    from vserve.models import ModelInfo
+
+    model_dir = tmp_path / "models" / "provider" / "Model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    model = ModelInfo(
+        path=model_dir,
+        provider="provider",
+        model_name="Model",
+        architecture="TestLM",
+        model_type="test",
+        quant_method=None,
+        max_position_embeddings=4096,
+        is_moe=False,
+        model_size_gb=1.0,
+    )
+    gpu = type("GPU", (), {
+        "name": "GPU 1",
+        "driver": "590",
+        "cuda": "13.1",
+        "vram_total_gb": 48.0,
+        "index": 1,
+    })()
+
+    fp = build_tuning_fingerprint(
+        model_info=model,
+        gpu=gpu,
+        backend="vllm",
+        gpu_mem_util=0.91,
+    )
+
+    assert fp["gpu_index"] == 1
+
+
 def test_build_tuning_fingerprint_includes_llamacpp_runtime_identity(tmp_path):
     from vserve.models import ModelInfo
 
