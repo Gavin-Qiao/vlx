@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,6 +171,7 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
 
 
 def fuzzy_match(query: str, models: list[ModelInfo]) -> list[ModelInfo]:
+    query = query.strip()
     for m in models:
         if query == str(m.path):
             return [m]
@@ -179,9 +181,47 @@ def fuzzy_match(query: str, models: list[ModelInfo]) -> list[ModelInfo]:
             return [m]
 
     query_lower = query.lower()
-    return [
+    contiguous = [
         m
         for m in models
         if query_lower in m.model_name.lower()
         or query_lower in m.full_name.lower()
     ]
+    if contiguous:
+        return contiguous
+
+    tokens = [t for t in re.split(r"[^a-z0-9]+", query_lower) if t]
+    if not tokens:
+        return []
+
+    ranked: list[tuple[int, str, ModelInfo]] = []
+    for m in models:
+        features = [
+            m.provider,
+            m.model_name,
+            m.full_name,
+            m.architecture,
+            m.model_type,
+            m.quant_method or "",
+            "gguf" if m.is_gguf else "safetensors",
+            "embedding" if m.is_embedding else "",
+        ]
+        haystack = " ".join(features).lower()
+        if not all(token in haystack for token in tokens):
+            continue
+        score = 0
+        name_lower = m.model_name.lower()
+        full_lower = m.full_name.lower()
+        for token in tokens:
+            if token == (m.quant_method or "").lower():
+                score += 8
+            if token in name_lower:
+                score += 4
+            if token in full_lower:
+                score += 2
+            if token == m.provider.lower():
+                score += 1
+        ranked.append((-score, m.full_name.lower(), m))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [m for _score, _name, m in ranked]

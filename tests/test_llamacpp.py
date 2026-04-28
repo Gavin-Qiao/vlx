@@ -95,6 +95,25 @@ class TestLlamaCppBuildConfig:
         cfg = b.build_config(m, choices)
         assert cfg["model"].endswith(".gguf")
 
+    def test_config_selects_one_coherent_split_shard_set(self, tmp_path):
+        b = LlamaCppBackend()
+        model_dir = tmp_path / "models" / "provider" / "Model"
+        model_dir.mkdir(parents=True)
+        for name, size in {
+            "Model-Q4_K_M-00001-of-00002.gguf": 1,
+            "Model-Q4_K_M-00002-of-00002.gguf": 1,
+            "Model-Q8_0-00001-of-00002.gguf": 3,
+            "Model-Q8_0-00002-of-00002.gguf": 3,
+        }.items():
+            (model_dir / name).write_bytes(b"\0" * size)
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        choices = {"context": 4096, "n_gpu_layers": 10, "parallel": 1, "port": 8888, "tools": False}
+        cfg = b.build_config(m, choices)
+
+        assert cfg["model"].endswith("Model-Q8_0-00001-of-00002.gguf")
+
     def test_config_embedding_mode(self, fake_gguf_model_dir):
         b = LlamaCppBackend()
         from vserve.models import detect_model
@@ -196,6 +215,32 @@ class TestLlamaCppTune:
 
         result = b.tune(m, gpu, gpu_mem_util=0.90)
         assert result["full_offload"] is True
+
+    def test_tune_uses_one_coherent_split_shard_set(self, tmp_path, mocker):
+        """Multiple split GGUF variants in one dir should not be summed together."""
+        self._mock_metadata(mocker)
+        mocker.patch.object(LlamaCppBackend, "detect_tools", return_value={})
+        b = LlamaCppBackend()
+        model_dir = tmp_path / "models" / "provider" / "Model"
+        model_dir.mkdir(parents=True)
+        for name, size_gb in {
+            "Model-Q4_K_M-00001-of-00002.gguf": 1,
+            "Model-Q4_K_M-00002-of-00002.gguf": 1,
+            "Model-Q8_0-00001-of-00002.gguf": 3,
+            "Model-Q8_0-00002-of-00002.gguf": 3,
+        }.items():
+            path = model_dir / name
+            with path.open("wb") as f:
+                f.truncate(size_gb * 1024**3)
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+
+        assert result["model_size_gb"] == 6.0
 
 
 class TestLlamaCppLifecycle:

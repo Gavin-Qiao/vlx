@@ -2,6 +2,25 @@
 
 Hard-won lessons from running vLLM on NVIDIA workstation GPUs.
 
+## Supported vLLM Runtime
+
+vserve currently supports stable vLLM `>=0.20,<0.21`. Release candidates, dev builds, and older minor versions should be replaced unless you intentionally bypass the guard for local testing.
+
+```bash
+vserve runtime check vllm
+vserve runtime upgrade vllm --stable
+```
+
+`vserve runtime check vllm` reports the external vLLM version plus torch, torch CUDA, Transformers, Hugging Face Hub, and `pip check` results. Tuning caches include these runtime facts, so changing vLLM or torch causes vserve to recalculate limits instead of reusing stale capacity numbers.
+
+For beta/pre-release vserve builds:
+
+```bash
+uv tool install --prerelease allow vserve
+pip install --pre vserve
+vserve update --nightly
+```
+
 ## GPU Crashes (Xid Errors)
 
 ### Xid 8 — GPU Stopped Processing
@@ -76,7 +95,17 @@ vLLM 0.18+ uses FlashInfer with just-in-time compiled CUDA kernels. First run fo
 
 **Problem:** If vLLM runs as a different user (e.g., systemd `User=vllm`), the JIT cache must be writable by that user. First-time startup will be slow.
 
-**The preheat solution:** `vserve tune` runs a preheat step that starts vLLM briefly as the service user to build the JIT cache before benchmarking. This uses `sudo -u <service_user>` with the correct `CUDA_HOME`, `PATH`, and `HF_HOME` environment.
+**The pre-cache option:** after an interactive `vserve tune`, vserve may offer to start the configured `vllm.service` briefly, wait for the health endpoint, and stop it again. This builds service-user JIT artifacts through the same systemd path used for real serving. Non-interactive `vserve tune MODEL` does not pre-cache; the first `vserve run` may still spend several minutes compiling.
+
+Preview or clear caches safely:
+
+```bash
+vserve cache clean --dry-run --all
+vserve stop
+vserve cache clean --all --yes
+```
+
+`cache clean` refuses to mutate caches while any backend is running or when backend state cannot be confirmed.
 
 ### torch.compile cache
 

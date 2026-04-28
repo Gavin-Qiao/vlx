@@ -35,6 +35,9 @@ _MARKER_TABLE: list[tuple[str, str | None, str]] = [
 _NAME_FALLBACKS: list[tuple[str, str]] = [
     (r"gpt-oss",    "openai"),
 ]
+KNOWN_TOOL_PARSERS = frozenset(parser for _marker, _extra, parser in _MARKER_TABLE) | frozenset(
+    parser for _pattern, parser in _NAME_FALLBACKS
+)
 
 # Reasoning parser markers — ordered by specificity.
 _REASONING_MARKER_TABLE: list[tuple[str, str | None, str]] = [
@@ -50,6 +53,9 @@ _REASONING_MARKER_TABLE: list[tuple[str, str | None, str]] = [
 _REASONING_NAME_FALLBACKS: list[tuple[str, str]] = [
     (r"gpt-oss",    "openai_gptoss"),
 ]
+KNOWN_REASONING_PARSERS = frozenset(parser for _marker, _extra, parser in _REASONING_MARKER_TABLE) | frozenset(
+    parser for _pattern, parser in _REASONING_NAME_FALLBACKS
+)
 
 # Models whose chat templates contain tool markers but are not
 # generative — embedding, reranker, reward, etc.

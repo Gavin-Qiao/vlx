@@ -2,12 +2,56 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from vserve.gpu import GpuInfo
     from vserve.models import ModelInfo
+
+
+@dataclass(frozen=True)
+class RuntimeIdentity:
+    backend: str
+    executable: Path | str | None
+    version: str | None = None
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CompatibilityResult:
+    backend: str
+    supported: bool
+    messages: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    supported_range: str | None = None
+
+
+@dataclass(frozen=True)
+class BackendCapabilities:
+    tools: bool = False
+    reasoning: bool = False
+    embedding: bool = False
+    tool_parser: str | None = None
+    reasoning_parser: str | None = None
+
+
+@dataclass(frozen=True)
+class ServiceStatus:
+    backend: str
+    running: bool | None
+    service_name: str
+    health_url: str | None = None
+    error: str | None = None
+
+
+BackendConfig = dict[str, Any]
+TuningResult = dict[str, Any]
+ActiveManifest = Mapping[str, Any]
+CacheFingerprint = Mapping[str, Any]
+ProfileData = Mapping[str, Any]
 
 
 @runtime_checkable
@@ -40,11 +84,19 @@ class Backend(Protocol):
         """Locate the server binary or launch command. None = not installed."""
         ...
 
-    def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float) -> dict:
+    def runtime_info(self) -> RuntimeIdentity | Any:
+        """Collect version and dependency facts for this backend runtime."""
+        ...
+
+    def compatibility(self) -> CompatibilityResult | Any:
+        """Return this backend's runtime compatibility check."""
+        ...
+
+    def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float) -> TuningResult:
         """Calculate optimal serving parameters. Returns limits dict."""
         ...
 
-    def build_config(self, model: ModelInfo, choices: dict) -> dict:
+    def build_config(self, model: ModelInfo, choices: dict) -> BackendConfig:
         """Build serving config from interactive wizard choices."""
         ...
 
@@ -68,7 +120,11 @@ class Backend(Protocol):
         """Return the health check URL for this backend."""
         ...
 
-    def detect_tools(self, model_path: Path) -> dict:
+    def active_manifest_path(self) -> Path:
+        """Return the backend-owned manifest path for active runtime state."""
+        ...
+
+    def detect_tools(self, model_path: Path) -> Mapping[str, Any]:
         """Detect tool calling capabilities. Keys vary by backend."""
         ...
 

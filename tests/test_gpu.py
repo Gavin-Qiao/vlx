@@ -1,7 +1,15 @@
 import pytest
 from unittest.mock import MagicMock, call, patch
 
-from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, get_fan_count, get_fan_speed, set_fan_speed, restore_fan_auto
+from vserve.gpu import (
+    get_gpu_info,
+    compute_gpu_memory_utilization,
+    resolve_gpu_memory_utilization,
+    get_fan_count,
+    get_fan_speed,
+    set_fan_speed,
+    restore_fan_auto,
+)
 
 
 def test_parse_gpu_info(mocker):
@@ -31,6 +39,19 @@ def test_compute_gpu_memory_utilization_small_gpu():
 def test_compute_gpu_memory_utilization_zero_vram():
     assert compute_gpu_memory_utilization(0.0) == 0.90
     assert compute_gpu_memory_utilization(-1.0) == 0.90
+
+
+def test_resolve_gpu_memory_utilization_uses_one_policy():
+    cfg = MagicMock(gpu_memory_utilization=None, gpu_overhead_gb=None)
+    assert abs(resolve_gpu_memory_utilization(48.0, config=cfg) - compute_gpu_memory_utilization(48.0)) < 0.001
+    assert resolve_gpu_memory_utilization(48.0, requested=0.82, config=cfg) == 0.82
+
+    cfg.gpu_memory_utilization = 0.91
+    assert resolve_gpu_memory_utilization(48.0, config=cfg) == 0.91
+
+    cfg.gpu_memory_utilization = None
+    cfg.gpu_overhead_gb = 2.0
+    assert abs(resolve_gpu_memory_utilization(48.0, config=cfg) - compute_gpu_memory_utilization(48.0, 2.0)) < 0.001
 
 
 def _mock_pynvml():

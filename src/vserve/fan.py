@@ -120,7 +120,7 @@ def compute_fan_speed(
 
 def _nvml_init():
     """Initialize NVML and return the GPU handle."""
-    import pynvml
+    import pynvml  # type: ignore[import-untyped]
     pynvml.nvmlInit()
     return pynvml.nvmlDeviceGetHandleByIndex(0)
 

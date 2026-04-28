@@ -68,17 +68,28 @@ def test_tune_all_models(mocker, fake_model_dir):
 
 def test_tune_cached_shows_table(mocker, fake_model_dir, fake_limits):
     from vserve.models import detect_model
+    from vserve.runtime import build_tuning_fingerprint
     m = detect_model(fake_model_dir)
+    gpu = type("GPU", (), {
+        "name": "Test GPU", "vram_total_gb": 48.0, "cuda": "13.1",
+        "vram_total_mb": 49152, "vram_used_mb": 0, "vram_free_mb": 49152,
+        "driver": "590", "vram_used_gb": 0.0,
+    })()
+    cached_limits = dict(fake_limits)
+    cached_limits["schema_version"] = 2
+    cached_limits["backend"] = "vllm"
+    cached_limits["fingerprint"] = build_tuning_fingerprint(
+        model_info=m,
+        gpu=gpu,
+        backend="vllm",
+        gpu_mem_util=fake_limits["gpu_memory_utilization"],
+    )
 
     mocker.patch("vserve.cli._all_models", return_value=[m])
     mocker.patch("vserve.cli.scan_models", return_value=[m])
     mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
-    mocker.patch("vserve.cli.read_limits", return_value=fake_limits)
-    mocker.patch("vserve.gpu.get_gpu_info", return_value=type("GPU", (), {
-        "name": "Test GPU", "vram_total_gb": 48.0, "cuda": "13.1",
-        "vram_total_mb": 49152, "vram_used_mb": 0, "vram_free_mb": 49152,
-        "driver": "590", "vram_used_gb": 0.0,
-    })())
+    mocker.patch("vserve.cli.read_limits", return_value=cached_limits)
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=gpu)
     # Mock config to not have custom gpu settings (so gpu_util matches fake_limits)
     mock_cfg = mocker.MagicMock()
     mock_cfg.gpu_memory_utilization = fake_limits["gpu_memory_utilization"]
@@ -88,6 +99,36 @@ def test_tune_cached_shows_table(mocker, fake_model_dir, fake_limits):
     result = runner.invoke(app, ["tune", "TestModel"])
     assert result.exit_code == 0
     assert "cached" in result.output
+
+
+def test_tune_recalculates_legacy_limits_without_schema(mocker, fake_model_dir, fake_limits):
+    from vserve.models import detect_model
+    m = detect_model(fake_model_dir)
+
+    _mock_vllm_backend(mocker)
+    legacy_limits = dict(fake_limits)
+    legacy_limits.pop("schema_version", None)
+    legacy_limits.pop("fingerprint", None)
+    mocker.patch("vserve.cli._all_models", return_value=[m])
+    mocker.patch("vserve.cli.scan_models", return_value=[m])
+    mocker.patch("vserve.cli.fuzzy_match", return_value=[m])
+    mocker.patch("vserve.cli.read_limits", return_value=legacy_limits)
+    write_limits = mocker.patch("vserve.config.write_limits")
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=type("GPU", (), {
+        "name": "Test GPU", "vram_total_gb": 48.0, "cuda": "13.1",
+        "vram_total_mb": 49152, "vram_used_mb": 0, "vram_free_mb": 49152,
+        "driver": "590", "vram_used_gb": 0.0,
+    })())
+    mock_cfg = mocker.MagicMock()
+    mock_cfg.gpu_memory_utilization = fake_limits["gpu_memory_utilization"]
+    mock_cfg.gpu_overhead_gb = None
+    mocker.patch("vserve.config.cfg", return_value=mock_cfg)
+
+    result = runner.invoke(app, ["tune", "TestModel"])
+
+    assert result.exit_code == 0
+    assert "cached" not in result.output
+    write_limits.assert_called_once()
 
 
 def test_tune_recalc_ignores_cache(mocker, fake_model_dir, fake_limits):

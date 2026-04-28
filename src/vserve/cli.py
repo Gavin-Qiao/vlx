@@ -30,7 +30,11 @@ from vserve import __version__
 
 app = typer.Typer(help="LLM inference manager")
 cache_app = typer.Typer(help="Cache management")
+runtime_app = typer.Typer(help="Runtime environment management")
+profile_app = typer.Typer(help="Manage saved serving profiles")
 app.add_typer(cache_app, name="cache")
+app.add_typer(runtime_app, name="runtime")
+app.add_typer(profile_app, name="profile")
 console = Console()
 _TITLE = f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]"
 
@@ -93,6 +97,57 @@ def _safe_resolve_path(path):
         return path.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
+
+
+def _record_backend_manifest(backend, cfg_path: pathlib.Path, *, label: str, status: str, port: int | None = None, error: str | None = None) -> None:
+    """Best-effort write of backend runtime state for status/doctor."""
+    from datetime import datetime, timezone
+    from vserve.config import write_active_manifest
+
+    path_fn = getattr(backend, "active_manifest_path", None)
+    if not callable(path_fn):
+        return
+    manifest = {
+        "backend": backend.name,
+        "service_name": backend.service_name,
+        "config_path": str(cfg_path.resolve()),
+        "label": label,
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if port is not None:
+        manifest["port"] = port
+    if error:
+        manifest["error"] = error
+    try:
+        write_active_manifest(manifest, path_fn())
+    except Exception:
+        pass
+
+
+def _check_backend_runtime_or_exit(backend, *, allow_unsupported_runtime: bool = False) -> None:
+    if getattr(backend, "name", None) != "vllm":
+        return
+    compatibility_fn = getattr(backend, "compatibility", None)
+    if not callable(compatibility_fn):
+        return
+    try:
+        check = compatibility_fn()
+    except Exception as exc:
+        console.print(f"[red]Could not check {backend.display_name} runtime compatibility:[/red] {exc}")
+        console.print("  Use [cyan]vserve runtime check vllm[/cyan] for details.")
+        if not allow_unsupported_runtime:
+            raise typer.Exit(1) from None
+        return
+    if check.supported:
+        return
+    console.print(f"[red]Unsupported {backend.display_name} runtime.[/red]")
+    console.print(f"  Supported: {check.range}")
+    for error in check.errors:
+        console.print(f"  [red]FAIL[/red]  {error}")
+    console.print("  Repair: [cyan]vserve runtime upgrade vllm --stable[/cyan]")
+    if not allow_unsupported_runtime:
+        raise typer.Exit(1)
 
 
 def _lock_or_exit(name: str, description: str) -> VserveLock:
@@ -164,6 +219,24 @@ def _resolve_model(query: str) -> ModelInfo:
             console.print(f"  {m.full_name}")
         raise typer.Exit(1)
     return matches[0]
+
+
+def _join_model_terms(terms: str | list[str] | tuple[str, ...] | None) -> str | None:
+    if not terms:
+        return None
+    if isinstance(terms, str):
+        query = terms.strip()
+        return query or None
+    query = " ".join(str(term) for term in terms).strip()
+    return query or None
+
+
+def _backend_format_guidance(backend_name: str) -> str:
+    if backend_name == "llamacpp":
+        return "llama.cpp serves GGUF models. Use vserve add to select a GGUF variant or omit --backend."
+    if backend_name == "vllm":
+        return "vLLM serves Hugging Face safetensors/bin model roots. Use a non-GGUF variant or omit --backend."
+    return "Use vserve list to inspect model formats, or omit --backend for automatic selection."
 
 
 def _show_update_notice() -> None:
@@ -369,6 +442,103 @@ def update(
     raise typer.Exit(1)
 
 
+@runtime_app.command("check")
+def runtime_check(
+    backend: str = typer.Argument("vllm", help="Runtime backend to check"),
+    allow_unsupported: bool = typer.Option(False, "--allow-unsupported-runtime", help="Exit 0 even if runtime is outside vserve's support range"),
+):
+    """Check external backend runtime compatibility."""
+    if backend != "vllm":
+        console.print(f"[red]Unsupported runtime check backend: {backend}[/red]")
+        console.print("  Available: vllm")
+        raise typer.Exit(1)
+
+    from vserve.runtime import check_vllm_compatibility, collect_vllm_runtime_info
+
+    info = collect_vllm_runtime_info()
+    check = check_vllm_compatibility(info)
+
+    if check.supported:
+        console.print("[green]vLLM runtime supported[/green]")
+    else:
+        console.print("[red]Unsupported vLLM runtime[/red]")
+    console.print(f"  vLLM:            {info.vllm_version or '?'}")
+    console.print(f"  torch:           {info.torch_version or '?'}")
+    console.print(f"  torch CUDA:      {info.torch_cuda or '?'}")
+    console.print(f"  transformers:    {info.transformers_version or '?'}")
+    console.print(f"  huggingface_hub: {info.huggingface_hub_version or '?'}")
+    console.print(f"  supported range: {check.range}")
+
+    for message in check.messages:
+        console.print(f"  [green]OK[/green]    {message}")
+    for warning in check.warnings:
+        console.print(f"  [yellow]WARN[/yellow]  {warning}")
+    for error in check.errors:
+        console.print(f"  [red]FAIL[/red]  {error}")
+
+    if not check.supported and not allow_unsupported:
+        raise typer.Exit(1)
+
+
+@runtime_app.command("upgrade")
+def runtime_upgrade(
+    backend: str = typer.Argument(..., help="Runtime backend to upgrade"),
+    stable: bool = typer.Option(False, "--stable", help="Install vserve's pinned stable runtime"),
+):
+    """Upgrade an external backend runtime managed by vserve."""
+    if backend != "vllm":
+        console.print(f"[red]Unsupported runtime upgrade backend: {backend}[/red]")
+        console.print("  Available: vllm")
+        raise typer.Exit(1)
+    if not stable:
+        console.print("[red]Choose the upgrade policy explicitly.[/red]")
+        console.print("  Run: [cyan]vserve runtime upgrade vllm --stable[/cyan]")
+        raise typer.Exit(1)
+
+    lock = _lock_or_exit("runtime", "upgrading vLLM runtime")
+    try:
+        from vserve.backends import get_backend_by_name
+
+        try:
+            backend_obj = get_backend_by_name("vllm")
+            if backend_obj.is_running():
+                console.print("[red]Stop vLLM before upgrading the runtime.[/red]")
+                console.print("  Run: [cyan]vserve stop[/cyan]")
+                raise typer.Exit(1)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            console.print("[red]Could not confirm vLLM is stopped.[/red]")
+            console.print(f"  {exc}")
+            raise typer.Exit(1) from None
+
+        from vserve.runtime import (
+            PINNED_STABLE_VLLM,
+            check_vllm_compatibility,
+            collect_vllm_runtime_info,
+            upgrade_vllm_stable,
+        )
+
+        try:
+            upgrade_vllm_stable()
+        except RuntimeError as exc:
+            console.print("[red]vLLM runtime upgrade failed.[/red]")
+            console.print(f"  {exc}")
+            raise typer.Exit(1) from None
+
+        info = collect_vllm_runtime_info()
+        check = check_vllm_compatibility(info)
+        if check.supported:
+            console.print(f"[green]vLLM runtime upgraded[/green] to {info.vllm_version or PINNED_STABLE_VLLM}")
+            return
+        console.print(f"[yellow]vLLM install completed, but runtime is not supported ({info.vllm_version or '?'}).[/yellow]")
+        for error in check.errors:
+            console.print(f"  [red]FAIL[/red]  {error}")
+        raise typer.Exit(1)
+    finally:
+        lock.release()
+
+
 def _refresh_banner() -> None:
     """Silently update the login banner if installed."""
     from pathlib import Path as _P
@@ -380,10 +550,11 @@ def _refresh_banner() -> None:
 
 
 @app.command(name="list")
-def list_models(model: str = typer.Argument(None, help="Model name for detail view")):
+def list_models(model_terms: list[str] = typer.Argument(None, help="Model name terms for detail view")):
     """List downloaded models."""
     from vserve.backends import _BACKENDS
 
+    model = _join_model_terms(model_terms)
     all_models = _all_models()
     if not all_models:
         console.print("[dim]No models found.[/dim] Run: vserve add")
@@ -452,9 +623,9 @@ def list_models(model: str = typer.Argument(None, help="Model name for detail vi
 
 
 @app.command(name="ls", hidden=True)
-def ls(model: str = typer.Argument(None, help="Model name for detail view")):
+def ls(model_terms: list[str] = typer.Argument(None, help="Model name terms for detail view")):
     """List downloaded models (alias for list)."""
-    list_models(model)
+    list_models(model_terms)
 
 
 def _show_model_detail(m: ModelInfo):
@@ -567,7 +738,7 @@ def _pick(items: list[str], title: str = "") -> int | None:
         return None
 
     try:
-        from simple_term_menu import TerminalMenu
+        from simple_term_menu import TerminalMenu  # type: ignore[import-untyped]
         menu = TerminalMenu(
             items, title=title,
             menu_cursor="❯ ",
@@ -781,6 +952,61 @@ def _pick_variants(variants: list) -> list:
     return [variants[i] for i in indices]
 
 
+def _materialize_subdirectory_variant(
+    local_dir: pathlib.Path,
+    *,
+    model_name: str,
+    selected_variants: list,
+    shared: dict[str, int],
+) -> pathlib.Path:
+    """Expose a single subdirectory HF variant as its own runnable model root."""
+    if len(selected_variants) != 1:
+        return local_dir
+    variant = selected_variants[0]
+    variant_files = list(getattr(variant, "files", {}).keys())
+    if not variant_files:
+        return local_dir
+
+    split_paths = [pathlib.PurePosixPath(name).parts for name in variant_files]
+    if not all(len(parts) > 1 for parts in split_paths):
+        return local_dir
+    prefix = split_paths[0][0]
+    if not all(parts[0] == prefix for parts in split_paths):
+        return local_dir
+
+    import re
+    import shutil
+
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(getattr(variant, "label", prefix))).strip("-") or prefix
+    materialized = local_dir.parent / f"{model_name}-{safe_label}"
+    materialized.mkdir(parents=True, exist_ok=True)
+
+    def link_or_copy(src: pathlib.Path, dest: pathlib.Path) -> None:
+        if not src.exists():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if dest.is_symlink() or dest.exists():
+                dest.unlink()
+        except OSError:
+            return
+        try:
+            dest.symlink_to(src.resolve())
+        except OSError:
+            shutil.copy2(src, dest)
+
+    for name in shared:
+        rel = pathlib.PurePosixPath(name)
+        link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*rel.parts))
+
+    for name in variant_files:
+        rel = pathlib.PurePosixPath(name)
+        stripped = pathlib.PurePosixPath(*rel.parts[1:])
+        link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*stripped.parts))
+
+    return materialized
+
+
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
     """Download a single model by its HuggingFace ID. Returns True if download happened."""
     from vserve.variants import fetch_repo_variants, _format_bytes
@@ -928,6 +1154,12 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
                 local_dir=local_dir,
                 allow_patterns=allow_files,
             )
+            local_dir = _materialize_subdirectory_variant(
+                local_dir,
+                model_name=model_name,
+                selected_variants=selected_variants,
+                shared=shared,
+            )
     except Exception as e:
         console.print(f"[red]Download failed:[/red] {e}")
         raise typer.Exit(1)
@@ -949,11 +1181,11 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         # Auto-tune after download
         try:
             from vserve.backends import get_backend
-            from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
-            from vserve.config import write_limits
+            from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
+            from vserve.config import cfg as _cfg3, write_limits
             backend = get_backend(info)
             gpu = get_gpu_info()
-            gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+            gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3())
             console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
             limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
             lim_path = limits_path(info.provider, info.model_name)
@@ -1023,25 +1255,25 @@ def _model_rm_impl(model: str | None, force: bool = False):
 
 @app.command()
 def rm(
-    model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    model_terms: list[str] = typer.Argument(None, help="Model name terms (fuzzy match)"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ):
     """Remove a downloaded model."""
-    _model_rm_impl(model, force=force)
+    _model_rm_impl(_join_model_terms(model_terms), force=force)
 
 
 @app.command(hidden=True)
 def remove(
-    model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    model_terms: list[str] = typer.Argument(None, help="Model name terms (fuzzy match)"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ):
     """Remove a downloaded model (alias for rm)."""
-    _model_rm_impl(model, force=force)
+    _model_rm_impl(_join_model_terms(model_terms), force=force)
 
 
 @app.command()
 def tune(
-    model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    model_terms: list[str] = typer.Argument(None, help="Model name terms (fuzzy match)"),
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
     recalc: bool = typer.Option(False, "--recalc", help="Force recalculation even if cached"),
     gpu_util: float = typer.Option(None, "--gpu-util", help="GPU memory utilization (0.5-0.99, auto if omitted)"),
@@ -1051,10 +1283,12 @@ def tune(
         console.print("[red]--gpu-util must be between 0.5 and 0.99[/red]")
         raise typer.Exit(1)
 
-    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
-    from vserve.config import write_limits
+    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, resolve_gpu_memory_utilization
+    from vserve.config import limits_cache_matches, write_limits
+    from vserve.runtime import build_tuning_fingerprint
 
     # Resolve which models to tune
+    model = _join_model_terms(model_terms)
     if all_models:
         models_to_tune = _all_models()
     elif model:
@@ -1078,12 +1312,10 @@ def tune(
     if gpu_util is None:
         from vserve.config import cfg as _cfg, save_config, reset_config
         _c = _cfg()
-        if _c.gpu_memory_utilization is not None:
-            gpu_util = _c.gpu_memory_utilization
-        elif _c.gpu_overhead_gb is not None:
-            gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb, _c.gpu_overhead_gb)
+        if _c.gpu_memory_utilization is not None or _c.gpu_overhead_gb is not None:
+            gpu_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_c)
         else:
-            gpu_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+            gpu_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_c)
             # Interactive menu only when user runs bare `vserve tune` (no model arg)
             if model is None and not all_models:
                 console.print(f"\n[bold]GPU memory reservation[/bold]  [dim]({gpu.vram_total_gb:.0f} GB total, current: {gpu_util:.0%})[/dim]")
@@ -1119,11 +1351,26 @@ def tune(
             console.print(f"[bold]{m.full_name}[/bold]  [red]No backend available[/red]")
             continue
 
-        # Check cached limits (invalidate if gpu_util changed)
+        runtime_info = None
+        runtime_info_fn = getattr(backend, "runtime_info", None)
+        if backend.name == "vllm" and callable(runtime_info_fn):
+            try:
+                runtime_info = runtime_info_fn()
+            except Exception:
+                runtime_info = None
+        fingerprint = build_tuning_fingerprint(
+            model_info=m,
+            gpu=gpu,
+            backend=backend.name,
+            gpu_mem_util=gpu_util,
+            runtime_info=runtime_info,
+        )
+
+        # Check cached limits against the full versioned fingerprint.
         lim_path = limits_path(m.provider, m.model_name)
         if not recalc:
             existing = read_limits(lim_path)
-            if existing and existing.get("gpu_memory_utilization") == gpu_util and existing.get("vram_total_gb") == gpu.vram_total_gb:
+            if existing is not None and limits_cache_matches(existing, backend=backend.name, fingerprint=fingerprint):
                 console.print(f"[bold]{m.full_name}[/bold]  [dim](cached — use --recalc to refresh)[/dim]")
                 _print_limits_table(existing, m)
                 continue
@@ -1141,6 +1388,8 @@ def tune(
             console.print(f"[bold]{m.full_name}[/bold]  [red]{e}[/red]")
             continue
 
+        limits_data["backend"] = backend.name
+        limits_data["fingerprint"] = fingerprint
         write_limits(lim_path, limits_data)
         console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {backend.display_name})[/dim]")
         _print_limits_table(limits_data, m)
@@ -1402,6 +1651,7 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
 
         ctx = cfg.get("max-model-len") or cfg.get("ctx_size") or cfg.get("ctx-size", "?")
         ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
+        launch_port = cfg.get("port", 8888)
         console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan] ({backend.display_name})")
         console.print(f"  context: {ctx_d}")
 
@@ -1416,10 +1666,12 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
         try:
             backend.start(cfg_path)
         except RuntimeError as e:
+            _record_backend_manifest(backend, cfg_path, label=label, status="failed", port=launch_port, error=str(e))
             console.print(f"[red]{e}[/red]")
             console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
             raise typer.Exit(1)
         except Exception as e:
+            _record_backend_manifest(backend, cfg_path, label=label, status="failed", port=launch_port, error=str(e))
             console.print(f"[red]Failed to start {backend.display_name}: {e}[/red]")
             console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 20")
             raise typer.Exit(1)
@@ -1427,7 +1679,7 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
         write_session(label)
 
         from urllib.request import urlopen
-        port = cfg.get("port", 8888)
+        port = launch_port
         health = backend.health_url(port)
 
         console.print(f"  [dim]Waiting for {health} ...[/dim]")
@@ -1437,6 +1689,7 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
             try:
                 with urlopen(health, timeout=2) as resp:
                     if resp.status == 200:
+                        _record_backend_manifest(backend, cfg_path, label=label, status="ready", port=port)
                         console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
                         console.print(f"  Config: {cfg_path}")
                         console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
@@ -1454,6 +1707,14 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
                 service_running = _service_running_state()
                 if service_running is False:
                     clear_session()
+                    _record_backend_manifest(
+                        backend,
+                        cfg_path,
+                        label=label,
+                        status="failed",
+                        port=port,
+                        error="service stopped before health endpoint became ready",
+                    )
                     console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
                     raise typer.Exit(1)
 
@@ -1464,9 +1725,18 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
 
         if service_running is False:
             clear_session()
+            _record_backend_manifest(
+                backend,
+                cfg_path,
+                label=label,
+                status="failed",
+                port=port,
+                error="timed out waiting for health endpoint",
+            )
             console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
             raise typer.Exit(1)
         if service_running is True:
+            _record_backend_manifest(backend, cfg_path, label=label, status="warming", port=port)
             console.print("[yellow]Health endpoint is still warming up, but the service remains active.[/yellow]")
             if needs_precache:
                 console.print("  [yellow]First run kernel compilation may still be in progress.[/yellow]")
@@ -1479,6 +1749,14 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
             console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f")
             console.print(f"  Health: {health}")
             return
+        _record_backend_manifest(
+            backend,
+            cfg_path,
+            label=label,
+            status="failed",
+            port=port,
+            error="service state could not be confirmed",
+        )
         console.print(f"[red]Timed out waiting for health endpoint, and service state could not be confirmed.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
         raise typer.Exit(1)
     finally:
@@ -1491,6 +1769,156 @@ def _custom_config(m: ModelInfo, backend, *, tools: bool = False, tool_parser: s
     if backend.name == "llamacpp":
         return _custom_config_llamacpp(m, backend, tools=tools)
     return _custom_config_vllm(m, backend, tools=tools, tool_parser=tool_parser)
+
+
+def _scripted_config(
+    m: ModelInfo,
+    backend,
+    *,
+    context: int | None,
+    slots: int | None,
+    kv_cache_dtype: str | None,
+    batched_tokens: int | None,
+    gpu_util: float | None,
+    port: int,
+    tools: bool,
+    tool_parser: str | None,
+    reasoning_parser: str | None,
+    gpu_layers: int | None,
+    embedding: bool,
+    pooling: str | None,
+    save_profile: str | None,
+) -> "pathlib.Path":
+    """Build a launch config from CLI flags without prompting."""
+    from vserve import config as config_module
+    from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
+
+    gpu = get_gpu_info()
+    effective_gpu_util = resolve_gpu_memory_utilization(
+        gpu.vram_total_gb,
+        requested=gpu_util,
+        config=config_module.cfg(),
+    )
+    chosen_context = context or max(4096, m.max_position_embeddings or 4096)
+
+    if backend.name == "llamacpp":
+        choices = {
+            "context": chosen_context,
+            "n_gpu_layers": gpu_layers if gpu_layers is not None else 999,
+            "parallel": slots or 1,
+            "port": port,
+            "tools": tools,
+            "embedding": embedding,
+            "pooling": pooling,
+        }
+        cfg = backend.build_config(m, choices)
+        profile_name = save_profile or "custom"
+        cfg_path = backend.root_dir / "configs" / "models" / f"{m.provider}--{m.model_name}.{profile_name}.json"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        return cfg_path
+
+    resolved_tools = tools or bool(tool_parser)
+    vllm_choices: dict[str, object] = {
+        "context": chosen_context,
+        "kv_dtype": kv_cache_dtype or "auto",
+        "slots": slots or 1,
+        "batched_tokens": batched_tokens,
+        "gpu_mem_util": effective_gpu_util,
+        "port": port,
+        "tools": resolved_tools and bool(tool_parser),
+        "tool_parser": tool_parser if resolved_tools else None,
+        "reasoning_parser": reasoning_parser,
+    }
+    cfg = backend.build_config(m, vllm_choices)
+    profile_name = save_profile or "custom"
+    cfg_path = config_module.profile_path(m.provider, m.model_name, profile_name)
+    config_module.write_profile_yaml(cfg_path, cfg, comment=f"vserve run — {profile_name} profile")
+    return cfg_path
+
+
+def _resolve_profile_path(profile: str, *, backend, model: ModelInfo | None = None) -> pathlib.Path:
+    candidate = pathlib.Path(profile).expanduser()
+    if candidate.exists():
+        return candidate
+    if model is not None:
+        from vserve import config as config_module
+        if backend.name == "llamacpp":
+            path = backend.root_dir / "configs" / "models" / f"{model.provider}--{model.model_name}.{profile}.json"
+        else:
+            path = config_module.profile_path(model.provider, model.model_name, profile)
+        if path.exists() or profile == "custom":
+            return path
+    matches = sorted(backend.root_dir.glob(f"configs/models/*.{profile}.json"))
+    if backend.name != "llamacpp":
+        from vserve.config import cfg as _cfg
+        matches.extend(sorted(_cfg().configs_dir.glob(f"*.{profile}.yaml")))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        console.print(f"[red]Profile '{profile}' matches multiple configs; include the model name or path.[/red]")
+        for match in matches:
+            console.print(f"  {match}")
+        raise typer.Exit(1)
+    console.print(f"[red]Profile '{profile}' not found.[/red]")
+    raise typer.Exit(1)
+
+
+def _profile_files() -> list[pathlib.Path]:
+    from vserve.backends import _BACKENDS
+    from vserve.config import cfg as _cfg
+
+    paths = list(_cfg().configs_dir.glob("*.yaml"))
+    for backend in _BACKENDS:
+        paths.extend((backend.root_dir / "configs" / "models").glob("*.json"))
+    return sorted(set(paths))
+
+
+@profile_app.command("list")
+def profile_list():
+    """List saved serving profiles."""
+    files = _profile_files()
+    if not files:
+        console.print("[dim]No saved profiles.[/dim]")
+        return
+    for path in files:
+        console.print(str(path))
+
+
+@profile_app.command("show")
+def profile_show(profile: str = typer.Argument(..., help="Profile name or path")):
+    """Show a saved serving profile."""
+    path = pathlib.Path(profile).expanduser()
+    if not path.exists():
+        matches = [p for p in _profile_files() if p.stem.endswith(f".{profile}")]
+        if len(matches) == 1:
+            path = matches[0]
+    if not path.exists():
+        console.print(f"[red]Profile '{profile}' not found.[/red]")
+        raise typer.Exit(1)
+    console.print(path.read_text())
+
+
+@profile_app.command("rm")
+def profile_rm(
+    profile: str = typer.Argument(..., help="Profile name or path"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Remove a saved serving profile."""
+    path = pathlib.Path(profile).expanduser()
+    if not path.exists():
+        matches = [p for p in _profile_files() if p.stem.endswith(f".{profile}")]
+        if len(matches) == 1:
+            path = matches[0]
+    if not path.exists():
+        console.print(f"[red]Profile '{profile}' not found.[/red]")
+        raise typer.Exit(1)
+    if not force and not typer.confirm(f"Delete {path}?", default=False):
+        console.print("[dim]Cancelled.[/dim]")
+        return
+    path.unlink()
+    console.print(f"[green]Deleted[/green] {path}")
 
 
 def _llamacpp_slots_from_limits_entry(entry: object) -> int | None:
@@ -1520,10 +1948,11 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     """Interactive config wizard for llama.cpp models."""
     import json
     from vserve.config import read_limits, write_limits as _write_limits
-    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
+    from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
+    from vserve.config import cfg as _cfg
 
     gpu = get_gpu_info()
-    gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+    gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg())
 
     lim_path_ = limits_path(m.provider, m.model_name)
     lim = read_limits(lim_path_)
@@ -1658,20 +2087,42 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
 
 def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
     """Interactive config wizard for vLLM models."""
-    from vserve.config import read_limits, write_profile_yaml
-    from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization
+    from vserve.config import cfg as _cfg, limits_cache_matches, read_limits, write_profile_yaml
+    from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
+    from vserve.runtime import build_tuning_fingerprint
 
     gpu = get_gpu_info()
-    gpu_mem_util = compute_gpu_memory_utilization(gpu.vram_total_gb)
+    gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg())
+    runtime_info = None
+    runtime_info_fn = getattr(backend, "runtime_info", None)
+    if callable(runtime_info_fn):
+        try:
+            runtime_info = runtime_info_fn()
+        except Exception:
+            runtime_info = None
+    fingerprint = build_tuning_fingerprint(
+        model_info=m,
+        gpu=gpu,
+        backend=backend.name,
+        gpu_mem_util=gpu_mem_util,
+        runtime_info=runtime_info,
+    )
 
     lim_path_ = limits_path(m.provider, m.model_name)
     lim = read_limits(lim_path_)
-    if not lim:
+    if not limits_cache_matches(lim, backend=backend.name, fingerprint=fingerprint):
+        if m.num_kv_heads is None or m.head_dim is None or m.num_layers is None:
+            console.print("[red]Missing architecture fields in config.json[/red]")
+            console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
+            raise typer.Exit(1)
         console.print(f"[dim]  Auto-tuning {m.model_name}...[/dim]")
         from vserve.config import write_limits as _write_limits
         lim = backend.tune(m, gpu, gpu_mem_util=gpu_mem_util)
+        lim["backend"] = backend.name
+        lim["fingerprint"] = fingerprint
         _write_limits(lim_path_, lim)
         console.print("[green]  Tuned.[/green]")
+    assert lim is not None
     limits = lim.get("limits", {})
 
     # 1. Context window
@@ -1802,10 +2253,24 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
 
 @app.command()
 def run(
-    model: str = typer.Argument(None, help="Model name (fuzzy match)"),
+    model_terms: list[str] = typer.Argument(None, help="Model name terms (fuzzy match)"),
     tools: bool = typer.Option(False, "--tools", help="Enable tool/function calling"),
     tool_parser: str | None = typer.Option(None, "--tool-parser", help="Override tool-call parser (e.g. hermes, qwen3_coder)"),
+    reasoning_parser: str | None = typer.Option(None, "--reasoning-parser", help="Override reasoning parser (e.g. qwen3, deepseek_r1)"),
     backend_name: str | None = typer.Option(None, "--backend", help="Force backend (vllm, llamacpp)"),
+    allow_unsupported_runtime: bool = typer.Option(False, "--allow-unsupported-runtime", help="Allow starting outside vserve's pinned runtime range"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Build config from flags/defaults without prompting"),
+    profile: str | None = typer.Option(None, "--profile", help="Saved profile name or explicit config path"),
+    save_profile: str | None = typer.Option(None, "--save-profile", help="Save generated config under this profile name"),
+    context: int | None = typer.Option(None, "--context", help="Context length in tokens"),
+    slots: int | None = typer.Option(None, "--slots", help="Concurrent request slots"),
+    kv_cache_dtype: str | None = typer.Option(None, "--kv-cache-dtype", help="vLLM KV cache dtype"),
+    batched_tokens: int | None = typer.Option(None, "--batched-tokens", help="vLLM max batched tokens"),
+    gpu_util: float | None = typer.Option(None, "--gpu-util", help="GPU memory utilization"),
+    port: int = typer.Option(8888, "--port", help="Serving port"),
+    gpu_layers: int | None = typer.Option(None, "--gpu-layers", help="llama.cpp GPU layers"),
+    embedding: bool = typer.Option(False, "--embedding", help="Run llama.cpp in embedding mode"),
+    pooling: str | None = typer.Option(None, "--pooling", help="llama.cpp embedding pooling"),
 ):
     """Start serving a model — interactive config picker."""
     from vserve.backends import get_backend, get_backend_by_name
@@ -1813,7 +2278,10 @@ def run(
     # Check session lock early — before interactive config
     _session_or_exit()
 
-    if model is None:
+    query = _join_model_terms(model_terms)
+
+    m: ModelInfo | None
+    if query is None and profile is None:
         all_models = _all_models()
         if not all_models:
             console.print("[red]No models found.[/red] Run: vserve add")
@@ -1863,17 +2331,61 @@ def run(
             raise typer.Exit(0)
         m = all_models[idx]
     else:
-        m = _resolve_model(model)
+        m = _resolve_model(query) if query is not None else None
 
     if backend_name:
-        backend = get_backend_by_name(backend_name)
+        try:
+            backend = get_backend_by_name(backend_name)
+        except KeyError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
     else:
+        if m is None:
+            console.print("[red]A model query is required unless profile backend metadata is available.[/red]")
+            raise typer.Exit(1)
         backend = get_backend(m)
+
+    if m is not None and not backend.can_serve(m):
+        console.print(f"[red]{backend.display_name} cannot serve {m.full_name}.[/red]")
+        console.print(f"  {_backend_format_guidance(backend.name)}")
+        raise typer.Exit(1)
+
+    _check_backend_runtime_or_exit(backend, allow_unsupported_runtime=allow_unsupported_runtime)
 
     if tool_parser and not tools:
         tools = True
-    cfg_path = _custom_config(m, backend, tools=tools, tool_parser=tool_parser)
-    _launch_backend(backend, cfg_path, m.model_name)
+    if profile:
+        cfg_path = _resolve_profile_path(profile, backend=backend, model=m)
+    elif yes or any(
+        value is not None
+        for value in (context, slots, kv_cache_dtype, batched_tokens, gpu_util, save_profile, reasoning_parser, gpu_layers, pooling)
+    ) or embedding:
+        if m is None:
+            console.print("[red]A model query is required when building a profile from flags.[/red]")
+            raise typer.Exit(1)
+        cfg_path = _scripted_config(
+            m,
+            backend,
+            context=context,
+            slots=slots,
+            kv_cache_dtype=kv_cache_dtype,
+            batched_tokens=batched_tokens,
+            gpu_util=gpu_util,
+            port=port,
+            tools=tools,
+            tool_parser=tool_parser,
+            reasoning_parser=reasoning_parser,
+            gpu_layers=gpu_layers,
+            embedding=embedding,
+            pooling=pooling,
+            save_profile=save_profile,
+        )
+    else:
+        if m is None:
+            console.print("[red]A model query is required for interactive configuration.[/red]")
+            raise typer.Exit(1)
+        cfg_path = _custom_config(m, backend, tools=tools, tool_parser=tool_parser)
+    _launch_backend(backend, cfg_path, m.model_name if m is not None else (profile or "profile"))
 
 
 @app.command()
@@ -2210,20 +2722,32 @@ def fan(
 def status():
     """Show current serving status."""
     from vserve.backends import _BACKENDS
-    from vserve.config import active_yaml_path, try_read_profile_yaml
+    from vserve.config import active_yaml_path, read_active_manifest, try_read_profile_yaml
 
     running_backend = None
+    probe_errors: list[str] = []
     for b in _BACKENDS:
         try:
             if b.is_running():
                 running_backend = b
                 break
-        except Exception:
+        except Exception as exc:
+            probe_errors.append(f"{b.display_name}: {exc}")
             continue
 
     if running_backend is None:
+        if probe_errors:
+            console.print("[red]Could not determine server state.[/red]")
+            for detail in probe_errors:
+                console.print(f"  {detail}")
+            raise typer.Exit(1)
         console.print("[dim]No server is running.[/dim] Start with: vserve run")
         return
+
+    manifest = None
+    manifest_path_fn = getattr(running_backend, "active_manifest_path", None)
+    if callable(manifest_path_fn):
+        manifest = read_active_manifest(manifest_path_fn())
 
     # Find active config — different path per backend
     import json as _json
@@ -2268,6 +2792,10 @@ def status():
     port = cfg.get("port", 8888)
 
     console.print(f"\n[bold green]{running_backend.display_name} is running[/bold green]")
+    if manifest:
+        state = manifest.get("status")
+        if state and state != "ready":
+            console.print(f"  [bold]State[/bold]      {state}")
     console.print(f"  [bold]Model[/bold]      {model_name}")
     console.print(f"  [bold]Endpoint[/bold]   http://localhost:{port}/v1")
     console.print()
@@ -2683,6 +3211,21 @@ def doctor():
     # ── vLLM ──
     console.print("\n  [bold]vLLM[/bold]")
 
+    # Runtime compatibility
+    try:
+        from vserve.runtime import check_vllm_compatibility, collect_vllm_runtime_info
+
+        runtime_info = collect_vllm_runtime_info(_c)
+        runtime_check = check_vllm_compatibility(runtime_info)
+        if runtime_check.supported:
+            _ok(f"Runtime supported ({runtime_info.vllm_version}, {runtime_check.range})")
+        else:
+            _fail("Unsupported vLLM runtime", "; ".join(runtime_check.errors))
+        for warning in runtime_check.warnings:
+            _warn(warning)
+    except Exception as exc:
+        _warn("Could not complete vLLM runtime compatibility check", str(exc))
+
     # Service user
     try:
         r = subprocess.run(["id", _c.service_user], capture_output=True, text=True, timeout=5)
@@ -2918,7 +3461,7 @@ def doctor():
 
         # gguf package
         try:
-            import gguf  # type: ignore[import-untyped]  # noqa: F401
+            import gguf  # type: ignore[import-not-found, import-untyped]  # noqa: F401
             _ok("gguf package installed")
         except ImportError:
             _warn("gguf package not installed — needed for GGUF metadata reading",
@@ -2982,61 +3525,103 @@ def doctor():
 @cache_app.command("clean")
 def cache_clean(
     all_caches: bool = typer.Option(False, "--all", help="Also clean flashinfer, torch, vllm caches"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview what would be removed"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
     """Clean stale sockets and optionally JIT caches."""
     import subprocess
+    from vserve.backends import probe_running_backends
     from vserve.config import cfg as _cfg
+
+    running_backends, probe_failed = probe_running_backends()
+    if running_backends:
+        names = ", ".join(b.display_name for b in running_backends)
+        console.print(f"[red]Refusing to clean caches while {names} is running.[/red]")
+        console.print("  Run: [cyan]vserve stop[/cyan]")
+        raise typer.Exit(1)
+    if probe_failed:
+        console.print("[red]Refusing to clean caches because backend state is uncertain.[/red]")
+        console.print("  Run: [cyan]vserve status[/cyan] and resolve probe errors first.")
+        raise typer.Exit(1)
+
     _c = _cfg()
     root = _c.vllm_root
     total_freed = 0
+    lock = _lock_or_exit("cache", "cleaning backend caches")
 
-    # Always: stale sockets in tmp
-    tmp_dir = root / "tmp"
-    if tmp_dir.exists():
-        sockets = [s for s in tmp_dir.iterdir() if s.is_socket()]
-        if sockets:
-            result = subprocess.run(
-                ["sudo", "find", str(tmp_dir), "-type", "s", "-delete"],
-                capture_output=True, text=True,
-            )
-            if result.returncode == 0:
-                console.print(f"  [green]Cleaned {len(sockets)} stale sockets from {tmp_dir}[/green]")
-            else:
-                console.print(f"  [red]Failed to clean sockets: {result.stderr.strip()}[/red]")
-        else:
-            console.print(f"  [dim]No stale sockets in {tmp_dir}[/dim]")
-
-    if all_caches:
-        cache_dirs = [
-            (root / ".cache" / "flashinfer", "FlashInfer JIT"),
-            (root / ".cache" / "torch_extensions", "torch compile"),
-            (root / ".cache" / "vllm", "vLLM"),
-        ]
-        for cache_dir, label in cache_dirs:
-            if cache_dir.exists():
-                # Measure size before deleting
+    try:
+        # Always: stale sockets in tmp
+        tmp_dir = root / "tmp"
+        if tmp_dir.exists():
+            sockets = [s for s in tmp_dir.iterdir() if s.is_socket()]
+            if dry_run:
+                console.print(f"  [cyan]Would clean {len(sockets)} stale sockets from {tmp_dir}[/cyan]")
+            elif sockets:
                 result = subprocess.run(
-                    ["sudo", "du", "-sm", str(cache_dir)],
-                    capture_output=True, text=True,
-                )
-                size_mb = 0
-                if result.returncode == 0:
-                    try:
-                        size_mb = int(result.stdout.split()[0])
-                    except (ValueError, IndexError):
-                        pass
-                result = subprocess.run(
-                    ["sudo", "rm", "-rf", str(cache_dir)],
+                    ["sudo", "find", str(tmp_dir), "-type", "s", "-delete"],
                     capture_output=True, text=True,
                 )
                 if result.returncode == 0:
-                    total_freed += size_mb
-                    console.print(f"  [green]Cleaned {label} cache ({size_mb} MB)[/green]")
+                    console.print(f"  [green]Cleaned {len(sockets)} stale sockets from {tmp_dir}[/green]")
                 else:
-                    console.print(f"  [red]Failed to clean {label}: {result.stderr.strip()}[/red]")
+                    console.print(f"  [red]Failed to clean sockets: {result.stderr.strip()}[/red]")
             else:
-                console.print(f"  [dim]{label} cache not found[/dim]")
+                console.print(f"  [dim]No stale sockets in {tmp_dir}[/dim]")
 
-        if total_freed > 0:
-            console.print(f"\n  [bold]Freed {total_freed} MB total[/bold]")
-        console.print("  [yellow]Next vserve run will recompile kernels (~5-10 min)[/yellow]")
+        if all_caches:
+            cache_dirs = [
+                (root / ".cache" / "flashinfer", "FlashInfer JIT"),
+                (root / ".cache" / "torch_extensions", "torch compile"),
+                (root / ".cache" / "vllm", "vLLM"),
+            ]
+            existing = [(cache_dir, label) for cache_dir, label in cache_dirs if cache_dir.exists()]
+            planned_total = 0
+            sizes: dict[pathlib.Path, int] = {}
+            for cache_dir, label in cache_dirs:
+                if cache_dir.exists():
+                    result = subprocess.run(
+                        ["sudo", "du", "-sm", str(cache_dir)],
+                        capture_output=True, text=True,
+                    )
+                    size_mb = 0
+                    if result.returncode == 0:
+                        try:
+                            size_mb = int(result.stdout.split()[0])
+                        except (ValueError, IndexError):
+                            pass
+                    sizes[cache_dir] = size_mb
+                    planned_total += size_mb
+                    if dry_run:
+                        console.print(f"  [cyan]Would clean {label} cache ({size_mb} MB)[/cyan]")
+                elif dry_run:
+                    console.print(f"  [dim]{label} cache not found[/dim]")
+
+            if dry_run:
+                console.print(f"\n  [bold]Would free approximately {planned_total} MB total[/bold]")
+                return
+            if existing and not yes:
+                if not typer.confirm(f"Delete {len(existing)} cache directories ({planned_total} MB)?", default=False):
+                    console.print("[dim]Cancelled.[/dim]")
+                    return
+            for cache_dir, label in cache_dirs:
+                if cache_dir.exists():
+                    result = subprocess.run(
+                        ["sudo", "rm", "-rf", str(cache_dir)],
+                        capture_output=True, text=True,
+                    )
+                    if result.returncode == 0:
+                        size_mb = sizes.get(cache_dir, 0)
+                        total_freed += size_mb
+                        console.print(f"  [green]Cleaned {label} cache ({size_mb} MB)[/green]")
+                    else:
+                        console.print(f"  [red]Failed to clean {label}: {result.stderr.strip()}[/red]")
+                else:
+                    console.print(f"  [dim]{label} cache not found[/dim]")
+
+            if total_freed > 0:
+                console.print(f"\n  [bold]Freed {total_freed} MB total[/bold]")
+            console.print("  [yellow]Next vserve run will recompile kernels (~5-10 min)[/yellow]")
+        elif dry_run:
+            console.print("  [bold]Dry run complete.[/bold]")
+    finally:
+        lock.release()

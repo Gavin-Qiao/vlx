@@ -190,6 +190,68 @@ class TestVllmBackend:
         assert cfg["reasoning-parser"] == "qwen3"
         assert cfg["max-num-batched-tokens"] == 4096
 
+    def test_build_config_reasoning_without_tools(self, fake_model_dir):
+        b = VllmBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_model_dir)
+
+        choices = {
+            "context": 8192,
+            "kv_dtype": "auto",
+            "slots": 4,
+            "batched_tokens": None,
+            "gpu_mem_util": 0.90,
+            "port": 8888,
+            "tools": False,
+            "tool_parser": None,
+            "reasoning_parser": "qwen3",
+        }
+        cfg = b.build_config(m, choices)
+        assert cfg["reasoning-parser"] == "qwen3"
+        assert "enable-auto-tool-choice" not in cfg
+
+    def test_build_config_rejects_unknown_tool_parser(self, fake_model_dir, mocker):
+        b = VllmBackend()
+        mocker.patch.object(b, "available_tool_parsers", return_value={"hermes"})
+        from vserve.models import detect_model
+        m = detect_model(fake_model_dir)
+
+        choices = {
+            "context": 4096,
+            "kv_dtype": "auto",
+            "slots": 1,
+            "gpu_mem_util": 0.9,
+            "port": 8888,
+            "tools": True,
+            "tool_parser": "qwen-3",
+            "reasoning_parser": None,
+        }
+
+        import pytest
+        with pytest.raises(ValueError, match="Unknown vLLM tool parser"):
+            b.build_config(m, choices)
+
+    def test_build_config_rejects_unknown_reasoning_parser(self, fake_model_dir, mocker):
+        b = VllmBackend()
+        mocker.patch.object(b, "available_reasoning_parsers", return_value={"qwen3"})
+        from vserve.models import detect_model
+        m = detect_model(fake_model_dir)
+
+        choices = {
+            "context": 4096,
+            "kv_dtype": "auto",
+            "slots": 1,
+            "gpu_mem_util": 0.9,
+            "port": 8888,
+            "tools": False,
+            "tool_parser": None,
+            "reasoning_parser": "qwen-3",
+        }
+
+        import pytest
+        with pytest.raises(ValueError, match="Unknown vLLM reasoning parser"):
+            b.build_config(m, choices)
+
     def test_find_entrypoint_missing(self, mocker):
         b = VllmBackend()
         mock_c = Mock()

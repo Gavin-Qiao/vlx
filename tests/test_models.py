@@ -224,6 +224,41 @@ def test_fuzzy_match_full_path(models_root):
     assert len(matches) == 1
 
 
+def test_fuzzy_match_tokenized_query_ranks_quant_and_provider():
+    from pathlib import Path
+
+    from vserve.models import ModelInfo
+
+    models = [
+        ModelInfo(
+            path=Path("/models/Qwen/Qwen3.5-27B-FP8"),
+            provider="Qwen",
+            model_name="Qwen3.5-27B-FP8",
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            quant_method="fp8",
+            max_position_embeddings=131072,
+            is_moe=False,
+            model_size_gb=27,
+        ),
+        ModelInfo(
+            path=Path("/models/Qwen/Qwen3.5-27B-BF16"),
+            provider="Qwen",
+            model_name="Qwen3.5-27B-BF16",
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            quant_method=None,
+            max_position_embeddings=131072,
+            is_moe=False,
+            model_size_gb=54,
+        ),
+    ]
+
+    matches = fuzzy_match("qwen fp8", models)
+
+    assert [m.model_name for m in matches] == ["Qwen3.5-27B-FP8"]
+
+
 # --- GGUF model detection ---
 
 

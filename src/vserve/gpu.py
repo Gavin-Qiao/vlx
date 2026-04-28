@@ -80,9 +80,27 @@ def compute_gpu_memory_utilization(
     return (vram_total_gb - overhead_gb) / vram_total_gb
 
 
+def resolve_gpu_memory_utilization(
+    vram_total_gb: float,
+    *,
+    requested: float | None = None,
+    config: object | None = None,
+) -> float:
+    """Resolve the effective GPU memory policy used by add, tune, and run."""
+    if requested is not None:
+        return requested
+    configured_util = getattr(config, "gpu_memory_utilization", None)
+    if configured_util is not None:
+        return float(configured_util)
+    configured_overhead = getattr(config, "gpu_overhead_gb", None)
+    if configured_overhead is not None:
+        return compute_gpu_memory_utilization(vram_total_gb, float(configured_overhead))
+    return compute_gpu_memory_utilization(vram_total_gb)
+
+
 def get_fan_speed() -> int:
     """Read current fan speed via NVML."""
-    import pynvml
+    import pynvml  # type: ignore[import-untyped]
     pynvml.nvmlInit()
     try:
         h = pynvml.nvmlDeviceGetHandleByIndex(0)

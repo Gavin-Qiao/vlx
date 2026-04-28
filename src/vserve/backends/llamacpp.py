@@ -45,24 +45,28 @@ class LlamaCppBackend:
         found = shutil.which("llama-server")
         return Path(found) if found else None
 
+    def runtime_info(self) -> dict:
+        return {
+            "backend": self.name,
+            "executable": str(self.find_entrypoint() or ""),
+        }
+
+    def compatibility(self) -> dict:
+        return {
+            "backend": self.name,
+            "supported": True,
+            "messages": ["llama.cpp runtime is managed separately."],
+            "warnings": [],
+            "errors": [],
+        }
+
     def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float = 0.90) -> dict:
         """Calculate n-gpu-layers, context sizes, and parallel slots."""
-        gguf_files = sorted(model.path.glob("*.gguf"))
-        if not gguf_files:
+        selected = self._select_gguf_model_files(model.path)
+        if selected is None:
             raise ValueError(f"No GGUF files in {model.path}")
-
-        # Detect split shards (e.g., model-00001-of-00003.gguf) vs independent variants
-        import re
-        shard_pattern = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
-        shard_files = [f for f in gguf_files if shard_pattern.search(f.name)]
-        if shard_files:
-            # Split model — sum all shards
-            model_size_bytes = sum(f.stat().st_size for f in shard_files)
-            primary_file = shard_files[0]
-        else:
-            # Pick the largest file (handles multiple quant variants in one dir)
-            primary_file = max(gguf_files, key=lambda f: f.stat().st_size)
-            model_size_bytes = primary_file.stat().st_size
+        primary_file, model_files = selected
+        model_size_bytes = sum(f.stat().st_size for f in model_files)
         model_size_gb = model_size_bytes / (1024**3)
 
         metadata = self._read_gguf_metadata(primary_file)
@@ -121,15 +125,41 @@ class LlamaCppBackend:
             "supports_reasoning": tool_info.get("supports_reasoning", False),
             "limits": limits,
         }
+        if not metadata:
+            result["metadata_estimated"] = True
         if is_embedding:
             result["is_embedding"] = True
             result["pooling"] = pooling or "mean"
         return result
 
+    @staticmethod
+    def _select_gguf_model_files(model_path: Path) -> tuple[Path, list[Path]] | None:
+        """Select one coherent GGUF variant from a model directory."""
+        import re
+
+        gguf_files = sorted(model_path.glob("*.gguf"))
+        if not gguf_files:
+            return None
+
+        shard_pattern = re.compile(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
+        groups: dict[str, list[Path]] = {}
+        singles: list[Path] = []
+        for path in gguf_files:
+            match = shard_pattern.match(path.name)
+            if match:
+                groups.setdefault(match.group("base"), []).append(path)
+            else:
+                singles.append(path)
+
+        candidates: list[list[Path]] = [sorted(paths) for paths in groups.values()]
+        candidates.extend([[path] for path in singles])
+        best = max(candidates, key=lambda files: (sum(path.stat().st_size for path in files), files[0].name))
+        return best[0], best
+
     def _read_gguf_metadata(self, gguf_path: Path) -> dict:
         """Read model metadata from GGUF file header."""
         try:
-            from gguf import GGUFReader  # type: ignore[import-untyped]
+            from gguf import GGUFReader  # type: ignore[import-not-found, import-untyped]
             reader = GGUFReader(str(gguf_path))
 
             arch = "llama"
@@ -198,15 +228,8 @@ class LlamaCppBackend:
 
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
         """Build llama-server JSON config."""
-        import re as _re
-        gguf_files = sorted(model.path.glob("*.gguf"))
-        if gguf_files:
-            # For split shards, pick the first shard; otherwise pick the largest variant
-            shard_pattern = _re.compile(r"-\d{5}-of-\d{5}\.gguf$")
-            shards = [f for f in gguf_files if shard_pattern.search(f.name)]
-            model_file = str(shards[0]) if shards else str(max(gguf_files, key=lambda f: f.stat().st_size))
-        else:
-            model_file = str(model.path)
+        selected = self._select_gguf_model_files(model.path)
+        model_file = str(selected[0]) if selected is not None else str(model.path)
 
         cfg: dict = {
             "model": model_file,
@@ -326,6 +349,9 @@ class LlamaCppBackend:
     def health_url(self, port: int) -> str:
         return f"http://localhost:{port}/health"
 
+    def active_manifest_path(self) -> Path:
+        return self.root_dir / "run" / "active-manifest.json"
+
     def detect_tools(self, model_path: Path) -> dict:
         """Check if model supports tool calling and reasoning via chat template or GGUF metadata."""
         from vserve.tools import supports_tools, _read_chat_template
@@ -351,7 +377,7 @@ class LlamaCppBackend:
         if not gguf_files:
             return None
         try:
-            from gguf import GGUFReader  # type: ignore[import-untyped]
+            from gguf import GGUFReader  # type: ignore[import-not-found, import-untyped]
             reader = GGUFReader(str(gguf_files[0]))
             field = reader.fields.get("tokenizer.chat_template")
             if field is None:

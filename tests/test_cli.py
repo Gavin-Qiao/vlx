@@ -45,6 +45,97 @@ def test_run_command_exists():
     assert result.exit_code == 0
 
 
+def test_run_accepts_tokenized_query_and_noninteractive_flags(mocker, fake_model_dir, tmp_path):
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.can_serve.return_value = True
+    backend.compatibility.return_value = mocker.Mock(supported=True)
+    backend.build_config.return_value = {
+        "model": str(model.path),
+        "host": "0.0.0.0",
+        "port": 9999,
+        "max-model-len": 4096,
+        "max-num-seqs": 2,
+        "kv-cache-dtype": "auto",
+    }
+    mocker.patch("vserve.cli._all_models", return_value=[model])
+    mocker.patch("vserve.backends.get_backend", return_value=backend)
+    mocker.patch("vserve.cli._session_or_exit")
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=mocker.Mock(name="GPU", vram_total_gb=48.0))
+    mocker.patch("vserve.config.profile_path", return_value=tmp_path / "profile.yaml")
+    mocker.patch("vserve.config.write_profile_yaml")
+    launch = mocker.patch("vserve.cli._launch_backend")
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "testmodel",
+            "fp8",
+            "--yes",
+            "--context",
+            "4096",
+            "--slots",
+            "2",
+            "--kv-cache-dtype",
+            "auto",
+            "--port",
+            "9999",
+        ],
+    )
+
+    assert result.exit_code == 0
+    backend.build_config.assert_called_once()
+    choices = backend.build_config.call_args.args[1]
+    assert choices["context"] == 4096
+    assert choices["slots"] == 2
+    assert choices["kv_dtype"] == "auto"
+    assert choices["port"] == 9999
+    launch.assert_called_once()
+
+
+def test_profile_namespace_exists():
+    result = runner.invoke(app, ["profile", "--help"])
+    assert result.exit_code == 0
+    assert "Manage saved serving profiles" in result.output
+
+
+def test_materialize_subdirectory_variant_as_runnable_root(tmp_path):
+    from vserve.cli import _materialize_subdirectory_variant
+    from vserve.variants import Variant
+
+    local_dir = tmp_path / "models" / "provider" / "Model"
+    (local_dir / "original").mkdir(parents=True)
+    (local_dir / "config.json").write_text("{}")
+    (local_dir / "tokenizer.json").write_text("{}")
+    (local_dir / "original" / "model.safetensors.index.json").write_text("{}")
+    (local_dir / "original" / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    variant = Variant(
+        label="original",
+        files={
+            "original/model.safetensors.index.json": 2,
+            "original/model-00001-of-00001.safetensors": 7,
+        },
+    )
+
+    materialized = _materialize_subdirectory_variant(
+        local_dir,
+        model_name="Model",
+        selected_variants=[variant],
+        shared={"config.json": 2, "tokenizer.json": 2},
+    )
+
+    assert materialized == local_dir.parent / "Model-original"
+    assert (materialized / "config.json").exists()
+    assert (materialized / "tokenizer.json").exists()
+    assert (materialized / "model.safetensors.index.json").exists()
+    assert (materialized / "model-00001-of-00001.safetensors").exists()
+
+
 def test_stop_command_exists():
     result = runner.invoke(app, ["stop", "--help"])
     assert result.exit_code == 0
@@ -233,6 +324,21 @@ def test_status_handles_non_mapping_active_config(mocker, tmp_path):
     assert "active config unreadable" in result.output
 
 
+def test_status_reports_probe_uncertainty(mocker):
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.is_running.side_effect = RuntimeError("dbus unavailable")
+
+    mocker.patch("vserve.backends._BACKENDS", [backend])
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 1
+    assert "Could not determine server state" in result.output
+    assert "dbus unavailable" in result.output
+
+
 def test_safe_resolve_path_returns_none_for_symlink_loop(tmp_path):
     from vserve.cli import _safe_resolve_path
 
@@ -247,6 +353,106 @@ def test_safe_resolve_path_returns_none_for_symlink_loop(tmp_path):
 def test_doctor_command_exists():
     result = runner.invoke(app, ["doctor", "--help"])
     assert result.exit_code == 0
+
+
+def test_runtime_check_vllm_reports_supported_runtime(mocker):
+    info = mocker.Mock(
+        backend="vllm",
+        vllm_version="0.20.0",
+        torch_version="2.11.0+cu130",
+        torch_cuda="13.0",
+        transformers_version="5.6.2",
+        huggingface_hub_version="1.12.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found.",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+    )
+    mocker.patch("vserve.runtime.collect_vllm_runtime_info", return_value=info)
+
+    result = runner.invoke(app, ["runtime", "check", "vllm"])
+
+    assert result.exit_code == 0
+    assert "vLLM runtime supported" in result.output
+    assert "0.20.0" in result.output
+
+
+def test_runtime_check_vllm_fails_unsupported_runtime(mocker):
+    info = mocker.Mock(
+        backend="vllm",
+        vllm_version="0.20.0rc1",
+        torch_version="2.11.0+cu130",
+        torch_cuda="13.0",
+        transformers_version="5.6.2",
+        huggingface_hub_version="1.12.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found.",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+    )
+    mocker.patch("vserve.runtime.collect_vllm_runtime_info", return_value=info)
+
+    result = runner.invoke(app, ["runtime", "check", "vllm"])
+
+    assert result.exit_code == 1
+    assert "Unsupported vLLM runtime" in result.output
+    assert "pre-release" in result.output
+
+
+def test_runtime_upgrade_vllm_stable_invokes_runtime_installer(mocker):
+    upgrade = mocker.patch("vserve.runtime.upgrade_vllm_stable")
+    backend = mocker.Mock()
+    backend.is_running.return_value = False
+    mocker.patch("vserve.backends.get_backend_by_name", return_value=backend)
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    check = mocker.patch("vserve.runtime.collect_vllm_runtime_info")
+    check.return_value = mocker.Mock(
+        backend="vllm",
+        vllm_version="0.20.0",
+        torch_version="2.11.0+cu130",
+        torch_cuda="13.0",
+        transformers_version="5.6.2",
+        huggingface_hub_version="1.12.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found.",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+    )
+
+    result = runner.invoke(app, ["runtime", "upgrade", "vllm", "--stable"])
+
+    assert result.exit_code == 0
+    upgrade.assert_called_once()
+    lock.release.assert_called_once()
+    assert "vLLM runtime upgraded" in result.output
+
+
+def test_runtime_upgrade_vllm_stable_refuses_running_service(mocker):
+    backend = mocker.Mock()
+    backend.is_running.return_value = True
+    mocker.patch("vserve.backends.get_backend_by_name", return_value=backend)
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    upgrade = mocker.patch("vserve.runtime.upgrade_vllm_stable")
+
+    result = runner.invoke(app, ["runtime", "upgrade", "vllm", "--stable"])
+
+    assert result.exit_code == 1
+    assert "Stop vLLM before upgrading" in result.output
+    upgrade.assert_not_called()
+    lock.release.assert_called_once()
+
+
+def test_cache_clean_dry_run_preview_and_refuses_running_backend(mocker):
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([backend], False))
+
+    result = runner.invoke(app, ["cache", "clean", "--dry-run"])
+
+    assert result.exit_code == 1
+    assert "Refusing to clean caches while vLLM is running" in result.output
 
 
 def test_doctor_handles_invalid_utf8_systemd_unit(mocker, tmp_path):
@@ -546,6 +752,33 @@ def test_run_backend_override(mocker):
 
     runner.invoke(app, ["run", "Model-7B", "--backend", "nope"])
     mock_get.assert_called_once_with("nope")
+
+
+def test_run_forced_backend_rejects_model_it_cannot_serve(mocker):
+    from vserve.models import ModelInfo
+
+    fake = ModelInfo(
+        path=Path("/opt/vllm/models/test/Model-7B"),
+        provider="test", model_name="Model-7B",
+        architecture="TestLM", model_type="test", quant_method="fp8",
+        max_position_embeddings=32768, is_moe=False, model_size_gb=7.2,
+    )
+    backend = mocker.Mock()
+    backend.name = "llamacpp"
+    backend.display_name = "llama.cpp"
+    backend.can_serve.return_value = False
+    backend.compatibility.return_value = mocker.Mock(supported=True)
+
+    mocker.patch("vserve.cli._all_models", return_value=[fake])
+    mocker.patch("vserve.cli.fuzzy_match", return_value=[fake])
+    mocker.patch("vserve.backends.get_backend_by_name", return_value=backend)
+    mocker.patch("vserve.cli._session_or_exit")
+
+    result = runner.invoke(app, ["run", "Model-7B", "--backend", "llamacpp"])
+
+    assert result.exit_code == 1
+    assert "llama.cpp cannot serve test/Model-7B" in result.output
+    assert "GGUF" in result.output
 
 
 def test_launch_backend_aborts_on_restart_stop_failure(mocker, tmp_path):

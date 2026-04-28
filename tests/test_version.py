@@ -276,6 +276,39 @@ class TestUpdateCommand:
             assert any("upgrade" in c for c in calls)
             mock_refresh.assert_called_once()
 
+    def test_nightly_upgrade_via_uv_allows_prerelease(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
+        with patch("shutil.which", return_value="/usr/bin/uv"), \
+             patch("subprocess.run") as mock_run, \
+             patch("vserve.cli._refresh_banner") as mock_refresh:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="vserve v0.1.0\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
+            result = runner.invoke(app, ["update", "--nightly"])
+            assert result.exit_code == 0
+            calls = [c.args[0] for c in mock_run.call_args_list]
+            assert any("--prerelease" in call and "allow" in call for call in calls)
+            mock_refresh.assert_called_once()
+
+    def test_nightly_upgrade_via_pip_uses_pre(self, monkeypatch):
+        monkeypatch.setattr(V, "background_refresh", lambda: None)
+
+        def _which(name: str) -> str | None:
+            if name == "uv":
+                return None
+            if name in {"pip", "pip3"}:
+                return "/usr/bin/pip"
+            return None
+
+        with patch("shutil.which", side_effect=_which), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run, \
+             patch("vserve.cli._refresh_banner") as mock_refresh:
+            result = runner.invoke(app, ["update", "--nightly"])
+            assert result.exit_code == 0
+            assert "--pre" in mock_run.call_args.args[0]
+            mock_refresh.assert_called_once()
+
     def test_uv_upgrade_failure_exits_nonzero(self, monkeypatch):
         monkeypatch.setattr(V, "background_refresh", lambda: None)
         with patch("vserve.version.check_pypi", return_value="9.9.9"), \

@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -103,6 +103,8 @@ def _read_yaml_mapping(path: Path, *, warn: bool, label: str) -> dict | None:
     return data
 
 CONFIG_FILE = Path.home() / ".config" / "vserve" / "config.yaml"
+LIMITS_SCHEMA_VERSION = 2
+ACTIVE_MANIFEST_SCHEMA_VERSION = 1
 
 # Hardcoded defaults — used only when discovery fails and no config file exists.
 _DEFAULT_VLLM_ROOT = "/opt/vllm"
@@ -110,6 +112,15 @@ _DEFAULT_SERVICE_NAME = "vllm"
 _DEFAULT_SERVICE_USER = "vllm"
 _DEFAULT_PORT = 8888
 _DEFAULT_CUDA_HOME = "/usr/local/cuda"
+
+
+@dataclass
+class BackendConfig:
+    name: str
+    root: Path | None
+    service_name: str
+    service_user: str
+    port: int | None = None
 
 
 @dataclass
@@ -131,6 +142,7 @@ class VserveConfig:
     llamacpp_root: Path | None = None
     llamacpp_service_name: str = "llama-cpp"
     llamacpp_service_user: str = "llama-cpp"
+    backends: dict[str, BackendConfig] = field(default_factory=dict)
 
     @property
     def active_yaml(self) -> Path:
@@ -207,6 +219,14 @@ def _discover_port(vllm_root: Path) -> int:
     return _DEFAULT_PORT
 
 
+def _vllm_venv_bin(vllm_root: Path) -> Path:
+    for name in ("venv", ".venv"):
+        candidate = vllm_root / name / "bin"
+        if (candidate / "vllm").exists() or (candidate / "python").exists():
+            return candidate
+    return vllm_root / "venv" / "bin"
+
+
 def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
                   service_user: str, port: int, *,
                   gpu_memory_utilization: float | None = None,
@@ -214,6 +234,22 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
                   llamacpp_root: Path | None = None,
                   llamacpp_service_name: str = "llama-cpp",
                   llamacpp_service_user: str = "llama-cpp") -> VserveConfig:
+    vllm_venv_bin = _vllm_venv_bin(vllm_root)
+    backends = {
+        "vllm": BackendConfig(
+            name="vllm",
+            root=vllm_root,
+            service_name=service_name,
+            service_user=service_user,
+            port=port,
+        ),
+        "llamacpp": BackendConfig(
+            name="llamacpp",
+            root=llamacpp_root,
+            service_name=llamacpp_service_name,
+            service_user=llamacpp_service_user,
+        ),
+    }
     return VserveConfig(
         vllm_root=vllm_root,
         models_dir=vllm_root / "models",
@@ -221,8 +257,8 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
         benchmarks_dir=vllm_root / "benchmarks",
         logs_dir=vllm_root / "logs",
         run_dir=vllm_root / "run",
-        vllm_bin=vllm_root / "venv" / "bin" / "vllm",
-        vllm_python=vllm_root / "venv" / "bin" / "python",
+        vllm_bin=vllm_venv_bin / "vllm",
+        vllm_python=vllm_venv_bin / "python",
         cuda_home=cuda_home,
         service_name=service_name,
         service_user=service_user,
@@ -232,6 +268,7 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
         llamacpp_root=llamacpp_root,
         llamacpp_service_name=llamacpp_service_name,
         llamacpp_service_user=llamacpp_service_user,
+        backends=backends,
     )
 
 
@@ -261,21 +298,30 @@ def load_config() -> VserveConfig:
             _log.warning("Failed to parse config YAML %s: %s", CONFIG_FILE, exc)
         else:
             if isinstance(raw, dict):
-                root = Path(str(raw.get("vllm_root", _DEFAULT_VLLM_ROOT)))
-                gpu_util_raw = raw.get("gpu_memory_utilization")
-                gpu_overhead_raw = raw.get("gpu_overhead_gb")
-                llamacpp_root_raw = raw.get("llamacpp_root")
+                backend_raw = raw.get("backends")
+                backends: dict[str, object] = backend_raw if isinstance(backend_raw, dict) else {}
+                vllm_raw_obj = backends.get("vllm")
+                llamacpp_raw_obj = backends.get("llamacpp")
+                vllm_raw: dict[str, object] = vllm_raw_obj if isinstance(vllm_raw_obj, dict) else {}
+                llamacpp_raw: dict[str, object] = llamacpp_raw_obj if isinstance(llamacpp_raw_obj, dict) else {}
+                gpu_raw = raw.get("gpu")
+                gpu: dict[str, object] = gpu_raw if isinstance(gpu_raw, dict) else {}
+
+                root = Path(str(vllm_raw.get("root", raw.get("vllm_root", _DEFAULT_VLLM_ROOT))))
+                gpu_util_raw = gpu.get("memory_utilization", raw.get("gpu_memory_utilization"))
+                gpu_overhead_raw = gpu.get("overhead_gb", raw.get("gpu_overhead_gb"))
+                llamacpp_root_raw = llamacpp_raw.get("root", raw.get("llamacpp_root"))
                 return _build_config(
                     vllm_root=root,
                     cuda_home=Path(str(raw.get("cuda_home", _DEFAULT_CUDA_HOME))),
-                    service_name=str(raw.get("service_name", _DEFAULT_SERVICE_NAME)),
-                    service_user=str(raw.get("service_user", _DEFAULT_SERVICE_USER)),
-                    port=_coerce_config_int(raw.get("port"), _DEFAULT_PORT),
+                    service_name=str(vllm_raw.get("service_name", raw.get("service_name", _DEFAULT_SERVICE_NAME))),
+                    service_user=str(vllm_raw.get("service_user", raw.get("service_user", _DEFAULT_SERVICE_USER))),
+                    port=_coerce_config_int(vllm_raw.get("port", raw.get("port")), _DEFAULT_PORT),
                     gpu_memory_utilization=_coerce_config_float(gpu_util_raw),
                     gpu_overhead_gb=_coerce_config_float(gpu_overhead_raw),
                     llamacpp_root=Path(str(llamacpp_root_raw)) if llamacpp_root_raw else None,
-                    llamacpp_service_name=str(raw.get("llamacpp_service_name", "llama-cpp")),
-                    llamacpp_service_user=str(raw.get("llamacpp_service_user", "llama-cpp")),
+                    llamacpp_service_name=str(llamacpp_raw.get("service_name", raw.get("llamacpp_service_name", "llama-cpp"))),
+                    llamacpp_service_user=str(llamacpp_raw.get("service_user", raw.get("llamacpp_service_user", "llama-cpp"))),
                 )
             _log.warning("Ignoring invalid config format in %s: expected mapping", CONFIG_FILE)
 
@@ -291,22 +337,30 @@ def save_config(cfg: VserveConfig) -> Path:
     """Write config to ~/.config/vserve/config.yaml."""
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {
-        "vllm_root": str(cfg.vllm_root),
+        "schema_version": 2,
         "cuda_home": str(cfg.cuda_home),
-        "service_name": cfg.service_name,
-        "service_user": cfg.service_user,
-        "port": cfg.port,
+        "backends": {
+            "vllm": {
+                "root": str(cfg.vllm_root),
+                "service_name": cfg.service_name,
+                "service_user": cfg.service_user,
+                "port": cfg.port,
+            },
+        },
     }
+    gpu: dict[str, float] = {}
     if cfg.gpu_memory_utilization is not None:
-        data["gpu_memory_utilization"] = cfg.gpu_memory_utilization
+        gpu["memory_utilization"] = cfg.gpu_memory_utilization
     if cfg.gpu_overhead_gb is not None:
-        data["gpu_overhead_gb"] = cfg.gpu_overhead_gb
+        gpu["overhead_gb"] = cfg.gpu_overhead_gb
+    if gpu:
+        data["gpu"] = gpu
     if cfg.llamacpp_root is not None:
-        data["llamacpp_root"] = str(cfg.llamacpp_root)
-    if cfg.llamacpp_service_name != "llama-cpp":
-        data["llamacpp_service_name"] = cfg.llamacpp_service_name
-    if cfg.llamacpp_service_user != "llama-cpp":
-        data["llamacpp_service_user"] = cfg.llamacpp_service_user
+        data["backends"]["llamacpp"] = {
+            "root": str(cfg.llamacpp_root),
+            "service_name": cfg.llamacpp_service_name,
+            "service_user": cfg.llamacpp_service_user,
+        }
     content = "# vserve configuration — generated by vserve init\n"
     content += yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
     _atomic_write_text(CONFIG_FILE, content)
@@ -368,6 +422,20 @@ def active_yaml_path() -> Path:
     return cfg().active_yaml
 
 
+def active_manifest_path() -> Path:
+    return cfg().run_dir / "active-manifest.json"
+
+
+def read_active_manifest(path: Path | None = None) -> dict | None:
+    return _read_json_mapping(path or active_manifest_path(), warn=True, label="active manifest")
+
+
+def write_active_manifest(data: dict, path: Path | None = None) -> None:
+    manifest = dict(data)
+    manifest.setdefault("schema_version", ACTIVE_MANIFEST_SCHEMA_VERSION)
+    _atomic_write_text(path or active_manifest_path(), json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
 def read_limits(path: Path) -> dict | None:
     data = _read_json_mapping(path, warn=True, label="limits")
     if data is None:
@@ -405,7 +473,22 @@ def read_limits(path: Path) -> dict | None:
 
 
 def write_limits(path: Path, data: dict) -> None:
-    _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
+    out = dict(data)
+    out.setdefault("schema_version", LIMITS_SCHEMA_VERSION)
+    _atomic_write_text(path, json.dumps(out, indent=2) + "\n")
+
+
+def limits_cache_matches(data: dict | None, *, backend: str, fingerprint: dict) -> bool:
+    if not data:
+        return False
+    if data.get("schema_version") != LIMITS_SCHEMA_VERSION:
+        return False
+    if data.get("backend") != backend:
+        return False
+    cached_fingerprint = data.get("fingerprint")
+    if not isinstance(cached_fingerprint, dict):
+        return False
+    return cached_fingerprint == fingerprint
 
 
 def timing_path(provider: str, model_name: str) -> Path:

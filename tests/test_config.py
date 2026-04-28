@@ -20,6 +20,10 @@ from vserve.config import (
     read_profile_yaml,
     try_read_profile_yaml,
     write_profile_yaml,
+    active_manifest_path,
+    read_active_manifest,
+    write_active_manifest,
+    limits_cache_matches,
 )
 
 
@@ -51,6 +55,25 @@ def test_build_config():
     assert c.active_yaml == Path("/test/vllm/configs/active.yaml")
 
 
+def test_build_config_uses_dotvenv_when_venv_missing(tmp_path):
+    root = tmp_path / "vllm"
+    dotvenv_bin = root / ".venv" / "bin"
+    dotvenv_bin.mkdir(parents=True)
+    (dotvenv_bin / "vllm").touch()
+    (dotvenv_bin / "python").touch()
+
+    c = _build_config(
+        vllm_root=root,
+        cuda_home=Path("/usr/local/cuda"),
+        service_name="vllm-test",
+        service_user="testuser",
+        port=9999,
+    )
+
+    assert c.vllm_bin == dotvenv_bin / "vllm"
+    assert c.vllm_python == dotvenv_bin / "python"
+
+
 def test_save_and_load_config(tmp_path, mocker):
     mocker.patch("vserve.config.CONFIG_FILE", tmp_path / "config.yaml")
     c = _build_config(
@@ -66,6 +89,74 @@ def test_save_and_load_config(tmp_path, mocker):
     assert loaded.vllm_root == Path("/my/vllm")
     assert loaded.service_name == "myvllm"
     assert loaded.port == 7777
+
+
+def test_save_config_writes_backend_indexed_schema(tmp_path, mocker):
+    import yaml
+
+    config_file = tmp_path / "config.yaml"
+    mocker.patch("vserve.config.CONFIG_FILE", config_file)
+    c = _build_config(
+        vllm_root=Path("/my/vllm"),
+        cuda_home=Path("/my/cuda"),
+        service_name="myvllm",
+        service_user="myuser",
+        port=7777,
+        llamacpp_root=Path("/my/llama"),
+        llamacpp_service_name="llama-test",
+        llamacpp_service_user="llamauser",
+    )
+
+    save_config(c)
+
+    data = yaml.safe_load(config_file.read_text())
+    assert data["schema_version"] == 2
+    assert data["backends"]["vllm"] == {
+        "root": "/my/vllm",
+        "service_name": "myvllm",
+        "service_user": "myuser",
+        "port": 7777,
+    }
+    assert data["backends"]["llamacpp"] == {
+        "root": "/my/llama",
+        "service_name": "llama-test",
+        "service_user": "llamauser",
+    }
+    assert "vllm_root" not in data
+    assert "llamacpp_root" not in data
+
+
+def test_load_config_backend_indexed_schema(tmp_path, mocker):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "schema_version: 2\n"
+        "cuda_home: /custom/cuda\n"
+        "gpu:\n"
+        "  memory_utilization: 0.91\n"
+        "backends:\n"
+        "  vllm:\n"
+        "    root: /custom/vllm\n"
+        "    service_name: my-vllm\n"
+        "    service_user: myuser\n"
+        "    port: 9999\n"
+        "  llamacpp:\n"
+        "    root: /custom/llama\n"
+        "    service_name: my-llama\n"
+        "    service_user: llamauser\n"
+    )
+    mocker.patch("vserve.config.CONFIG_FILE", config_file)
+    reset_config()
+
+    c = load_config()
+
+    assert c.vllm_root == Path("/custom/vllm")
+    assert c.service_name == "my-vllm"
+    assert c.port == 9999
+    assert c.llamacpp_root == Path("/custom/llama")
+    assert c.llamacpp_service_name == "my-llama"
+    assert c.gpu_memory_utilization == 0.91
+    assert c.backends["vllm"].root == Path("/custom/vllm")
+    assert c.backends["llamacpp"].root == Path("/custom/llama")
 
 
 def test_limits_path():
@@ -91,7 +182,67 @@ def test_write_and_read_limits(tmp_path):
     path = tmp_path / "test.limits.json"
     write_limits(path, data)
     loaded = read_limits(path)
+    assert loaded["schema_version"] == 2
     assert loaded["limits"]["4096"]["fp8"] == 128
+
+
+def test_limits_cache_matches_requires_schema_and_fingerprint(tmp_path):
+    data = {
+        "schema_version": 2,
+        "backend": "vllm",
+        "fingerprint": {
+            "model_path": "/opt/vllm/models/test/model",
+            "vllm_version": "0.20.0",
+            "torch_version": "2.11.0+cu130",
+        },
+        "limits": {"4096": {"auto": 64, "fp8": 128}},
+    }
+
+    assert limits_cache_matches(
+        data,
+        backend="vllm",
+        fingerprint={
+            "model_path": "/opt/vllm/models/test/model",
+            "vllm_version": "0.20.0",
+            "torch_version": "2.11.0+cu130",
+        },
+    )
+    assert not limits_cache_matches(
+        data,
+        backend="vllm",
+        fingerprint={
+            "model_path": "/opt/vllm/models/test/model",
+            "vllm_version": "0.20.1",
+            "torch_version": "2.11.0+cu130",
+        },
+    )
+    assert not limits_cache_matches(
+        {"limits": data["limits"]},
+        backend="vllm",
+        fingerprint=data["fingerprint"],
+    )
+
+
+def test_active_manifest_roundtrip(tmp_path, mocker):
+    mock_c = mocker.Mock(run_dir=tmp_path / "run")
+    mocker.patch("vserve.config.cfg", return_value=mock_c)
+    path = active_manifest_path()
+
+    write_active_manifest(
+        {
+            "backend": "vllm",
+            "service_name": "vllm",
+            "config_path": "/opt/vllm/configs/models/test.yaml",
+            "status": "ready",
+        },
+        path,
+    )
+
+    loaded = read_active_manifest(path)
+    assert loaded is not None
+    assert loaded["schema_version"] == 1
+    assert loaded["backend"] == "vllm"
+    assert path == tmp_path / "run" / "active-manifest.json"
 
 
 def test_read_limits_missing(tmp_path):

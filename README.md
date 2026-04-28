@@ -7,9 +7,9 @@
 Download models. Auto-tune limits. Serve with one command. Multiple backends.
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
-![vLLM 0.19+](https://img.shields.io/badge/vLLM-0.19%2B-ff6f00?style=flat-square)
+![vLLM 0.20.x](https://img.shields.io/badge/vLLM-0.20.x-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-314%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-428%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
@@ -27,6 +27,8 @@ Highlights in `0.5.2b1`:
 - `vserve run` now polls health every 3 seconds and shows the latest 5 `journalctl` lines while waiting, which makes JIT/kernel warmup much easier to follow
 - config, profile, limits, and local state parsing is hardened against malformed files
 - doctor/update/runtime paths are more defensive around probe failures, unreadable files, and backend/service uncertainty
+- vLLM runtime support is pinned to stable `>=0.20,<0.21`; `vserve runtime check vllm` reports installed vLLM, torch, CUDA, Transformers, and dependency health
+- tuning caches are versioned and tied to model, GPU, backend, and runtime fingerprints, so stale limits are recalculated after runtime drift
 
 Current beta caveats:
 
@@ -47,6 +49,14 @@ Or with pip:
 pip install vserve
 ```
 
+Beta/pre-release channel:
+
+```bash
+uv tool install --prerelease allow vserve
+pip install --pre vserve
+vserve update --nightly
+```
+
 For llama.cpp GGUF tuning support:
 
 ```bash
@@ -59,10 +69,36 @@ pip install 'vserve[llamacpp]'
 
 ```bash
 vserve init                        # scan GPU, backends, CUDA, systemd — write config
+vserve runtime check vllm          # verify the external vLLM runtime
 vserve add                         # search HuggingFace, pick variant, download
 vserve run <model>                 # auto-tune + interactive config + serve
 vserve run <model> --tools         # enable tool calling (auto-detected)
 vserve run <model> --backend llamacpp  # force a specific backend
+```
+
+Scriptable serving:
+
+```bash
+vserve run qwen fp8 --yes --context 32768 --slots 4 --kv-cache-dtype fp8 --port 8888
+vserve run qwen fp8 --save-profile fast --yes
+vserve run qwen fp8 --profile fast
+```
+
+Runtime repair and GGUF-only setup:
+
+```bash
+vserve runtime check vllm
+vserve runtime upgrade vllm --stable
+vserve add TheBloke/some-model-GGUF
+vserve run some model q4 --backend llamacpp --yes --gpu-layers 999
+```
+
+Automation:
+
+```bash
+vserve run qwen fp8 --profile fast --yes
+vserve status
+vserve stop
 ```
 
 ---
@@ -122,15 +158,20 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 | `vserve rm <name>` | Remove a downloaded model |
 | `vserve tune [model]` | Calculate context/concurrency limits |
 | `vserve run [model]` | Configure and start serving (auto-tunes if needed) |
-| `vserve run <model> --tools` | Start with tool calling enabled |
-| `vserve run <model> --backend llamacpp` | Force a specific backend |
+| `vserve run MODEL... --yes --context N --slots N` | Non-interactive serving from flags |
+| `vserve run MODEL... --profile NAME` | Serve a saved profile by name or path |
+| `vserve run MODEL... --tools --tool-parser hermes --reasoning-parser qwen3` | Start with explicit parsers |
+| `vserve run MODEL... --backend llamacpp --gpu-layers 999` | Force llama.cpp for GGUF |
+| `vserve profile list\|show\|rm` | Manage saved serving profiles |
 | `vserve stop` | Stop the running server |
 | `vserve status` | Show current serving config |
 | `vserve fan [auto\|off\|30-100]` | GPU fan control with temp-based curve |
 | `vserve doctor` | Check system readiness |
-| `vserve cache clean [--all]` | Clean stale sockets and JIT caches |
+| `vserve cache clean [--dry-run] [--all] [--yes]` | Preview or clean stale sockets and JIT caches |
+| `vserve runtime check vllm` | Check vLLM version/dependency compatibility |
+| `vserve runtime upgrade vllm --stable` | Reinstall vserve's pinned stable vLLM runtime |
 | `vserve version` | Show current version and check for updates |
-| `vserve update` | Update vserve to the latest version |
+| `vserve update [--nightly]` | Update vserve, optionally allowing pre-releases |
 
 All commands support **fuzzy matching** — `vserve run qwen fp8` finds the right model.
 
@@ -175,7 +216,7 @@ Uses `--jinja` to read the model's chat template directly. No parser selection n
 
 | Requirement | Check | Install |
 |:------------|:------|:--------|
-| vLLM 0.19+ | `vllm --version` | [docs.vllm.ai](https://docs.vllm.ai/en/latest/getting_started/installation.html) |
+| stable vLLM 0.20.x | `vserve runtime check vllm` | `vserve runtime upgrade vllm --stable` or [docs.vllm.ai](https://docs.vllm.ai/en/latest/getting_started/installation.html) |
 
 **For llama.cpp backend:**
 
@@ -190,20 +231,23 @@ Uses `--jinja` to read the model's chat template directly. No parser selection n
 Auto-discovered on first run. Override at `~/.config/vserve/config.yaml`:
 
 ```yaml
-# Shared
-port: 8888
-
-# vLLM
-vllm_root: /opt/vllm
+schema_version: 2
 cuda_home: /usr/local/cuda
-service_name: vllm
-service_user: vllm
-
-# llama.cpp (optional)
-llamacpp_root: /opt/llama-cpp
-llamacpp_service_name: llama-cpp
-llamacpp_service_user: llama-cpp
+gpu:
+  memory_utilization: 0.91
+backends:
+  vllm:
+    root: /opt/vllm
+    service_name: vllm
+    service_user: vllm
+    port: 8888
+  llamacpp:
+    root: /opt/llama-cpp
+    service_name: llama-cpp
+    service_user: llama-cpp
 ```
+
+Legacy top-level `vllm_root`, `service_name`, `llamacpp_root`, and GPU memory keys still load, but newly saved config uses the backend-indexed schema above.
 
 ---
 
@@ -213,13 +257,20 @@ llamacpp_service_user: llama-cpp
 /opt/vllm/                     # vLLM backend
 ├── venv/bin/vllm              # Python venv
 ├── models/                    # safetensors models
-├── configs/                   # limits + profiles
+├── configs/
+│   ├── active.yaml            # active profile symlink
+│   └── models/                # limits + YAML profiles
+├── run/
+│   └── active-manifest.json   # active backend state
 └── logs/
 
 /opt/llama-cpp/                # llama.cpp backend
 ├── bin/llama-server           # compiled binary
 ├── models/                    # GGUF models
-├── configs/                   # JSON configs
+├── configs/
+│   ├── active.sh              # active launch script symlink
+│   ├── active.json            # active config symlink
+│   └── models/                # JSON profiles
 └── logs/
 ```
 
@@ -249,7 +300,7 @@ Backend Protocol
 └── (future: SGLang, etc.)
 ```
 
-The registry auto-detects the right backend from the model format. All CLI commands work through the protocol — no backend-specific code in the command layer.
+The registry auto-detects the right backend from the model format. Runtime checks, tuning fingerprints, profile/config generation, service lifecycle, active manifests, and status summaries live behind the backend protocol so the command layer can stay focused on user workflows.
 
 ---
 
@@ -259,7 +310,7 @@ The registry auto-detects the right backend from the model format. All CLI comma
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 314 tests
+uv run pytest tests/              # 428 tests
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/           # type check
 ```

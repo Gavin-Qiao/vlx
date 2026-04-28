@@ -8,6 +8,7 @@ def _mock_cfg(mocker, service_name="vllm", active_yaml=None):
     mock = Mock()
     mock.service_name = service_name
     mock.active_yaml = active_yaml or Path("/tmp/active.yaml")
+    mock.run_dir = mock.active_yaml.parent / "run"
     mocker.patch("vserve.serve.cfg", return_value=mock)
     return mock
 
@@ -51,6 +52,52 @@ def test_start_vllm_with_config(mocker, tmp_path):
     start_vllm(config_path=config_file)
     assert active.is_symlink()
     mock_systemctl.assert_called_with("start")
+
+
+def test_start_vllm_writes_active_manifest(mocker, tmp_path):
+    config_file = tmp_path / "test.yaml"
+    config_file.write_text("model: /opt/vllm/models/test\nport: 8888\n")
+
+    active = tmp_path / "active.yaml"
+    mock_c = _mock_cfg(mocker, active_yaml=active)
+    mocker.patch("vserve.serve._systemctl", return_value=(True, "", ""))
+
+    start_vllm(config_path=config_file)
+
+    from vserve.config import read_active_manifest
+
+    manifest = read_active_manifest(mock_c.run_dir / "active-manifest.json")
+    assert manifest is not None
+    assert manifest["backend"] == "vllm"
+    assert manifest["service_name"] == "vllm"
+    assert manifest["config_path"] == str(config_file.resolve())
+    assert manifest["status"] == "starting"
+
+
+def test_start_vllm_rolls_back_active_link_on_systemctl_failure(mocker, tmp_path):
+    previous_config = tmp_path / "previous.yaml"
+    previous_config.write_text("model: previous\n")
+    next_config = tmp_path / "next.yaml"
+    next_config.write_text("model: next\n")
+    active = tmp_path / "active.yaml"
+    active.symlink_to(previous_config)
+
+    mock_c = _mock_cfg(mocker, active_yaml=active)
+    mocker.patch("vserve.serve._systemctl", return_value=(False, "", "Unit not found"))
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="systemctl start failed"):
+        start_vllm(next_config)
+
+    assert active.resolve() == previous_config.resolve()
+
+    from vserve.config import read_active_manifest
+
+    manifest = read_active_manifest(mock_c.run_dir / "active-manifest.json")
+    assert manifest is not None
+    assert manifest["status"] == "failed"
+    assert "Unit not found" in manifest["error"]
 
 
 def test_systemctl_uses_service_name(mocker):

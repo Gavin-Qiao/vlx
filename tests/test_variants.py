@@ -183,6 +183,27 @@ def test_gguf_variants():
     assert "Q8_0" in labels
 
 
+def test_split_gguf_shards_are_one_variant():
+    """Split GGUF shards should be grouped as one downloadable variant."""
+    files = {
+        "config.json": 1000,
+        "Model-Q4_K_M-00001-of-00002.gguf": 2_000_000_000,
+        "Model-Q4_K_M-00002-of-00002.gguf": 2_000_000_000,
+        "Model-Q8_0.gguf": 8_000_000_000,
+    }
+
+    variants, shared = discover_variants(files, {})
+
+    labels = {v.label for v in variants}
+    assert labels == {"Q4_K_M", "Q8_0"}
+    q4 = next(v for v in variants if v.label == "Q4_K_M")
+    assert q4.num_files == 2
+    assert set(q4.files) == {
+        "Model-Q4_K_M-00001-of-00002.gguf",
+        "Model-Q4_K_M-00002-of-00002.gguf",
+    }
+
+
 def test_gguf_iq_quant():
     """GGUF with IQ quant naming."""
     files = {"model-IQ4_XS.gguf": 3_000_000_000}

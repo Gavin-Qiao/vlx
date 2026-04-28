@@ -1,6 +1,7 @@
 """Variant discovery: group HuggingFace repo files into downloadable model variants."""
 
 from dataclasses import dataclass
+import re
 
 
 _WEIGHT_EXTENSIONS = {".safetensors", ".bin", ".pt", ".pth", ".gguf"}
@@ -77,13 +78,22 @@ def discover_variants(
             variants.append(Variant(label=_label_from_orphan(path), files={path: size}))
             claimed.add(path)
 
-    # 3. GGUF files
+    # 3. GGUF files. Split shards are one runnable variant.
+    split_gguf: dict[tuple[str, str], dict[str, int]] = {}
     for path, size in sorted(files.items()):
         if path in claimed or _is_skipped(path):
             continue
         if _ext(path) == ".gguf":
+            split = _split_gguf_group(path)
+            if split is not None:
+                split_gguf.setdefault(split, {})[path] = size
+                claimed.add(path)
+                continue
             variants.append(Variant(label=_label_from_gguf(path), files={path: size}))
             claimed.add(path)
+
+    for (_base, label), grouped_files in sorted(split_gguf.items()):
+        variants.append(Variant(label=label, files=dict(sorted(grouped_files.items()))))
 
     # 4. Shared files
     shared: dict[str, int] = {}
@@ -186,6 +196,29 @@ def _label_from_orphan(path: str) -> str:
 def _label_from_gguf(path: str) -> str:
     filename = path.rsplit("/", 1)[-1]
     stem = filename.removesuffix(".gguf")
+    split = _split_gguf_group(path)
+    if split is not None:
+        return split[1]
+    for sep in ["-", ".", "_"]:
+        parts = stem.rsplit(sep, 1)
+        if len(parts) == 2 and parts[1].startswith(("Q", "IQ")):
+            return parts[1]
+    return stem
+
+
+def _split_gguf_group(path: str) -> tuple[str, str] | None:
+    filename = path.rsplit("/", 1)[-1]
+    match = re.match(r"(?P<base>.+)-\d{5}-of-\d{5}\.gguf$", filename)
+    if match is None:
+        return None
+    base = match.group("base")
+    label = _label_from_gguf_stem(base)
+    directory = path.rsplit("/", 1)[0] if "/" in path else ""
+    group_key = f"{directory}/{base}" if directory else base
+    return group_key, label
+
+
+def _label_from_gguf_stem(stem: str) -> str:
     for sep in ["-", ".", "_"]:
         parts = stem.rsplit(sep, 1)
         if len(parts) == 2 and parts[1].startswith(("Q", "IQ")):
