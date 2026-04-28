@@ -304,7 +304,7 @@ def build_tuning_fingerprint(
     gpu: Any,
     backend: str,
     gpu_mem_util: float,
-    runtime_info: RuntimeInfo | None = None,
+    runtime_info: Any | None = None,
 ) -> dict[str, Any]:
     """Return the inputs that make a cached tuning table valid."""
     fingerprint: dict[str, Any] = {
@@ -331,9 +331,15 @@ def build_tuning_fingerprint(
         "torch_version": None,
         "torch_cuda": None,
         "transformers_version": None,
+        "runtime_executable": None,
+        "llama_server_version": None,
     }
     if runtime_info is not None:
-        runtime_fingerprint = runtime_info.fingerprint()
-        if isinstance(runtime_fingerprint, dict):
-            fingerprint.update(runtime_fingerprint)
+        if isinstance(runtime_info, dict):
+            fingerprint["runtime_executable"] = runtime_info.get("executable")
+            fingerprint["llama_server_version"] = runtime_info.get("llama_server_version")
+        else:
+            runtime_fingerprint = runtime_info.fingerprint()
+            if isinstance(runtime_fingerprint, dict):
+                fingerprint.update(runtime_fingerprint)
     return fingerprint

@@ -13,6 +13,8 @@ vserve runtime upgrade vllm --stable
 
 `vserve runtime check vllm` reports the external vLLM version plus torch, torch CUDA, Transformers, Hugging Face Hub, and `pip check` results. Tuning caches include these runtime facts, so changing vLLM or torch causes vserve to recalculate limits instead of reusing stale capacity numbers.
 
+`vserve runtime upgrade vllm --stable` requires a configured vLLM virtualenv, a stopped backend service, and installs vserve's pinned runtime (`vllm==0.20.0`). It refuses to mutate the environment if backend state is active or uncertain.
+
 For beta/pre-release vserve builds:
 
 ```bash
@@ -106,6 +108,10 @@ vserve cache clean --all --yes
 ```
 
 `cache clean` refuses to mutate caches while any backend is running or when backend state cannot be confirmed.
+
+`vserve cache clean --all` deletes stale sockets under `$VLLM_ROOT/tmp` plus `$VLLM_ROOT/.cache/flashinfer`, `$VLLM_ROOT/.cache/torch_extensions`, and `$VLLM_ROOT/.cache/vllm`. It does not delete downloaded models, profile YAML/JSON, limits caches, logs, `.env`, or active manifests.
+
+For automation, `vserve run --yes` never prompts and refuses to replace a running backend unless you pass `--replace`.
 
 ### torch.compile cache
 

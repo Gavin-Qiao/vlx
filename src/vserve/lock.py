@@ -118,6 +118,11 @@ class VserveLock:
     def release(self) -> None:
         if self._fd is not None:
             try:
+                os.ftruncate(self._fd, 0)
+                os.lseek(self._fd, 0, os.SEEK_SET)
+            except OSError:
+                pass
+            try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
             except OSError:
                 pass
@@ -126,10 +131,6 @@ class VserveLock:
             except OSError:
                 pass
             self._fd = None
-            try:
-                self._path.unlink(missing_ok=True)
-            except OSError:
-                pass  # another user's sticky-bit protection
 
     def __enter__(self) -> VserveLock:
         self.acquire()

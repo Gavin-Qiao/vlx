@@ -46,18 +46,42 @@ class LlamaCppBackend:
         return Path(found) if found else None
 
     def runtime_info(self) -> dict:
+        entrypoint = self.find_entrypoint()
+        errors: list[str] = []
+        version: str | None = None
+        if entrypoint is None:
+            errors.append("llama-server entrypoint not found")
+        else:
+            try:
+                result = subprocess.run(
+                    [str(entrypoint), "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                output = result.stdout.strip() or result.stderr.strip()
+                if result.returncode == 0:
+                    version = output or None
+                else:
+                    errors.append(output or f"{entrypoint} --version failed")
+            except Exception as exc:
+                errors.append(f"{entrypoint} --version failed: {exc}")
         return {
             "backend": self.name,
-            "executable": str(self.find_entrypoint() or ""),
+            "executable": str(entrypoint or ""),
+            "llama_server_version": version,
+            "errors": errors,
         }
 
     def compatibility(self) -> dict:
+        info = self.runtime_info()
+        errors = list(info.get("errors") or [])
         return {
             "backend": self.name,
-            "supported": True,
-            "messages": ["llama.cpp runtime is managed separately."],
+            "supported": not errors,
+            "messages": ["llama.cpp runtime is available."] if not errors else [],
             "warnings": [],
-            "errors": [],
+            "errors": errors,
         }
 
     def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float = 0.90) -> dict:
@@ -142,17 +166,32 @@ class LlamaCppBackend:
             return None
 
         shard_pattern = re.compile(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
-        groups: dict[str, list[Path]] = {}
+        groups: dict[str, dict[int, Path]] = {}
+        totals: dict[str, int] = {}
         singles: list[Path] = []
         for path in gguf_files:
             match = shard_pattern.match(path.name)
             if match:
-                groups.setdefault(match.group("base"), []).append(path)
+                base = match.group("base")
+                groups.setdefault(base, {})[int(match.group("idx"))] = path
+                totals[base] = int(match.group("total"))
             else:
                 singles.append(path)
 
-        candidates: list[list[Path]] = [sorted(paths) for paths in groups.values()]
+        incomplete: list[str] = []
+        candidates: list[list[Path]] = []
+        for base, paths_by_index in groups.items():
+            total = totals[base]
+            expected = set(range(1, total + 1))
+            found = set(paths_by_index)
+            if found != expected:
+                missing = ", ".join(f"{idx:05d}" for idx in sorted(expected - found))
+                incomplete.append(f"{base} missing shard(s): {missing}")
+                continue
+            candidates.append([paths_by_index[idx] for idx in sorted(paths_by_index)])
         candidates.extend([[path] for path in singles])
+        if not candidates and incomplete:
+            raise ValueError(f"Incomplete split GGUF shard set in {model_path}: {'; '.join(incomplete)}")
         best = max(candidates, key=lambda files: (sum(path.stat().st_size for path in files), files[0].name))
         return best[0], best
 
@@ -229,7 +268,9 @@ class LlamaCppBackend:
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
         """Build llama-server JSON config."""
         selected = self._select_gguf_model_files(model.path)
-        model_file = str(selected[0]) if selected is not None else str(model.path)
+        if selected is None:
+            raise ValueError(f"No GGUF files in {model.path}")
+        model_file = str(selected[0])
 
         cfg: dict = {
             "model": model_file,
@@ -294,6 +335,9 @@ class LlamaCppBackend:
         import shlex
         active = self._active_config_path()
         active.parent.mkdir(parents=True, exist_ok=True)
+        json_link = active.with_suffix(".json")
+        previous_active_target = active.readlink() if active.is_symlink() else None
+        previous_json_target = json_link.readlink() if json_link.is_symlink() else None
 
         # Per-model script in configs/models/
         model_script = config_path.with_suffix(".sh")
@@ -309,7 +353,6 @@ class LlamaCppBackend:
         active.symlink_to(model_script.resolve())
 
         # Symlink active.json → per-model JSON
-        json_link = active.with_suffix(".json")
         json_link.unlink(missing_ok=True)
         json_link.symlink_to(model_json.resolve())
 
@@ -318,6 +361,13 @@ class LlamaCppBackend:
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
+            self._restore_active_links(
+                active,
+                json_link,
+                previous_active_target=previous_active_target,
+                previous_json_target=previous_json_target,
+            )
+            self._write_failed_manifest(config_path, result.stderr.strip() or result.stdout.strip())
             raise RuntimeError(f"systemctl start {self.service_name} failed: {result.stderr}")
 
     def stop(self) -> None:
@@ -407,3 +457,35 @@ class LlamaCppBackend:
 
     def _active_config_path(self) -> Path:
         return self.root_dir / "configs" / "active.sh"
+
+    @staticmethod
+    def _restore_active_links(
+        active: Path,
+        json_link: Path,
+        *,
+        previous_active_target: Path | None,
+        previous_json_target: Path | None,
+    ) -> None:
+        for link, target in ((active, previous_active_target), (json_link, previous_json_target)):
+            try:
+                link.unlink(missing_ok=True)
+                if target is not None:
+                    link.symlink_to(target)
+            except OSError:
+                pass
+
+    def _write_failed_manifest(self, config_path: Path, error: str) -> None:
+        from datetime import datetime, timezone
+        from vserve.config import write_active_manifest
+
+        try:
+            write_active_manifest({
+                "backend": self.name,
+                "service_name": self.service_name,
+                "config_path": str(config_path.resolve()),
+                "status": "failed",
+                "error": error,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, self.active_manifest_path())
+        except Exception:
+            pass

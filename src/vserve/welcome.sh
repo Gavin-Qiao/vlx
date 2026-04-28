@@ -14,12 +14,40 @@ _svc_name="vllm"
 _port="8888"
 
 _llamacpp_root=""
+_llamacpp_svc="llama-cpp"
 
 if [ -f "$_vserve_cfg" ]; then
-    _vllm_root="$(grep '^vllm_root:' "$_vserve_cfg" 2>/dev/null | sed 's/vllm_root: *//')" || _vllm_root="/opt/vllm"
-    _svc_name="$(grep '^service_name:' "$_vserve_cfg" 2>/dev/null | sed 's/service_name: *//')" || _svc_name="vllm"
-    _port="$(grep '^port:' "$_vserve_cfg" 2>/dev/null | sed 's/port: *//')" || _port="8888"
-    _llamacpp_root="$(grep '^llamacpp_root:' "$_vserve_cfg" 2>/dev/null | sed 's/llamacpp_root: *//')"
+    _cfg_values="$(python3 - "$_vserve_cfg" 2>/dev/null <<'PY'
+import shlex
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+backends = data.get("backends") or {}
+vllm = backends.get("vllm") or {}
+llamacpp = backends.get("llamacpp") or {}
+
+def emit(name, value):
+    if value is not None and value != "":
+        print(f"{name}={shlex.quote(str(value))}")
+
+emit("_vllm_root", vllm.get("root", data.get("vllm_root")))
+emit("_svc_name", vllm.get("service_name", data.get("service_name")))
+emit("_port", vllm.get("port", data.get("port")))
+emit("_llamacpp_root", llamacpp.get("root", data.get("llamacpp_root")))
+emit("_llamacpp_svc", llamacpp.get("service_name", data.get("llamacpp_service_name")))
+PY
+)"
+    if [ -n "$_cfg_values" ]; then
+        eval "$_cfg_values"
+    else
+        _vllm_root="$(grep '^vllm_root:' "$_vserve_cfg" 2>/dev/null | sed 's/vllm_root: *//')" || _vllm_root="/opt/vllm"
+        _svc_name="$(grep '^service_name:' "$_vserve_cfg" 2>/dev/null | sed 's/service_name: *//')" || _svc_name="vllm"
+        _port="$(grep '^port:' "$_vserve_cfg" 2>/dev/null | sed 's/port: *//')" || _port="8888"
+        _llamacpp_root="$(grep '^llamacpp_root:' "$_vserve_cfg" 2>/dev/null | sed 's/llamacpp_root: *//')"
+    fi
 fi
 
 # ── Gather data ──────────────────────────────────────
@@ -29,7 +57,7 @@ _active_backend=""
 if systemctl is-active --quiet "$_svc_name" 2>/dev/null; then
     _s="active"
     _active_backend="vllm"
-elif [ -n "$_llamacpp_root" ] && systemctl is-active --quiet "llama-cpp" 2>/dev/null; then
+elif [ -n "$_llamacpp_root" ] && systemctl is-active --quiet "$_llamacpp_svc" 2>/dev/null; then
     _s="active"
     _active_backend="llamacpp"
 fi
@@ -178,7 +206,7 @@ _body="$(gum join --vertical \
 gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2" "$_body"
 
 unset -f _lbl _mkbar
-unset _vserve_cfg _vllm_root _llamacpp_root _svc_name _port
+unset _vserve_cfg _cfg_values _vllm_root _llamacpp_root _llamacpp_svc _svc_name _port
 unset _s _m _mc _lc_mc _active _active_backend _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
 unset _proc_data _ph _prows _row

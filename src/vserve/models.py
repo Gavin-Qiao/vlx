@@ -61,7 +61,8 @@ def detect_model(model_dir: Path) -> ModelInfo:
     gguf_files = list(model_dir.glob("*.gguf"))
 
     has_safetensors = any(model_dir.glob("*.safetensors"))
-    if gguf_files and not has_safetensors:
+    has_bin = any(model_dir.glob("*.bin"))
+    if gguf_files and not has_safetensors and not has_bin:
         # GGUF model — may or may not have config.json alongside
         size_bytes = sum(f.stat().st_size for f in gguf_files)
         size_gb = round(size_bytes / (1024**3), 1)
@@ -115,11 +116,14 @@ def detect_model(model_dir: Path) -> ModelInfo:
         "num_attention_heads",
         config.get("num_attention_heads"),
     )
+    if num_kv_heads is None and num_attn_heads is not None:
+        num_kv_heads = num_attn_heads
     head_dim_val = text_config.get("head_dim", config.get("head_dim"))
     if head_dim_val is None and hidden_size and num_attn_heads:
         head_dim_val = hidden_size // num_attn_heads
 
     size_bytes = sum(f.stat().st_size for f in model_dir.glob("*.safetensors"))
+    size_bytes += sum(f.stat().st_size for f in model_dir.glob("*.bin"))
     size_gb = round(size_bytes / (1024**3), 1)
 
     return ModelInfo(
@@ -157,6 +161,8 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
             continue
         for model_dir in model_dirs:
             if not model_dir.is_dir():
+                continue
+            if (model_dir / ".vserve-ignore").exists():
                 continue
             try:
                 has_config = (model_dir / "config.json").exists()

@@ -34,12 +34,11 @@ class VllmBackend:
         return cfg().vllm_root
 
     def can_serve(self, model: ModelInfo) -> bool:
-        """True if model has safetensors or .bin weights (not GGUF-only)."""
+        """True if model has top-level safetensors or .bin weights."""
         p = model.path
         has_safetensors = any(p.glob("*.safetensors"))
         has_bin = any(p.glob("*.bin"))
-        has_gguf = any(p.glob("*.gguf"))
-        return (has_safetensors or has_bin) or ((p / "config.json").exists() and not has_gguf)
+        return has_safetensors or has_bin
 
     def find_entrypoint(self) -> Path | None:
         from vserve.config import cfg
@@ -66,7 +65,7 @@ class VllmBackend:
         result["backend"] = self.name
         return result
 
-    def available_tool_parsers(self) -> set[str]:
+    def available_tool_parsers(self) -> set[str] | None:
         """Return tool parsers supported by the installed vLLM runtime."""
         try:
             from vllm.entrypoints.openai.tool_parsers import ToolParserManager  # type: ignore[import-not-found, import-untyped]
@@ -75,11 +74,9 @@ class VllmBackend:
                 return set(parsers)
         except Exception:
             pass
-        from vserve.tools import KNOWN_TOOL_PARSERS
+        return None
 
-        return set(KNOWN_TOOL_PARSERS)
-
-    def available_reasoning_parsers(self) -> set[str]:
+    def available_reasoning_parsers(self) -> set[str] | None:
         """Return reasoning parsers supported by the installed vLLM runtime."""
         try:
             from vllm.reasoning import ReasoningParserManager  # type: ignore[import-not-found, import-untyped]
@@ -95,18 +92,21 @@ class VllmBackend:
                 return set(parsers)
         except Exception:
             pass
-        from vserve.tools import KNOWN_REASONING_PARSERS
-
-        return set(KNOWN_REASONING_PARSERS)
+        return None
 
     @staticmethod
-    def _format_available(values: set[str]) -> str:
+    def _format_available(values: set[str] | None) -> str:
         return ", ".join(sorted(values)) if values else "(none reported)"
 
     def _validate_parsers(self, choices: dict) -> None:
         tool_parser = choices.get("tool_parser")
         if tool_parser:
             available = self.available_tool_parsers()
+            if available is None:
+                raise RuntimeError(
+                    "Could not inspect installed vLLM tool parsers. "
+                    "Activate the configured vLLM runtime or pass a parser supported by the installed runtime."
+                )
             if tool_parser not in available:
                 raise ValueError(
                     f"Unknown vLLM tool parser '{tool_parser}'. "
@@ -115,6 +115,11 @@ class VllmBackend:
         reasoning_parser = choices.get("reasoning_parser")
         if reasoning_parser:
             available = self.available_reasoning_parsers()
+            if available is None:
+                raise RuntimeError(
+                    "Could not inspect installed vLLM reasoning parsers. "
+                    "Activate the configured vLLM runtime or pass a parser supported by the installed runtime."
+                )
             if reasoning_parser not in available:
                 raise ValueError(
                     f"Unknown vLLM reasoning parser '{reasoning_parser}'. "
@@ -134,13 +139,14 @@ class VllmBackend:
             "host": "0.0.0.0",
             "port": choices.get("port", 8888),
             "dtype": "bfloat16",
-            "trust-remote-code": True,
             "gpu-memory-utilization": choices["gpu_mem_util"],
             "max-model-len": choices["context"],
             "max-num-seqs": choices["slots"],
             "kv-cache-dtype": choices["kv_dtype"],
             "enable-prefix-caching": True,
         }
+        if choices.get("trust_remote_code"):
+            cfg["trust-remote-code"] = True
         bt = choices.get("batched_tokens")
         if bt is not None:
             cfg["max-num-batched-tokens"] = bt

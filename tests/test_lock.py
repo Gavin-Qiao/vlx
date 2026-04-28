@@ -53,6 +53,25 @@ def test_release_idempotent():
     lock.release()  # should not raise
 
 
+def test_release_keeps_lock_file_stable(tmp_path):
+    lock = VserveLock("stable", "test")
+    lock.acquire()
+    lock_file = tmp_path / "vserve-stable.lock"
+    first_inode = lock_file.stat().st_ino
+    lock.release()
+
+    assert lock_file.exists()
+
+    next_lock = VserveLock("stable", "next")
+    next_lock.acquire()
+    try:
+        assert lock_file.stat().st_ino == first_inode
+        data = json.loads(lock_file.read_text().strip())
+        assert data["command"] == "next"
+    finally:
+        next_lock.release()
+
+
 # ── Contention ───────────────────────────────────────
 
 def test_second_acquire_raises(tmp_path):

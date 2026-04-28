@@ -204,6 +204,21 @@ def test_split_gguf_shards_are_one_variant():
     }
 
 
+def test_incomplete_split_gguf_shards_are_not_offered():
+    """Do not offer a split GGUF group unless every shard is present."""
+    files = {
+        "config.json": 1000,
+        "Model-Q4_K_M-00001-of-00002.gguf": 2_000_000_000,
+        "Model-Q8_0.gguf": 8_000_000_000,
+    }
+
+    variants, shared = discover_variants(files, {})
+
+    labels = {v.label for v in variants}
+    assert labels == {"Q8_0"}
+    assert "Model-Q4_K_M-00001-of-00002.gguf" not in shared
+
+
 def test_gguf_iq_quant():
     """GGUF with IQ quant naming."""
     files = {"model-IQ4_XS.gguf": 3_000_000_000}

@@ -79,21 +79,28 @@ def discover_variants(
             claimed.add(path)
 
     # 3. GGUF files. Split shards are one runnable variant.
-    split_gguf: dict[tuple[str, str], dict[str, int]] = {}
+    split_gguf: dict[tuple[str, str, int], dict[int, tuple[str, int]]] = {}
     for path, size in sorted(files.items()):
         if path in claimed or _is_skipped(path):
             continue
         if _ext(path) == ".gguf":
-            split = _split_gguf_group(path)
+            split = _split_gguf_part(path)
             if split is not None:
-                split_gguf.setdefault(split, {})[path] = size
+                group_key, label, idx, total = split
+                split_gguf.setdefault((group_key, label, total), {})[idx] = (path, size)
                 claimed.add(path)
                 continue
             variants.append(Variant(label=_label_from_gguf(path), files={path: size}))
             claimed.add(path)
 
-    for (_base, label), grouped_files in sorted(split_gguf.items()):
-        variants.append(Variant(label=label, files=dict(sorted(grouped_files.items()))))
+    for (_base, label, total), grouped_files in sorted(split_gguf.items()):
+        if set(grouped_files) != set(range(1, total + 1)):
+            continue
+        files_for_variant = {
+            path: size
+            for _idx, (path, size) in sorted(grouped_files.items())
+        }
+        variants.append(Variant(label=label, files=files_for_variant))
 
     # 4. Shared files
     shared: dict[str, int] = {}
@@ -207,15 +214,23 @@ def _label_from_gguf(path: str) -> str:
 
 
 def _split_gguf_group(path: str) -> tuple[str, str] | None:
+    split = _split_gguf_part(path)
+    if split is None:
+        return None
+    group_key, label, _idx, _total = split
+    return group_key, label
+
+
+def _split_gguf_part(path: str) -> tuple[str, str, int, int] | None:
     filename = path.rsplit("/", 1)[-1]
-    match = re.match(r"(?P<base>.+)-\d{5}-of-\d{5}\.gguf$", filename)
+    match = re.match(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", filename)
     if match is None:
         return None
     base = match.group("base")
     label = _label_from_gguf_stem(base)
     directory = path.rsplit("/", 1)[0] if "/" in path else ""
     group_key = f"{directory}/{base}" if directory else base
-    return group_key, label
+    return group_key, label, int(match.group("idx")), int(match.group("total"))
 
 
 def _label_from_gguf_stem(stem: str) -> str:

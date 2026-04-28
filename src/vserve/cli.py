@@ -258,6 +258,9 @@ def dashboard(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         from vserve.version import background_refresh
         background_refresh()
+        import sys
+        if "--json" in sys.argv or ctx.invoked_subcommand in {"status", "doctor"}:
+            return
         from rich.rule import Rule
         console.print(Rule(title=f"[bold cyan]vserve[/bold cyan] [dim]{__version__}[/dim]", style="cyan"))
         if ctx.invoked_subcommand not in ("version", "update"):
@@ -426,8 +429,7 @@ def update(
 
     pip = shutil.which("pip") or shutil.which("pip3")
     if pip:
-        import sys
-        pip_cmd = [sys.executable, "-m", "pip"]
+        pip_cmd = [pip]
         if nightly:
             console.print("[dim]Upgrading to latest pre-release via pip...[/dim]")
             _run_checked([*pip_cmd, "install", "--upgrade", "--pre", "vserve"], "pip install")
@@ -1004,7 +1006,22 @@ def _materialize_subdirectory_variant(
         stripped = pathlib.PurePosixPath(*rel.parts[1:])
         link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*stripped.parts))
 
+    (local_dir / ".vserve-ignore").write_text("materialized variants live in sibling model roots\n")
     return materialized
+
+
+def _safe_variant_label(label: str) -> str:
+    import re
+
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "variant"
+
+
+def _gguf_variant_root(base_dir: pathlib.Path, *, model_name: str, variant, force_suffix: bool) -> pathlib.Path:
+    label = _safe_variant_label(str(getattr(variant, "label", "variant")))
+    if not force_suffix:
+        return base_dir
+    suffix = label if label.lower() not in model_name.lower() else "variant"
+    return base_dir.parent / f"{model_name}-{suffix}"
 
 
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
@@ -1077,6 +1094,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
 
     console.print(f"\n[bold]Downloading[/bold] {model_id}")
     console.print(f"  To: {local_dir}\n")
+    downloaded_dirs: list[pathlib.Path] = []
 
     lock_name = f"download-{provider}--{model_name}"
     lock = VserveLock(lock_name, f"downloading {model_id}")
@@ -1132,22 +1150,27 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     try:
         if is_gguf_download:
             from huggingface_hub import hf_hub_download  # type: ignore[import-untyped]
-            gguf_files = [f for f in allow_files if f.endswith(".gguf")]
-            other_files = [f for f in allow_files if not f.endswith(".gguf")]
-            # Download GGUF files individually
-            for filename in gguf_files:
-                hf_hub_download(repo_id=model_id, filename=filename, local_dir=local_dir)
-            # Also grab tokenizer_config.json for tool detection
-            try:
-                hf_hub_download(repo_id=model_id, filename="tokenizer_config.json", local_dir=local_dir)
-            except Exception:
-                pass  # not all GGUF repos have it
-            # Download any shared non-GGUF files
-            for filename in other_files:
-                try:
-                    hf_hub_download(repo_id=model_id, filename=filename, local_dir=local_dir)
-                except Exception:
-                    pass
+            force_suffix = len(selected_variants) > 1
+            for variant in selected_variants:
+                variant_dir = _gguf_variant_root(
+                    local_dir,
+                    model_name=model_name,
+                    variant=variant,
+                    force_suffix=force_suffix,
+                )
+                variant_dir.mkdir(parents=True, exist_ok=True)
+                downloaded_dirs.append(variant_dir)
+                for filename in variant.files:
+                    if filename.endswith(".gguf"):
+                        hf_hub_download(repo_id=model_id, filename=filename, local_dir=variant_dir)
+                # Also grab tokenizer_config.json and shared non-GGUF files in each runnable root.
+                for filename in ["tokenizer_config.json", *shared.keys()]:
+                    if filename.endswith(".gguf"):
+                        continue
+                    try:
+                        hf_hub_download(repo_id=model_id, filename=filename, local_dir=variant_dir)
+                    except Exception:
+                        pass
         else:
             snapshot_download(  # type: ignore[operator]
                 repo_id=model_id,
@@ -1160,42 +1183,60 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
                 selected_variants=selected_variants,
                 shared=shared,
             )
+            downloaded_dirs.append(local_dir)
     except Exception as e:
         console.print(f"[red]Download failed:[/red] {e}")
         raise typer.Exit(1)
     finally:
         lock.release()
 
-    try:
-        from vserve.models import detect_model
-        info = detect_model(local_dir)
-    except Exception:
-        info = None
-    if info:
-        console.print(f"\n[green]Downloaded {info.full_name}[/green]")
-        console.print(f"  Size: {info.model_size_gb:.1f} GB")
-        console.print(f"  Quant: {info.quant_method or 'none'}")
-        if info.max_position_embeddings:
-            console.print(f"  Context: {info.max_position_embeddings:,} tokens")
-
-        # Auto-tune after download
+    for downloaded_dir in downloaded_dirs or [local_dir]:
         try:
-            from vserve.backends import get_backend
-            from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
-            from vserve.config import cfg as _cfg3, write_limits
-            backend = get_backend(info)
-            gpu = get_gpu_info()
-            gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3())
-            console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
-            limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
-            lim_path = limits_path(info.provider, info.model_name)
-            write_limits(lim_path, limits_data)
-            console.print(f"[green]Tuned.[/green] Ready: vserve run {model_name}")
-        except Exception as e:
-            console.print(f"  [yellow]Auto-tune skipped: {e}[/yellow]")
-            console.print(f"  Run: vserve tune {model_name}")
-    else:
-        console.print(f"\n[green]Downloaded to {local_dir}[/green]")
+            from vserve.models import detect_model
+            info = detect_model(downloaded_dir)
+        except Exception:
+            info = None
+        if info:
+            console.print(f"\n[green]Downloaded {info.full_name}[/green]")
+            console.print(f"  Size: {info.model_size_gb:.1f} GB")
+            console.print(f"  Quant: {info.quant_method or 'none'}")
+            if info.max_position_embeddings:
+                console.print(f"  Context: {info.max_position_embeddings:,} tokens")
+
+            # Auto-tune after download
+            try:
+                from vserve.backends import get_backend
+                from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
+                from vserve.config import cfg as _cfg3, write_limits
+                from vserve.runtime import build_tuning_fingerprint
+                backend = get_backend(info)
+                gpu = get_gpu_info()
+                gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3())
+                console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
+                limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
+                runtime_info = None
+                runtime_info_fn = getattr(backend, "runtime_info", None)
+                if callable(runtime_info_fn):
+                    try:
+                        runtime_info = runtime_info_fn()
+                    except Exception:
+                        runtime_info = None
+                limits_data["backend"] = backend.name
+                limits_data["fingerprint"] = build_tuning_fingerprint(
+                    model_info=info,
+                    gpu=gpu,
+                    backend=backend.name,
+                    gpu_mem_util=gpu_mem_util,
+                    runtime_info=runtime_info,
+                )
+                lim_path = limits_path(info.provider, info.model_name)
+                write_limits(lim_path, limits_data)
+                console.print(f"[green]Tuned.[/green] Ready: vserve run {info.model_name}")
+            except Exception as e:
+                console.print(f"  [yellow]Auto-tune skipped: {e}[/yellow]")
+                console.print(f"  Run: vserve tune {info.model_name}")
+        else:
+            console.print(f"\n[green]Downloaded to {downloaded_dir}[/green]")
     return True
 
 
@@ -1353,7 +1394,7 @@ def tune(
 
         runtime_info = None
         runtime_info_fn = getattr(backend, "runtime_info", None)
-        if backend.name == "vllm" and callable(runtime_info_fn):
+        if callable(runtime_info_fn):
             try:
                 runtime_info = runtime_info_fn()
             except Exception:
@@ -1539,7 +1580,14 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
     console.print()
 
 
-def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
+def _launch_backend(
+    backend,
+    cfg_path: "pathlib.Path",
+    label: str,
+    *,
+    non_interactive: bool = False,
+    replace: bool = False,
+) -> None:
     """Stop any running backend, start with given config, wait for health."""
     import json
     import subprocess
@@ -1630,8 +1678,13 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
             else:
                 console.print(f"[yellow]Running backend(s): {running_names}.[/yellow]")
                 prompt = f"Stop {running_names} and start {backend.display_name}?"
-            if not typer.confirm(prompt, default=False):
-                return
+            if non_interactive and not replace:
+                console.print(f"[red]{running_names} is already running.[/red]")
+                console.print("  Re-run with [cyan]--replace[/cyan] to stop it and start this profile.")
+                raise typer.Exit(1)
+            if not replace:
+                if not typer.confirm(prompt, default=False):
+                    return
             for candidate in stop_candidates:
                 try:
                     candidate.stop()
@@ -1764,11 +1817,24 @@ def _launch_backend(backend, cfg_path: "pathlib.Path", label: str) -> None:
 
 
 
-def _custom_config(m: ModelInfo, backend, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
+def _custom_config(
+    m: ModelInfo,
+    backend,
+    *,
+    tools: bool = False,
+    tool_parser: str | None = None,
+    trust_remote_code: bool = False,
+) -> "pathlib.Path":
     """Guide user through parameter selection, delegate config building to backend."""
     if backend.name == "llamacpp":
         return _custom_config_llamacpp(m, backend, tools=tools)
-    return _custom_config_vllm(m, backend, tools=tools, tool_parser=tool_parser)
+    return _custom_config_vllm(
+        m,
+        backend,
+        tools=tools,
+        tool_parser=tool_parser,
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def _scripted_config(
@@ -1788,6 +1854,7 @@ def _scripted_config(
     embedding: bool,
     pooling: str | None,
     save_profile: str | None,
+    trust_remote_code: bool,
 ) -> "pathlib.Path":
     """Build a launch config from CLI flags without prompting."""
     from vserve import config as config_module
@@ -1799,13 +1866,31 @@ def _scripted_config(
         requested=gpu_util,
         config=config_module.cfg(),
     )
-    chosen_context = context or max(4096, m.max_position_embeddings or 4096)
+    need_tuned_defaults = context is None or slots is None
+    if backend.name == "vllm":
+        need_tuned_defaults = need_tuned_defaults or kv_cache_dtype is None
+    if backend.name == "llamacpp":
+        need_tuned_defaults = need_tuned_defaults or gpu_layers is None
+    limits_data = _ensure_scripted_limits(
+        m,
+        backend,
+        gpu=gpu,
+        gpu_mem_util=effective_gpu_util,
+        required=need_tuned_defaults,
+    )
 
     if backend.name == "llamacpp":
+        chosen_context, chosen_slots, chosen_layers = _choose_llamacpp_scripted_defaults(
+            m,
+            limits_data,
+            context=context,
+            slots=slots,
+            gpu_layers=gpu_layers,
+        )
         choices = {
             "context": chosen_context,
-            "n_gpu_layers": gpu_layers if gpu_layers is not None else 999,
-            "parallel": slots or 1,
+            "n_gpu_layers": chosen_layers,
+            "parallel": chosen_slots,
             "port": port,
             "tools": tools,
             "embedding": embedding,
@@ -1819,17 +1904,42 @@ def _scripted_config(
         cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
         return cfg_path
 
-    resolved_tools = tools or bool(tool_parser)
+    chosen_context, chosen_kv, chosen_slots = _choose_vllm_scripted_defaults(
+        m,
+        limits_data,
+        context=context,
+        slots=slots,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    tool_info: dict = {}
+    resolved_parser = tool_parser
+    if tools or tool_parser:
+        resolved_parser = resolved_parser or limits_data.get("tool_call_parser")
+        if not resolved_parser:
+            tool_info = _detect_capabilities_for_scripted_run(m, backend)
+            resolved_parser = tool_info.get("tool_call_parser")
+        if not resolved_parser:
+            console.print("[red]Tool calling was requested, but no valid vLLM tool parser was found.[/red]")
+            console.print("  Re-run with [cyan]--tool-parser <name>[/cyan] after checking the installed vLLM runtime.")
+            raise typer.Exit(1)
+
+    resolved_reasoning = reasoning_parser or limits_data.get("reasoning_parser")
+    if not resolved_reasoning:
+        if not tool_info:
+            tool_info = _detect_capabilities_for_scripted_run(m, backend)
+        resolved_reasoning = tool_info.get("reasoning_parser")
+
     vllm_choices: dict[str, object] = {
         "context": chosen_context,
-        "kv_dtype": kv_cache_dtype or "auto",
-        "slots": slots or 1,
+        "kv_dtype": chosen_kv,
+        "slots": chosen_slots,
         "batched_tokens": batched_tokens,
         "gpu_mem_util": effective_gpu_util,
         "port": port,
-        "tools": resolved_tools and bool(tool_parser),
-        "tool_parser": tool_parser if resolved_tools else None,
-        "reasoning_parser": reasoning_parser,
+        "tools": bool(tools or tool_parser) and bool(resolved_parser),
+        "tool_parser": resolved_parser if (tools or tool_parser) else None,
+        "reasoning_parser": resolved_reasoning,
+        "trust_remote_code": trust_remote_code,
     }
     cfg = backend.build_config(m, vllm_choices)
     profile_name = save_profile or "custom"
@@ -1838,24 +1948,90 @@ def _scripted_config(
     return cfg_path
 
 
-def _resolve_profile_path(profile: str, *, backend, model: ModelInfo | None = None) -> pathlib.Path:
+def _infer_backend_from_profile(path: pathlib.Path) -> str | None:
+    suffix = path.suffix.lower()
+    try:
+        if suffix in {".yaml", ".yml"}:
+            from vserve.config import try_read_profile_yaml
+
+            data = try_read_profile_yaml(path) or {}
+        elif suffix == ".json":
+            import json
+
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    backend_name = data.get("backend") if isinstance(data, dict) else None
+    if isinstance(backend_name, str) and backend_name:
+        return backend_name
+    if suffix in {".yaml", ".yml"}:
+        return "vllm"
+    if suffix == ".json":
+        return "llamacpp"
+    return None
+
+
+def _profile_roots() -> list[pathlib.Path]:
+    from vserve.backends import _BACKENDS
+    from vserve.config import cfg as _cfg
+
+    roots = [_cfg().configs_dir]
+    for backend in _BACKENDS:
+        roots.append(backend.root_dir / "configs" / "models")
+    return roots
+
+
+def _path_is_under(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _is_known_profile_file(path: pathlib.Path) -> bool:
+    suffix = path.suffix.lower()
+    return suffix in {".yaml", ".yml", ".json"} and any(_path_is_under(path, root) for root in _profile_roots())
+
+
+def _resolve_profile_path(
+    profile: str,
+    *,
+    backend=None,
+    model: ModelInfo | None = None,
+    allow_external_path: bool = False,
+) -> tuple[pathlib.Path, str | None]:
     candidate = pathlib.Path(profile).expanduser()
     if candidate.exists():
-        return candidate
+        if allow_external_path or _is_known_profile_file(candidate):
+            return candidate, _infer_backend_from_profile(candidate)
+        console.print(f"[red]{candidate} is not a vserve profile.[/red]")
+        console.print("  Use [cyan]vserve profile list[/cyan] to see removable profiles.")
+        raise typer.Exit(1)
     if model is not None:
         from vserve import config as config_module
-        if backend.name == "llamacpp":
+        if backend is not None and backend.name == "llamacpp":
             path = backend.root_dir / "configs" / "models" / f"{model.provider}--{model.model_name}.{profile}.json"
+        elif backend is not None:
+            path = config_module.profile_path(model.provider, model.model_name, profile)
         else:
             path = config_module.profile_path(model.provider, model.model_name, profile)
         if path.exists() or profile == "custom":
-            return path
-    matches = sorted(backend.root_dir.glob(f"configs/models/*.{profile}.json"))
-    if backend.name != "llamacpp":
-        from vserve.config import cfg as _cfg
-        matches.extend(sorted(_cfg().configs_dir.glob(f"*.{profile}.yaml")))
+            return path, _infer_backend_from_profile(path) or getattr(backend, "name", None)
+    matches = []
+    for path in _profile_files():
+        if backend is not None and _infer_backend_from_profile(path) != backend.name:
+            continue
+        if path.stem.endswith(f".{profile}") or path.name == profile:
+            matches.append(path)
+    matches = sorted(matches)
     if len(matches) == 1:
-        return matches[0]
+        path = matches[0]
+        return path, _infer_backend_from_profile(path)
     if len(matches) > 1:
         console.print(f"[red]Profile '{profile}' matches multiple configs; include the model name or path.[/red]")
         for match in matches:
@@ -1889,14 +2065,7 @@ def profile_list():
 @profile_app.command("show")
 def profile_show(profile: str = typer.Argument(..., help="Profile name or path")):
     """Show a saved serving profile."""
-    path = pathlib.Path(profile).expanduser()
-    if not path.exists():
-        matches = [p for p in _profile_files() if p.stem.endswith(f".{profile}")]
-        if len(matches) == 1:
-            path = matches[0]
-    if not path.exists():
-        console.print(f"[red]Profile '{profile}' not found.[/red]")
-        raise typer.Exit(1)
+    path, _backend_name = _resolve_profile_path(profile, allow_external_path=True)
     console.print(path.read_text())
 
 
@@ -1906,14 +2075,7 @@ def profile_rm(
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ):
     """Remove a saved serving profile."""
-    path = pathlib.Path(profile).expanduser()
-    if not path.exists():
-        matches = [p for p in _profile_files() if p.stem.endswith(f".{profile}")]
-        if len(matches) == 1:
-            path = matches[0]
-    if not path.exists():
-        console.print(f"[red]Profile '{profile}' not found.[/red]")
-        raise typer.Exit(1)
+    path, _backend_name = _resolve_profile_path(profile, allow_external_path=False)
     if not force and not typer.confirm(f"Delete {path}?", default=False):
         console.print("[dim]Cancelled.[/dim]")
         return
@@ -1942,6 +2104,115 @@ def _vllm_limits_entry(entry: object) -> dict[str, int | None]:
     if entry is None or isinstance(entry, bool) or not isinstance(entry, int):
         return {}
     return {"auto": entry}
+
+
+def _ensure_scripted_limits(m: ModelInfo, backend, *, gpu, gpu_mem_util: float, required: bool) -> dict:
+    """Return cached limits for non-interactive defaults, tuning once if needed."""
+    from vserve import config as config_module
+
+    lim_path = limits_path(m.provider, m.model_name)
+    lim = read_limits(lim_path)
+    if lim is not None:
+        return lim
+    if not required:
+        return {"backend": backend.name, "limits": {}}
+    lim = backend.tune(m, gpu, gpu_mem_util=gpu_mem_util)
+    if isinstance(lim, dict):
+        from vserve.runtime import build_tuning_fingerprint
+
+        runtime_info = None
+        runtime_info_fn = getattr(backend, "runtime_info", None)
+        if callable(runtime_info_fn):
+            try:
+                runtime_info = runtime_info_fn()
+            except Exception:
+                runtime_info = None
+        lim.setdefault("backend", backend.name)
+        lim["fingerprint"] = build_tuning_fingerprint(
+            model_info=m,
+            gpu=gpu,
+            backend=backend.name,
+            gpu_mem_util=gpu_mem_util,
+            runtime_info=runtime_info,
+        )
+        config_module.write_limits(lim_path, lim)
+        return lim
+    raise RuntimeError(f"{backend.display_name} did not return valid tuning limits")
+
+
+def _choose_vllm_scripted_defaults(
+    m: ModelInfo,
+    limits_data: dict,
+    *,
+    context: int | None,
+    slots: int | None,
+    kv_cache_dtype: str | None,
+) -> tuple[int, str, int]:
+    limits = limits_data.get("limits", {})
+    limits = limits if isinstance(limits, dict) else {}
+    working_contexts: list[int] = []
+    for ctx_str, entry in limits.items():
+        try:
+            ctx = int(str(ctx_str))
+        except ValueError:
+            continue
+        choices = _vllm_limits_entry(entry)
+        if kv_cache_dtype is not None:
+            if choices.get(kv_cache_dtype) is not None:
+                working_contexts.append(ctx)
+        elif any(value is not None for value in choices.values()):
+            working_contexts.append(ctx)
+
+    chosen_context = context or (max(working_contexts) if working_contexts else max(4096, m.max_position_embeddings or 4096))
+    ctx_entry = _vllm_limits_entry(limits.get(str(chosen_context), {}))
+    if kv_cache_dtype is not None:
+        chosen_kv = kv_cache_dtype
+    elif ctx_entry.get("auto") is not None:
+        chosen_kv = "auto"
+    else:
+        viable_kvs = [key for key, value in ctx_entry.items() if value is not None]
+        chosen_kv = viable_kvs[0] if viable_kvs else "auto"
+
+    if slots is not None:
+        chosen_slots = slots
+    else:
+        tuned_slots = ctx_entry.get(chosen_kv)
+        chosen_slots = int(tuned_slots) if tuned_slots is not None else 1
+    return chosen_context, chosen_kv, chosen_slots
+
+
+def _choose_llamacpp_scripted_defaults(
+    m: ModelInfo,
+    limits_data: dict,
+    *,
+    context: int | None,
+    slots: int | None,
+    gpu_layers: int | None,
+) -> tuple[int, int, int]:
+    limits = limits_data.get("limits", {})
+    limits = limits if isinstance(limits, dict) else {}
+    working_contexts: list[int] = []
+    for ctx_str, entry in limits.items():
+        try:
+            ctx = int(str(ctx_str))
+        except ValueError:
+            continue
+        if _llamacpp_slots_from_limits_entry(entry) is not None:
+            working_contexts.append(ctx)
+    chosen_context = context or (max(working_contexts) if working_contexts else max(4096, m.max_position_embeddings or 4096))
+    tuned_slots = _llamacpp_slots_from_limits_entry(limits.get(str(chosen_context)))
+    chosen_slots = slots if slots is not None else (tuned_slots or 1)
+    tuned_layers = limits_data.get("n_gpu_layers")
+    chosen_layers = gpu_layers if gpu_layers is not None else int(tuned_layers) if isinstance(tuned_layers, int) else 999
+    return chosen_context, chosen_slots, chosen_layers
+
+
+def _detect_capabilities_for_scripted_run(m: ModelInfo, backend) -> dict:
+    detect_fn = getattr(backend, "detect_tools", None)
+    if not callable(detect_fn):
+        return {}
+    info = detect_fn(m.path)
+    return info if isinstance(info, dict) else {}
 
 
 def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "pathlib.Path":
@@ -2085,7 +2356,14 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     return cfg_path
 
 
-def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_parser: str | None = None) -> "pathlib.Path":
+def _custom_config_vllm(
+    m: ModelInfo,
+    backend,
+    *,
+    tools: bool = False,
+    tool_parser: str | None = None,
+    trust_remote_code: bool = False,
+) -> "pathlib.Path":
     """Interactive config wizard for vLLM models."""
     from vserve.config import cfg as _cfg, limits_cache_matches, read_limits, write_profile_yaml
     from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
@@ -2225,7 +2503,8 @@ def _custom_config_vllm(m: ModelInfo, backend, *, tools: bool = False, tool_pars
         "port": 8888,
         "tools": tools and bool(resolved_parser),
         "tool_parser": resolved_parser if tools else None,
-        "reasoning_parser": resolved_reasoning if tools else None,
+        "reasoning_parser": resolved_reasoning,
+        "trust_remote_code": trust_remote_code,
     }
     cfg = backend.build_config(m, choices)
 
@@ -2260,6 +2539,7 @@ def run(
     backend_name: str | None = typer.Option(None, "--backend", help="Force backend (vllm, llamacpp)"),
     allow_unsupported_runtime: bool = typer.Option(False, "--allow-unsupported-runtime", help="Allow starting outside vserve's pinned runtime range"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Build config from flags/defaults without prompting"),
+    replace: bool = typer.Option(False, "--replace", help="For --yes, stop a running backend before starting this profile"),
     profile: str | None = typer.Option(None, "--profile", help="Saved profile name or explicit config path"),
     save_profile: str | None = typer.Option(None, "--save-profile", help="Save generated config under this profile name"),
     context: int | None = typer.Option(None, "--context", help="Context length in tokens"),
@@ -2271,6 +2551,7 @@ def run(
     gpu_layers: int | None = typer.Option(None, "--gpu-layers", help="llama.cpp GPU layers"),
     embedding: bool = typer.Option(False, "--embedding", help="Run llama.cpp in embedding mode"),
     pooling: str | None = typer.Option(None, "--pooling", help="llama.cpp embedding pooling"),
+    trust_remote_code: bool = typer.Option(False, "--trust-remote-code", help="Allow vLLM to execute model repository code"),
 ):
     """Start serving a model — interactive config picker."""
     from vserve.backends import get_backend, get_backend_by_name
@@ -2281,6 +2562,8 @@ def run(
     query = _join_model_terms(model_terms)
 
     m: ModelInfo | None
+    resolved_profile_path: pathlib.Path | None = None
+    inferred_profile_backend: str | None = None
     if query is None and profile is None:
         all_models = _all_models()
         if not all_models:
@@ -2332,6 +2615,13 @@ def run(
         m = all_models[idx]
     else:
         m = _resolve_model(query) if query is not None else None
+        if profile is not None and m is None:
+            resolved_profile_path, inferred_profile_backend = _resolve_profile_path(
+                profile,
+                backend=None,
+                model=None,
+                allow_external_path=True,
+            )
 
     if backend_name:
         try:
@@ -2339,9 +2629,16 @@ def run(
         except KeyError as exc:
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1) from None
+    elif inferred_profile_backend:
+        try:
+            backend = get_backend_by_name(inferred_profile_backend)
+        except KeyError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
     else:
         if m is None:
-            console.print("[red]A model query is required unless profile backend metadata is available.[/red]")
+            console.print("[red]A model query is required unless the profile path or content identifies a backend.[/red]")
+            console.print("  Use [cyan]--backend vllm[/cyan] for YAML profiles or [cyan]--backend llamacpp[/cyan] for llama.cpp JSON profiles.")
             raise typer.Exit(1)
         backend = get_backend(m)
 
@@ -2355,7 +2652,14 @@ def run(
     if tool_parser and not tools:
         tools = True
     if profile:
-        cfg_path = _resolve_profile_path(profile, backend=backend, model=m)
+        if resolved_profile_path is None:
+            resolved_profile_path, _profile_backend = _resolve_profile_path(
+                profile,
+                backend=backend,
+                model=m,
+                allow_external_path=True,
+            )
+        cfg_path = resolved_profile_path
     elif yes or any(
         value is not None
         for value in (context, slots, kv_cache_dtype, batched_tokens, gpu_util, save_profile, reasoning_parser, gpu_layers, pooling)
@@ -2379,13 +2683,26 @@ def run(
             embedding=embedding,
             pooling=pooling,
             save_profile=save_profile,
+            trust_remote_code=trust_remote_code,
         )
     else:
         if m is None:
             console.print("[red]A model query is required for interactive configuration.[/red]")
             raise typer.Exit(1)
-        cfg_path = _custom_config(m, backend, tools=tools, tool_parser=tool_parser)
-    _launch_backend(backend, cfg_path, m.model_name if m is not None else (profile or "profile"))
+        cfg_path = _custom_config(
+            m,
+            backend,
+            tools=tools,
+            tool_parser=tool_parser,
+            trust_remote_code=trust_remote_code,
+        )
+    _launch_backend(
+        backend,
+        cfg_path,
+        m.model_name if m is not None else (profile or "profile"),
+        non_interactive=yes,
+        replace=replace,
+    )
 
 
 @app.command()
@@ -2403,27 +2720,27 @@ def stop():
             lock = _lock_or_exit("gpu", "stopping backend (probe uncertain)")
             try:
                 _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)
-                stop_errors: list[str] = []
+                fallback_stop_errors: list[str] = []
                 for candidate in _BACKENDS:
                     try:
                         candidate.stop()
                     except Exception as exc:
-                        stop_errors.append(f"{candidate.display_name}: {exc}")
+                        fallback_stop_errors.append(f"{candidate.display_name}: {exc}")
                 confirmed_backends, confirmed_probe_failed = probe_running_backends()
                 if confirmed_backends:
                     remaining_names = ", ".join(candidate.display_name for candidate in confirmed_backends)
                     console.print(f"[red]{remaining_names} still appear to be running after fallback stop attempts.[/red]")
-                    for detail in stop_errors:
+                    for detail in fallback_stop_errors:
                         console.print(f"  {detail}")
                     raise typer.Exit(1)
                 if confirmed_probe_failed:
                     console.print("[red]Could not verify backend state after fallback stop attempts.[/red]")
-                    for detail in stop_errors:
+                    for detail in fallback_stop_errors:
                         console.print(f"  {detail}")
                     raise typer.Exit(1)
                 clear_session()
                 console.print("[yellow]Backend state was uncertain; issued stop requests to all known backends.[/yellow]")
-                for detail in stop_errors:
+                for detail in fallback_stop_errors:
                     console.print(f"  [dim]{detail}[/dim]")
                 console.print("[green]Stop request completed.[/green]")
                 return
@@ -2719,23 +3036,38 @@ def fan(
 
 
 @app.command()
-def status():
+def status(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
     """Show current serving status."""
     from vserve.backends import _BACKENDS
     from vserve.config import active_yaml_path, read_active_manifest, try_read_profile_yaml
 
-    running_backend = None
+    running_backends = []
     probe_errors: list[str] = []
     for b in _BACKENDS:
         try:
             if b.is_running():
-                running_backend = b
-                break
+                running_backends.append(b)
         except Exception as exc:
             probe_errors.append(f"{b.display_name}: {exc}")
             continue
 
-    if running_backend is None:
+    if not running_backends:
+        if json_output:
+            import json as _json
+
+            typer.echo(_json.dumps({
+                "running": False,
+                "running_backends": [],
+                "multiple_active": False,
+                "uncertain": bool(probe_errors),
+                "probe_errors": probe_errors,
+                "next_action": "resolve probe errors" if probe_errors else "vserve run",
+            }, sort_keys=True))
+            if probe_errors:
+                raise typer.Exit(1)
+            return
         if probe_errors:
             console.print("[red]Could not determine server state.[/red]")
             for detail in probe_errors:
@@ -2743,6 +3075,8 @@ def status():
             raise typer.Exit(1)
         console.print("[dim]No server is running.[/dim] Start with: vserve run")
         return
+
+    running_backend = running_backends[0]
 
     manifest = None
     manifest_path_fn = getattr(running_backend, "active_manifest_path", None)
@@ -2755,8 +3089,9 @@ def status():
     config_source = None
     invalid_source = None
     if running_backend.name == "llamacpp":
-        active_json = running_backend._active_config_path().with_suffix(".json")
-        if active_json.exists():
+        active_config_path_fn = getattr(running_backend, "_active_config_path", None)
+        active_json = active_config_path_fn().with_suffix(".json") if callable(active_config_path_fn) else None
+        if active_json is not None and active_json.exists():
             try:
                 data = _json.loads(active_json.read_text())
                 if isinstance(data, dict):
@@ -2780,6 +3115,24 @@ def status():
             else:
                 invalid_source = config_source
     if not cfg:
+        if json_output:
+            import json as _json
+
+            typer.echo(_json.dumps({
+                "running": True,
+                "backend": running_backend.name,
+                "running_backends": [
+                    {"name": b.name, "display_name": b.display_name}
+                    for b in running_backends
+                ],
+                "multiple_active": len(running_backends) > 1,
+                "uncertain": bool(probe_errors),
+                "probe_errors": probe_errors,
+                "config_source": str(config_source) if config_source else None,
+                "config_readable": False,
+                "active_manifest": manifest,
+            }, sort_keys=True))
+            return
         if invalid_source is not None:
             console.print(f"[bold green]{running_backend.display_name} is running[/bold green] (active config unreadable)")
             console.print(f"  [dim]{invalid_source}[/dim]\n")
@@ -2790,6 +3143,31 @@ def status():
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
     port = cfg.get("port", 8888)
+
+    if json_output:
+        import json as _json
+
+        typer.echo(_json.dumps({
+            "running": True,
+            "backend": running_backend.name,
+            "display_name": running_backend.display_name,
+            "running_backends": [
+                {"name": b.name, "display_name": b.display_name}
+                for b in running_backends
+            ],
+            "multiple_active": len(running_backends) > 1,
+            "uncertain": bool(probe_errors),
+            "probe_errors": probe_errors,
+            "model": model_path,
+            "model_name": model_name,
+            "port": port,
+            "endpoint": f"http://localhost:{port}/v1",
+            "config_source": str(config_source) if config_source else None,
+            "config_readable": True,
+            "active_manifest": manifest,
+            "next_action": "stop extra active backend" if len(running_backends) > 1 else "ready",
+        }, sort_keys=True))
+        return
 
     console.print(f"\n[bold green]{running_backend.display_name} is running[/bold green]")
     if manifest:
@@ -3107,8 +3485,12 @@ def _doctor_summary_label(warn_count: int, fail_count: int) -> str:
 
 
 @app.command()
-def doctor():
+def doctor(
+    strict: bool = typer.Option(False, "--strict", help="Exit nonzero if any check fails"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
     """Check system readiness."""
+    import json
     import os
     import subprocess
     import socket
@@ -3127,38 +3509,46 @@ def doctor():
     ok_count = 0
     warn_count = 0
     fail_count = 0
+    checks: list[dict[str, str]] = []
+
+    def _emit(*args, **kwargs) -> None:
+        if not json_output:
+            console.print(*args, **kwargs)
 
     def _ok(msg: str) -> None:
         nonlocal ok_count
-        console.print(f"  [green]OK[/green]    {msg}")
+        checks.append({"status": "ok", "message": msg, "fix": ""})
+        _emit(f"  [green]OK[/green]    {msg}")
         ok_count += 1
 
     def _fail(msg: str, fix: str = "") -> None:
         nonlocal fail_count
-        console.print(f"  [red]FAIL[/red]  {msg}")
+        checks.append({"status": "fail", "message": msg, "fix": fix})
+        _emit(f"  [red]FAIL[/red]  {msg}")
         if fix:
-            console.print(f"          Fix: {fix}")
+            _emit(f"          Fix: {fix}")
         fail_count += 1
 
     def _warn(msg: str, fix: str = "") -> None:
         nonlocal warn_count
-        console.print(f"  [yellow]WARN[/yellow]  {msg}")
+        checks.append({"status": "warn", "message": msg, "fix": fix})
+        _emit(f"  [yellow]WARN[/yellow]  {msg}")
         if fix:
-            console.print(f"          Fix: {fix}")
+            _emit(f"          Fix: {fix}")
         warn_count += 1
 
-    console.print("\n[bold]vserve doctor[/bold]\n")
+    _emit("\n[bold]vserve doctor[/bold]\n")
 
     # -- Environment --
-    console.print("  [bold]Environment[/bold]")
+    _emit("  [bold]Environment[/bold]")
 
     # nvcc
     try:
         r = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5,
                            env={**os.environ, "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", "")})
         if r.returncode == 0:
-            ver = [ln for ln in r.stdout.splitlines() if "release" in ln]
-            _ok(f"nvcc {ver[0].split('release')[-1].strip().rstrip(',') if ver else 'found'}")
+            nvcc_lines = [ln for ln in r.stdout.splitlines() if "release" in ln]
+            _ok(f"nvcc {nvcc_lines[0].split('release')[-1].strip().rstrip(',') if nvcc_lines else 'found'}")
         else:
             _fail("nvcc not working", "Install CUDA toolkit or check /usr/local/cuda/bin/nvcc")
     except Exception:
@@ -3192,7 +3582,7 @@ def doctor():
         _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
 
     # -- Backends --
-    console.print("\n  [bold]Backends[/bold]")
+    _emit("\n  [bold]Backends[/bold]")
     from vserve.backends import _BACKENDS
     for b in _BACKENDS:
         for desc, check_fn in b.doctor_checks():
@@ -3209,7 +3599,7 @@ def doctor():
     _c = _cfg()
 
     # ── vLLM ──
-    console.print("\n  [bold]vLLM[/bold]")
+    _emit("\n  [bold]vLLM[/bold]")
 
     # Runtime compatibility
     try:
@@ -3356,7 +3746,7 @@ def doctor():
         _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
 
     # ── llama.cpp ──
-    console.print("\n  [bold]llama.cpp[/bold]")
+    _emit("\n  [bold]llama.cpp[/bold]")
 
     lc_root = _c.llamacpp_root
     if lc_root is None:
@@ -3468,7 +3858,7 @@ def doctor():
                   "pip install 'vserve\\[llamacpp]'")
 
     # -- Shared --
-    console.print("\n  [bold]Shared[/bold]")
+    _emit("\n  [bold]Shared[/bold]")
 
     # Port
     _port = _c.port
@@ -3514,10 +3904,16 @@ def doctor():
     probed = sum(1 for m in all_models if read_limits(limits_path(m.provider, m.model_name)))
     _ok(f"{len(all_models)} models downloaded, {probed} probed")
 
-    console.print(
-        f"\n  [bold]{_doctor_summary_label(warn_count, fail_count)}[/bold]  "
-        f"({ok_count} ok, {warn_count} warn, {fail_count} fail)\n",
-    )
+    summary = {"ok": ok_count, "warn": warn_count, "fail": fail_count}
+    if json_output:
+        typer.echo(json.dumps({"summary": summary, "checks": checks}, sort_keys=True))
+    else:
+        console.print(
+            f"\n  [bold]{_doctor_summary_label(warn_count, fail_count)}[/bold]  "
+            f"({ok_count} ok, {warn_count} warn, {fail_count} fail)\n",
+        )
+    if strict and fail_count:
+        raise typer.Exit(1)
 
 
 # ── Cache management ──
@@ -3550,6 +3946,17 @@ def cache_clean(
     lock = _lock_or_exit("cache", "cleaning backend caches")
 
     try:
+        running_backends, probe_failed = probe_running_backends()
+        if running_backends:
+            names = ", ".join(b.display_name for b in running_backends)
+            console.print(f"[red]Refusing to clean caches while {names} is running.[/red]")
+            console.print("  Run: [cyan]vserve stop[/cyan]")
+            raise typer.Exit(1)
+        if probe_failed:
+            console.print("[red]Refusing to clean caches because backend state is uncertain.[/red]")
+            console.print("  Run: [cyan]vserve status[/cyan] and resolve probe errors first.")
+            raise typer.Exit(1)
+
         # Always: stale sockets in tmp
         tmp_dir = root / "tmp"
         if tmp_dir.exists():

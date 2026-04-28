@@ -39,17 +39,7 @@ Current beta caveats:
 
 ## Install
 
-```bash
-uv tool install vserve
-```
-
-Or with pip:
-
-```bash
-pip install vserve
-```
-
-Beta/pre-release channel:
+Beta/pre-release channel (primary while `vserve` is in beta):
 
 ```bash
 uv tool install --prerelease allow vserve
@@ -80,8 +70,10 @@ Scriptable serving:
 
 ```bash
 vserve run qwen fp8 --yes --context 32768 --slots 4 --kv-cache-dtype fp8 --port 8888
+vserve run qwen fp8 --yes --replace              # safe non-interactive restart
 vserve run qwen fp8 --save-profile fast --yes
 vserve run qwen fp8 --profile fast
+vserve run --profile /opt/vllm/configs/models/provider--Model.fast.yaml --yes
 ```
 
 Runtime repair and GGUF-only setup:
@@ -159,21 +151,25 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 | `vserve tune [model]` | Calculate context/concurrency limits |
 | `vserve run [model]` | Configure and start serving (auto-tunes if needed) |
 | `vserve run MODEL... --yes --context N --slots N` | Non-interactive serving from flags |
-| `vserve run MODEL... --profile NAME` | Serve a saved profile by name or path |
+| `vserve run MODEL... --yes --replace` | Non-interactive restart; without `--replace`, running backends are refused |
+| `vserve run MODEL... --profile NAME_OR_PATH` | Serve a saved profile by name or explicit path |
 | `vserve run MODEL... --tools --tool-parser hermes --reasoning-parser qwen3` | Start with explicit parsers |
+| `vserve run MODEL... --trust-remote-code` | Opt in to vLLM remote model code execution |
 | `vserve run MODEL... --backend llamacpp --gpu-layers 999` | Force llama.cpp for GGUF |
 | `vserve profile list\|show\|rm` | Manage saved serving profiles |
 | `vserve stop` | Stop the running server |
-| `vserve status` | Show current serving config |
+| `vserve status [--json]` | Show current serving config and probe uncertainty |
 | `vserve fan [auto\|off\|30-100]` | GPU fan control with temp-based curve |
-| `vserve doctor` | Check system readiness |
+| `vserve doctor [--json] [--strict]` | Check system readiness; strict exits nonzero on failures |
 | `vserve cache clean [--dry-run] [--all] [--yes]` | Preview or clean stale sockets and JIT caches |
 | `vserve runtime check vllm` | Check vLLM version/dependency compatibility |
 | `vserve runtime upgrade vllm --stable` | Reinstall vserve's pinned stable vLLM runtime |
 | `vserve version` | Show current version and check for updates |
 | `vserve update [--nightly]` | Update vserve, optionally allowing pre-releases |
 
-All commands support **fuzzy matching** — `vserve run qwen fp8` finds the right model.
+Model-taking commands support **fuzzy matching** — `vserve run qwen fp8` finds the right model.
+
+Profile rules: profile names resolve inside configured vserve profile roots; explicit `--profile` paths are accepted for `run` and infer backend from YAML/JSON when possible. `profile rm` never deletes arbitrary external paths, even with `--force`.
 
 ---
 
@@ -196,6 +192,8 @@ Auto-detects the correct vLLM parser by reading the model's chat template:
 | GPT-OSS | `openai` | `openai_gptoss` |
 
 Detection is template-based (not model-name regex), so it works for fine-tunes and community uploads.
+
+Remote model code is disabled by default. Use `--trust-remote-code` only for repositories you trust; generated profiles include `trust-remote-code` only when that flag is explicitly set.
 
 ### llama.cpp
 
@@ -234,6 +232,7 @@ Auto-discovered on first run. Override at `~/.config/vserve/config.yaml`:
 schema_version: 2
 cuda_home: /usr/local/cuda
 gpu:
+  index: 0
   memory_utilization: 0.91
 backends:
   vllm:
@@ -256,10 +255,17 @@ Legacy top-level `vllm_root`, `service_name`, `llamacpp_root`, and GPU memory ke
 ```
 /opt/vllm/                     # vLLM backend
 ├── venv/bin/vllm              # Python venv
+├── .venv/bin/vllm             # alternate Python venv location
 ├── models/                    # safetensors models
 ├── configs/
+│   ├── .env                   # service environment
 │   ├── active.yaml            # active profile symlink
 │   └── models/                # limits + YAML profiles
+├── tmp/                       # RPC sockets / runtime temp files
+├── .cache/
+│   ├── flashinfer/            # FlashInfer JIT cache
+│   ├── torch_extensions/      # torch extension cache
+│   └── vllm/                  # vLLM/torch.compile cache
 ├── run/
 │   └── active-manifest.json   # active backend state
 └── logs/
@@ -271,8 +277,12 @@ Legacy top-level `vllm_root`, `service_name`, `llamacpp_root`, and GPU memory ke
 │   ├── active.sh              # active launch script symlink
 │   ├── active.json            # active config symlink
 │   └── models/                # JSON profiles
+├── run/
+│   └── active-manifest.json   # active backend state
 └── logs/
 ```
+
+GGUF downloads create one runnable model root per selected quant/subdirectory, so `Q4_K_M` and `Q8_0` variants do not share a directory. Source roots left only for materialization are ignored by model scanning.
 
 ---
 
@@ -312,7 +322,7 @@ cd vserve
 uv sync --dev
 uv run pytest tests/              # 428 tests
 uv run ruff check src/ tests/     # lint
-uv run mypy src/vserve/           # type check
+uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
 ```
 
 ---

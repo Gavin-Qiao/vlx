@@ -205,3 +205,44 @@ def test_build_tuning_fingerprint_includes_gguf_metadata_hash(tmp_path):
     )
 
     assert fp["gguf_metadata_hash"]
+
+
+def test_build_tuning_fingerprint_includes_llamacpp_runtime_identity(tmp_path):
+    from vserve.models import ModelInfo
+
+    model_dir = tmp_path / "models" / "provider" / "Model-GGUF"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model-Q4_K_M.gguf").write_bytes(b"GGUF")
+    model = ModelInfo(
+        path=model_dir,
+        provider="provider",
+        model_name="Model-GGUF",
+        architecture="gguf",
+        model_type="gguf",
+        quant_method=None,
+        max_position_embeddings=0,
+        is_moe=False,
+        model_size_gb=1.0,
+        is_gguf=True,
+    )
+    gpu = type("GPU", (), {
+        "name": "GPU",
+        "driver": "590",
+        "cuda": "13.1",
+        "vram_total_gb": 48.0,
+    })()
+
+    fp = build_tuning_fingerprint(
+        model_info=model,
+        gpu=gpu,
+        backend="llamacpp",
+        gpu_mem_util=0.91,
+        runtime_info={
+            "backend": "llamacpp",
+            "executable": "/opt/llama-cpp/bin/llama-server",
+            "llama_server_version": "llama-server 2026",
+        },
+    )
+
+    assert fp["llama_server_version"] == "llama-server 2026"
+    assert fp["runtime_executable"] == "/opt/llama-cpp/bin/llama-server"

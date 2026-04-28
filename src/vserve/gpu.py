@@ -53,9 +53,24 @@ def _get_cuda_version() -> str:
     return "unknown"
 
 
-def get_gpu_info() -> GpuInfo:
+def get_gpu_info(config: object | None = None) -> GpuInfo:
+    if config is None:
+        try:
+            from vserve.config import cfg
+
+            config = cfg()
+        except Exception:
+            config = None
+    gpu_index = int(getattr(config, "gpu_index", 0) or 0)
     raw = _run_nvidia_smi()
-    parts = [p.strip() for p in raw.split(",")]
+    rows = [line for line in raw.splitlines() if line.strip()]
+    if not rows:
+        raise RuntimeError("nvidia-smi returned no GPU rows")
+    if gpu_index < 0 or gpu_index >= len(rows):
+        raise ValueError(f"Configured GPU index {gpu_index} is unavailable; found {len(rows)} GPU(s)")
+    parts = [p.strip() for p in rows[gpu_index].split(",")]
+    if len(parts) < 5:
+        raise RuntimeError(f"Could not parse nvidia-smi GPU row: {rows[gpu_index]}")
     name = parts[0]
     vram_total = int(parts[1])
     vram_used = int(parts[3])
@@ -87,15 +102,23 @@ def resolve_gpu_memory_utilization(
     config: object | None = None,
 ) -> float:
     """Resolve the effective GPU memory policy used by add, tune, and run."""
+    def _validate(value: float, label: str) -> float:
+        if not 0.5 <= value <= 0.99:
+            raise ValueError(f"{label} must resolve to a GPU memory utilization between 0.5 and 0.99, got {value:.3f}")
+        return value
+
     if requested is not None:
-        return requested
+        return _validate(float(requested), "--gpu-util")
     configured_util = getattr(config, "gpu_memory_utilization", None)
     if configured_util is not None:
-        return float(configured_util)
+        return _validate(float(configured_util), "gpu.memory_utilization")
     configured_overhead = getattr(config, "gpu_overhead_gb", None)
     if configured_overhead is not None:
-        return compute_gpu_memory_utilization(vram_total_gb, float(configured_overhead))
-    return compute_gpu_memory_utilization(vram_total_gb)
+        return _validate(
+            compute_gpu_memory_utilization(vram_total_gb, float(configured_overhead)),
+            "gpu.overhead_gb",
+        )
+    return max(0.5, min(0.99, compute_gpu_memory_utilization(vram_total_gb)))
 
 
 def get_fan_speed() -> int:

@@ -114,6 +114,21 @@ class TestLlamaCppBuildConfig:
 
         assert cfg["model"].endswith("Model-Q8_0-00001-of-00002.gguf")
 
+    def test_config_rejects_incomplete_split_shard_set(self, tmp_path):
+        import pytest
+
+        b = LlamaCppBackend()
+        model_dir = tmp_path / "models" / "provider" / "Model"
+        model_dir.mkdir(parents=True)
+        (model_dir / "Model-Q4_K_M-00001-of-00002.gguf").write_bytes(b"\0")
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        choices = {"context": 4096, "n_gpu_layers": 10, "parallel": 1, "port": 8888, "tools": False}
+
+        with pytest.raises(ValueError, match="Incomplete split GGUF"):
+            b.build_config(m, choices)
+
     def test_config_embedding_mode(self, fake_gguf_model_dir):
         b = LlamaCppBackend()
         from vserve.models import detect_model
@@ -365,6 +380,32 @@ class TestLlamaCppFindEntrypoint:
         assert b.find_entrypoint() is None
 
 
+class TestLlamaCppRuntimeInfo:
+    def test_runtime_info_calls_llama_server_version(self, mocker, tmp_path):
+        b = LlamaCppBackend()
+        exe = tmp_path / "llama-server"
+        exe.write_text("")
+        mocker.patch.object(b, "find_entrypoint", return_value=exe)
+        run = mocker.patch(
+            "vserve.backends.llamacpp.subprocess.run",
+            return_value=Mock(returncode=0, stdout="llama-server 2026\n", stderr=""),
+        )
+
+        info = b.runtime_info()
+
+        assert info["llama_server_version"] == "llama-server 2026"
+        run.assert_called_once_with([str(exe), "--version"], capture_output=True, text=True, timeout=10)
+
+    def test_compatibility_fails_without_entrypoint(self, mocker):
+        b = LlamaCppBackend()
+        mocker.patch.object(b, "find_entrypoint", return_value=None)
+
+        result = b.compatibility()
+
+        assert result["supported"] is False
+        assert "entrypoint not found" in result["errors"][0]
+
+
 class TestLlamaCppDoctorChecks:
     def test_returns_callables(self):
         b = LlamaCppBackend()
@@ -389,6 +430,47 @@ class TestLlamaCppStartFailure:
         cfg_path.write_text('{}')
         with pytest.raises(RuntimeError, match="systemctl start"):
             b.start(cfg_path)
+
+    def test_start_failure_rolls_back_active_links_and_writes_manifest(self, mocker, tmp_path):
+        import json
+        import pytest
+
+        from vserve.config import read_active_manifest
+
+        b = LlamaCppBackend()
+        mocker.patch(
+            "vserve.backends.llamacpp.subprocess.run",
+            return_value=Mock(returncode=1, stdout="", stderr="Unit not found"),
+        )
+        mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
+
+        active = tmp_path / "configs" / "active.sh"
+        active.parent.mkdir(parents=True)
+        previous_script = tmp_path / "configs" / "models" / "previous.sh"
+        previous_json = tmp_path / "configs" / "models" / "previous.json"
+        previous_script.parent.mkdir(parents=True)
+        previous_script.write_text("#!/bin/bash\n")
+        previous_json.write_text("{}")
+        active.symlink_to(previous_script)
+        active_json = active.with_suffix(".json")
+        active_json.symlink_to(previous_json)
+        manifest_path = tmp_path / "run" / "active-manifest.json"
+
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "active_manifest_path", return_value=manifest_path)
+
+        cfg_path = tmp_path / "configs" / "models" / "next.json"
+        cfg_path.write_text(json.dumps({"model": "test.gguf", "port": 8888}))
+
+        with pytest.raises(RuntimeError, match="systemctl start"):
+            b.start(cfg_path)
+
+        assert active.resolve() == previous_script.resolve()
+        assert active_json.resolve() == previous_json.resolve()
+        manifest = read_active_manifest(manifest_path)
+        assert manifest is not None
+        assert manifest["status"] == "failed"
+        assert "Unit not found" in manifest["error"]
 
 
 class TestLlamaCppLaunchScript:

@@ -100,6 +100,18 @@ class TestVllmBackend:
         )
         assert b.can_serve(m) is False
 
+    def test_cannot_serve_config_only_root(self, tmp_path):
+        b = VllmBackend()
+        model_dir = tmp_path / "models" / "user" / "Model"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text("{}")
+
+        from vserve.models import detect_model
+
+        m = detect_model(model_dir)
+
+        assert b.can_serve(m) is False
+
     def test_health_url(self):
         b = VllmBackend()
         assert b.health_url(8888) == "http://localhost:8888/health"
@@ -167,9 +179,32 @@ class TestVllmBackend:
         assert cfg["kv-cache-dtype"] == "auto"
         assert cfg["gpu-memory-utilization"] == 0.90
         assert "enable-auto-tool-choice" not in cfg
+        assert "trust-remote-code" not in cfg
+
+    def test_build_config_trust_remote_code_explicit(self, fake_model_dir):
+        b = VllmBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_model_dir)
+
+        choices = {
+            "context": 8192,
+            "kv_dtype": "auto",
+            "slots": 4,
+            "batched_tokens": None,
+            "gpu_mem_util": 0.90,
+            "port": 8888,
+            "tools": False,
+            "tool_parser": None,
+            "reasoning_parser": None,
+            "trust_remote_code": True,
+        }
+        cfg = b.build_config(m, choices)
+        assert cfg["trust-remote-code"] is True
 
     def test_build_config_with_tools(self, fake_model_dir):
         b = VllmBackend()
+        b.available_tool_parsers = Mock(return_value={"hermes"})  # type: ignore[method-assign]
+        b.available_reasoning_parsers = Mock(return_value={"qwen3"})  # type: ignore[method-assign]
         from vserve.models import detect_model
         m = detect_model(fake_model_dir)
 
@@ -192,6 +227,7 @@ class TestVllmBackend:
 
     def test_build_config_reasoning_without_tools(self, fake_model_dir):
         b = VllmBackend()
+        b.available_reasoning_parsers = Mock(return_value={"qwen3"})  # type: ignore[method-assign]
         from vserve.models import detect_model
         m = detect_model(fake_model_dir)
 
@@ -250,6 +286,26 @@ class TestVllmBackend:
 
         import pytest
         with pytest.raises(ValueError, match="Unknown vLLM reasoning parser"):
+            b.build_config(m, choices)
+
+    def test_build_config_rejects_parser_when_runtime_introspection_uncertain(self, fake_model_dir, mocker):
+        b = VllmBackend()
+        mocker.patch.object(b, "available_tool_parsers", return_value=None)
+        from vserve.models import detect_model
+        m = detect_model(fake_model_dir)
+
+        choices = {
+            "context": 4096,
+            "kv_dtype": "auto",
+            "slots": 1,
+            "gpu_mem_util": 0.9,
+            "port": 8888,
+            "tools": True,
+            "tool_parser": "hermes",
+            "reasoning_parser": None,
+        }
+
+        with pytest.raises(RuntimeError, match="Could not inspect installed vLLM tool parsers"):
             b.build_config(m, choices)
 
     def test_find_entrypoint_missing(self, mocker):

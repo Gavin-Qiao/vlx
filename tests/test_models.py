@@ -48,6 +48,43 @@ def test_detect_model_head_dim_from_hidden_size(tmp_path):
     assert info.head_dim == 128  # 8192 / 64
 
 
+def test_detect_model_size_includes_bin_weights(tmp_path):
+    """Legacy PyTorch .bin weights count toward model size."""
+    import json
+    model_dir = tmp_path / "models" / "test" / "BinModel"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({
+        "architectures": ["TestLM"],
+        "model_type": "test",
+    }))
+    with (model_dir / "pytorch_model.bin").open("wb") as f:
+        f.truncate(2 * 1024**3)
+
+    info = detect_model(model_dir)
+
+    assert info.model_size_gb == 2.0
+
+
+def test_detect_model_mha_uses_attention_heads_when_kv_heads_missing(tmp_path):
+    """Standard MHA configs omit num_key_value_heads; KV heads equal attention heads."""
+    import json
+    model_dir = tmp_path / "models" / "test" / "MhaModel"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({
+        "architectures": ["TestLM"],
+        "model_type": "test",
+        "hidden_size": 4096,
+        "num_attention_heads": 32,
+        "num_hidden_layers": 24,
+    }))
+    (model_dir / "model.safetensors").write_bytes(b"\0" * 512)
+
+    info = detect_model(model_dir)
+
+    assert info.num_kv_heads == 32
+    assert info.head_dim == 128
+
+
 def test_detect_model_missing_arch_fields(tmp_path):
     """Models without kv_heads/layers get None fields."""
     import json
@@ -158,6 +195,15 @@ def test_scan_models_empty(tmp_path):
     empty_root = tmp_path / "models"
     empty_root.mkdir()
     assert scan_models(empty_root) == []
+
+
+def test_scan_models_skips_ignored_materialization_sources(tmp_path):
+    source = tmp_path / "models" / "provider" / "Model"
+    source.mkdir(parents=True)
+    (source / "config.json").write_text("{}")
+    (source / ".vserve-ignore").write_text("materialized variants live in sibling roots\n")
+
+    assert scan_models(tmp_path / "models") == []
 
 
 def test_scan_models_logs_invalid_candidate(tmp_path, caplog):

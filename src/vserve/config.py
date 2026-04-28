@@ -137,6 +137,7 @@ class VserveConfig:
     service_name: str
     service_user: str
     port: int
+    gpu_index: int = 0
     gpu_memory_utilization: float | None = None
     gpu_overhead_gb: float | None = None
     llamacpp_root: Path | None = None
@@ -229,6 +230,7 @@ def _vllm_venv_bin(vllm_root: Path) -> Path:
 
 def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
                   service_user: str, port: int, *,
+                  gpu_index: int = 0,
                   gpu_memory_utilization: float | None = None,
                   gpu_overhead_gb: float | None = None,
                   llamacpp_root: Path | None = None,
@@ -263,6 +265,7 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
         service_name=service_name,
         service_user=service_user,
         port=port,
+        gpu_index=gpu_index,
         gpu_memory_utilization=gpu_memory_utilization,
         gpu_overhead_gb=gpu_overhead_gb,
         llamacpp_root=llamacpp_root,
@@ -310,6 +313,7 @@ def load_config() -> VserveConfig:
                 root = Path(str(vllm_raw.get("root", raw.get("vllm_root", _DEFAULT_VLLM_ROOT))))
                 gpu_util_raw = gpu.get("memory_utilization", raw.get("gpu_memory_utilization"))
                 gpu_overhead_raw = gpu.get("overhead_gb", raw.get("gpu_overhead_gb"))
+                gpu_index_raw = gpu.get("index", raw.get("gpu_index", 0))
                 llamacpp_root_raw = llamacpp_raw.get("root", raw.get("llamacpp_root"))
                 return _build_config(
                     vllm_root=root,
@@ -317,6 +321,7 @@ def load_config() -> VserveConfig:
                     service_name=str(vllm_raw.get("service_name", raw.get("service_name", _DEFAULT_SERVICE_NAME))),
                     service_user=str(vllm_raw.get("service_user", raw.get("service_user", _DEFAULT_SERVICE_USER))),
                     port=_coerce_config_int(vllm_raw.get("port", raw.get("port")), _DEFAULT_PORT),
+                    gpu_index=_coerce_config_int(gpu_index_raw, 0),
                     gpu_memory_utilization=_coerce_config_float(gpu_util_raw),
                     gpu_overhead_gb=_coerce_config_float(gpu_overhead_raw),
                     llamacpp_root=Path(str(llamacpp_root_raw)) if llamacpp_root_raw else None,
@@ -348,13 +353,12 @@ def save_config(cfg: VserveConfig) -> Path:
             },
         },
     }
-    gpu: dict[str, float] = {}
+    gpu: dict[str, float | int] = {"index": cfg.gpu_index}
     if cfg.gpu_memory_utilization is not None:
         gpu["memory_utilization"] = cfg.gpu_memory_utilization
     if cfg.gpu_overhead_gb is not None:
         gpu["overhead_gb"] = cfg.gpu_overhead_gb
-    if gpu:
-        data["gpu"] = gpu
+    data["gpu"] = gpu
     if cfg.llamacpp_root is not None:
         data["backends"]["llamacpp"] = {
             "root": str(cfg.llamacpp_root),

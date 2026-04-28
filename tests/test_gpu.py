@@ -26,6 +26,24 @@ def test_parse_gpu_info(mocker):
     assert info.cuda == "13.1"
 
 
+def test_parse_gpu_info_uses_selected_row(mocker):
+    mocker.patch(
+        "vserve.gpu._run_nvidia_smi",
+        return_value=(
+            "GPU 0, 24576, 0, 1024, 590.48.01\n"
+            "GPU 1, 49152, 0, 2048, 590.48.01"
+        ),
+    )
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="13.1")
+    cfg = MagicMock(gpu_index=1)
+
+    info = get_gpu_info(config=cfg)
+
+    assert info.name == "GPU 1"
+    assert info.vram_total_mb == 49152
+    assert info.vram_used_mb == 2048
+
+
 def test_compute_gpu_memory_utilization():
     util = compute_gpu_memory_utilization(vram_total_gb=47.8, overhead_gb=2.0)
     assert abs(util - 0.958) < 0.001
@@ -52,6 +70,17 @@ def test_resolve_gpu_memory_utilization_uses_one_policy():
     cfg.gpu_memory_utilization = None
     cfg.gpu_overhead_gb = 2.0
     assert abs(resolve_gpu_memory_utilization(48.0, config=cfg) - compute_gpu_memory_utilization(48.0, 2.0)) < 0.001
+
+
+def test_resolve_gpu_memory_utilization_rejects_invalid_persisted_values():
+    cfg = MagicMock(gpu_memory_utilization=1.2, gpu_overhead_gb=None)
+    with pytest.raises(ValueError, match="gpu.memory_utilization"):
+        resolve_gpu_memory_utilization(48.0, config=cfg)
+
+    cfg.gpu_memory_utilization = None
+    cfg.gpu_overhead_gb = 100.0
+    with pytest.raises(ValueError, match="between 0.5 and 0.99"):
+        resolve_gpu_memory_utilization(48.0, config=cfg)
 
 
 def _mock_pynvml():
