@@ -53,6 +53,13 @@ EMERGENCY_TEMP = 88  # ignore quiet hours above this
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
+def _configured_gpu_index() -> int:
+    try:
+        return int(getattr(cfg(), "gpu_index", 0) or 0)
+    except Exception:
+        return 0
+
+
 def _write_state_file(path: Path, content: str) -> None:
     """Write fan daemon state without following symlinks."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +154,7 @@ def _nvml_init():
     """Initialize NVML and return the GPU handle."""
     import pynvml  # type: ignore[import-untyped]
     pynvml.nvmlInit()
-    return pynvml.nvmlDeviceGetHandleByIndex(0)
+    return pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
 
 
 def _get_gpu_temp() -> int:
@@ -155,7 +162,7 @@ def _get_gpu_temp() -> int:
     import pynvml
     pynvml.nvmlInit()
     try:
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        h = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
         return pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
     finally:
         pynvml.nvmlShutdown()
@@ -250,7 +257,7 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
 
     import pynvml
     pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    handle = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
 
     try:
         # Enable manual fan control via NVML — no X11/Xvfb needed
@@ -379,7 +386,7 @@ def run_fixed_daemon(speed: int) -> None:
 
     import pynvml
     pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    handle = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
 
     try:
         _set_manual_control(handle)

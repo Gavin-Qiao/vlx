@@ -4423,6 +4423,28 @@ def cache_clean(
                     continue
             return None
 
+        def _unsafe_descendant_reason(path: pathlib.Path, root: pathlib.Path) -> str | None:
+            import stat
+
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                return f"{path} is outside {root}"
+            current = root
+            for part in relative.parts:
+                current = current / part
+                try:
+                    st = current.lstat()
+                except FileNotFoundError:
+                    break
+                except OSError as exc:
+                    return str(exc)
+                if stat.S_ISLNK(st.st_mode):
+                    return f"{current} is a symlink"
+                if current != path and not stat.S_ISDIR(st.st_mode):
+                    return f"{current} is not a directory"
+            return None
+
         running_backends, probe_failed = probe_running_backends()
         if running_backends:
             names = ", ".join(b.display_name for b in running_backends)
@@ -4464,6 +4486,13 @@ def cache_clean(
                 (root / ".cache" / "torch_extensions", "torch compile"),
                 (root / ".cache" / "vllm", "vLLM"),
             ]
+            for cache_dir, label in cache_dirs:
+                unsafe_reason = _unsafe_descendant_reason(cache_dir, root)
+                if unsafe_reason:
+                    console.print(f"  [red]Refusing to clean unsafe cache path for {label}: {unsafe_reason}[/red]")
+                    failures.append(label)
+            if failures:
+                raise typer.Exit(1)
             existing = [(cache_dir, label) for cache_dir, label in cache_dirs if cache_dir.exists()]
             planned_total = 0
             sizes: dict[pathlib.Path, int | None] = {}

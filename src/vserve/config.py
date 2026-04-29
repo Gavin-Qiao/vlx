@@ -130,7 +130,7 @@ def unit_content_matches_backend(
     return any(needle and needle in content for needle in needles)
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+def _atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     tmp = Path(tmp_name)
@@ -141,6 +141,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        if mode is not None:
+            path.chmod(mode)
     finally:
         if fd >= 0:
             try:
@@ -619,4 +621,4 @@ def write_profile_yaml(path: Path, data: dict, comment: str = "") -> None:
         for line in comment.splitlines():
             parts.append(f"# {line}\n")
     parts.append(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
-    _atomic_write_text(path, "".join(parts))
+    _atomic_write_text(path, "".join(parts), mode=0o644)

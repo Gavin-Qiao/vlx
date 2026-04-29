@@ -246,6 +246,14 @@ def test_active_manifest_roundtrip(tmp_path, mocker):
     assert path == tmp_path / "run" / "active-manifest.json"
 
 
+def test_write_profile_yaml_is_service_readable(tmp_path):
+    path = tmp_path / "models" / "provider--model.custom.yaml"
+
+    write_profile_yaml(path, {"model": "/opt/vllm/models/provider/model"})
+
+    assert path.stat().st_mode & 0o044 == 0o044
+
+
 def test_read_limits_missing(tmp_path):
     path = tmp_path / "nonexistent.json"
     assert read_limits(path) is None

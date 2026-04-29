@@ -9,6 +9,7 @@ from vserve.fan import (
     read_state,
     _interpolate_curve,
     _apply_fan,
+    _nvml_init,
     _set_manual_control,
     _restore_auto_control,
     EMERGENCY_TEMP,
@@ -289,6 +290,20 @@ def test_fan_state_writer_refuses_symlink_without_clobbering_target(tmp_path):
 
     assert victim.read_text() == "keep me\n"
     assert state_path.is_symlink()
+
+
+def test_fan_nvml_init_uses_configured_gpu_index(mocker):
+    import vserve.fan as fan_module
+
+    handle = object()
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlDeviceGetHandleByIndex.return_value = handle
+    mocker.patch.object(fan_module, "cfg", return_value=mocker.Mock(gpu_index=2))
+
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        assert _nvml_init() is handle
+
+    mock_nvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(2)
 
 
 def test_apply_fan_sets_all_fans():

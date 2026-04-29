@@ -1003,6 +1003,23 @@ def test_cache_clean_refuses_symlinked_vllm_root_before_sudo(mocker, tmp_path):
     run.assert_not_called()
 
 
+def test_cache_clean_refuses_symlinked_cache_parent_before_sudo(mocker, tmp_path):
+    outside = tmp_path / "outside-cache"
+    (outside / "vllm").mkdir(parents=True)
+    cache_parent = tmp_path / ".cache"
+    cache_parent.symlink_to(outside)
+    run = mocker.patch("subprocess.run")
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([], False))
+    mocker.patch("vserve.cli._lock_or_exit", return_value=mocker.Mock())
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(vllm_root=tmp_path))
+
+    result = runner.invoke(app, ["cache", "clean", "--all", "--yes"])
+
+    assert result.exit_code == 1
+    assert "Refusing to clean unsafe cache path" in result.output
+    run.assert_not_called()
+
+
 def test_cache_clean_delete_failure_exits_nonzero(mocker, tmp_path):
     cache_dir = tmp_path / ".cache" / "vllm"
     cache_dir.mkdir(parents=True)
