@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 
 
-_WEIGHT_EXTENSIONS = {".safetensors", ".bin", ".pt", ".pth", ".gguf"}
+_WEIGHT_EXTENSIONS = {".safetensors", ".bin", ".gguf"}
 _SKIP_PREFIXES = ("metal/", ".git")
 
 

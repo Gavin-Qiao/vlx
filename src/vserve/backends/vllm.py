@@ -83,32 +83,55 @@ class VllmBackend:
         script = r"""
 import json
 
-def tool_parsers():
-    try:
-        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-        parsers = getattr(ToolParserManager, "tool_parsers", None)
+def registered(manager, attr_names):
+    list_registered = getattr(manager, "list_registered", None)
+    if callable(list_registered):
+        try:
+            values = list_registered()
+            if isinstance(values, dict):
+                return sorted(str(key) for key in values)
+            if isinstance(values, (list, tuple, set)):
+                return sorted(str(value) for value in values)
+        except Exception:
+            pass
+    for attr_name in attr_names:
+        parsers = getattr(manager, attr_name, None)
         if isinstance(parsers, dict):
             return sorted(str(key) for key in parsers)
-    except Exception:
-        return None
+    return None
+
+def tool_parsers():
+    managers = []
+    for module_name in (
+        "vllm.tool_parsers",
+        "vllm.entrypoints.openai.tool_parsers",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["ToolParserManager"])
+            managers.append(getattr(module, "ToolParserManager"))
+        except Exception:
+            pass
+    for manager in managers:
+        values = registered(manager, ("tool_parsers", "_tool_parsers"))
+        if values is not None:
+            return values
     return None
 
 def reasoning_parsers():
     managers = []
-    try:
-        from vllm.reasoning import ReasoningParserManager
-        managers.append(ReasoningParserManager)
-    except Exception:
-        pass
-    try:
-        from vllm.entrypoints.openai.reasoning_parsers import ReasoningParserManager
-        managers.append(ReasoningParserManager)
-    except Exception:
-        pass
+    for module_name in (
+        "vllm.reasoning",
+        "vllm.entrypoints.openai.reasoning_parsers",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["ReasoningParserManager"])
+            managers.append(getattr(module, "ReasoningParserManager"))
+        except Exception:
+            pass
     for manager in managers:
-        parsers = getattr(manager, "reasoning_parsers", None)
-        if isinstance(parsers, dict):
-            return sorted(str(key) for key in parsers)
+        values = registered(manager, ("reasoning_parsers", "_reasoning_parsers"))
+        if values is not None:
+            return values
     return None
 
 print(json.dumps({

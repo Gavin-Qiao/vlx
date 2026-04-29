@@ -68,21 +68,14 @@ class VserveLock:
 
     def acquire(self) -> None:
         _ensure_lock_dir()
-        if self._path.exists():
-            _raise_if_unsafe_file(self._path)
-            try:
-                os.chmod(str(self._path), 0o666)
-            except PermissionError:
-                info = _read_lock_info(self._path)
-                if info and _pid_alive(info.pid):
-                    raise LockHeld(self.name, info)
-                raise PermissionError(
-                    f"Cannot acquire lock: {self._path} is owned by another user. "
-                    f"Run: sudo chmod 666 {self._path}"
-                )
         try:
             self._fd = _open_regular_file(self._path, os.O_RDWR | os.O_CREAT, 0o666)
-        except PermissionError:
+        except PermissionError as exc:
+            if "Refusing" in str(exc):
+                raise
+            info = _read_lock_info(self._path)
+            if info and _pid_alive(info.pid):
+                raise LockHeld(self.name, info)
             raise PermissionError(
                 f"Cannot create lock file: {self._path}\n"
                 f"Run: sudo chmod 1777 {LOCK_DIR}"
@@ -140,7 +133,15 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _ensure_lock_dir() -> None:
-    LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
+    try:
+        st = os.lstat(str(LOCK_DIR))
+    except FileNotFoundError:
+        LOCK_DIR.mkdir(mode=0o1777, parents=True, exist_ok=True)
+    else:
+        if stat.S_ISLNK(st.st_mode):
+            raise PermissionError(f"Refusing to use symlink as vserve lock directory: {LOCK_DIR}")
+        if not stat.S_ISDIR(st.st_mode):
+            raise PermissionError(f"Refusing to use non-directory vserve lock directory: {LOCK_DIR}")
     try:
         os.chmod(str(LOCK_DIR), 0o1777)
     except PermissionError:
@@ -170,6 +171,11 @@ def _open_regular_file(path: Path, flags: int, mode: int = 0o666) -> int:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise PermissionError(f"Refusing to use non-regular vserve state file: {path}")
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            try:
+                os.fchmod(fd, mode)
+            except PermissionError:
+                pass
     except Exception:
         os.close(fd)
         raise
@@ -363,10 +369,6 @@ def write_session(model: str) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-    try:
-        os.chmod(str(session_path), 0o644)
-    except PermissionError:
-        pass
 
 
 def read_session() -> SessionInfo | None:

@@ -1073,32 +1073,37 @@ def _materialize_subdirectory_variants(
 
     roots: list[pathlib.Path] = []
     materialized_any = False
+    materialize_top_level = len(selected_variants) > 1
     for variant in selected_variants:
         variant_files = list(getattr(variant, "files", {}).keys())
         prefix = _variant_common_prefix(variant_files)
-        if prefix is None:
+        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(getattr(variant, "label", prefix or "variant"))).strip("-") or (prefix or "variant")
+        if prefix is None and not materialize_top_level:
             roots.append(local_dir)
             continue
 
-        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(getattr(variant, "label", prefix))).strip("-") or prefix
         materialized = local_dir.parent / f"{model_name}-{safe_label}"
         materialized.mkdir(parents=True, exist_ok=True)
         materialized_any = True
 
         for name in shared:
             rel = pathlib.PurePosixPath(name)
-            dest_rel = pathlib.PurePosixPath(*rel.parts[1:]) if rel.parts and rel.parts[0] == prefix and len(rel.parts) > 1 else rel
+            dest_rel = (
+                pathlib.PurePosixPath(*rel.parts[1:])
+                if prefix is not None and rel.parts and rel.parts[0] == prefix and len(rel.parts) > 1
+                else rel
+            )
             link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*dest_rel.parts))
 
         for name in variant_files:
             rel = pathlib.PurePosixPath(name)
-            stripped = pathlib.PurePosixPath(*rel.parts[1:])
+            stripped = pathlib.PurePosixPath(*rel.parts[1:]) if prefix is not None else rel
             link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*stripped.parts))
 
         roots.append(materialized)
 
     ignore = local_dir / ".vserve-ignore"
-    if materialized_any and not _root_has_top_level_weights(local_dir):
+    if materialized_any and (materialize_top_level or not _root_has_top_level_weights(local_dir)):
         ignore.write_text("materialized variants live in sibling model roots\n")
     elif ignore.exists() and _root_has_top_level_weights(local_dir):
         ignore.unlink()
@@ -1119,6 +1124,33 @@ def _gguf_variant_root(base_dir: pathlib.Path, *, model_name: str, variant) -> p
 
 def _variant_contains_gguf(variant) -> bool:
     return any(str(filename).lower().endswith(".gguf") for filename in getattr(variant, "files", {}))
+
+
+def _expected_download_roots(
+    local_dir: pathlib.Path,
+    *,
+    model_name: str,
+    selected_variants: list,
+    is_gguf_download: bool,
+) -> list[pathlib.Path]:
+    if is_gguf_download:
+        return [
+            _gguf_variant_root(local_dir, model_name=model_name, variant=variant)
+            for variant in selected_variants
+        ]
+    return [local_dir]
+
+
+def _download_roots_ready(roots: list[pathlib.Path]) -> bool:
+    if not roots:
+        return False
+    for root in roots:
+        try:
+            if not root.exists() or not any(root.iterdir()):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _strip_downloaded_file_prefix(downloaded: pathlib.Path, root: pathlib.Path, filename: str) -> pathlib.Path:
@@ -1255,10 +1287,16 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
         if not wait_for_release(lock_name, timeout=7200):
             console.print("[red]Timed out waiting for download.[/red]")
             raise typer.Exit(1)
-        if local_dir.exists() and any(local_dir.iterdir()):
+        ready_roots = _expected_download_roots(
+            local_dir,
+            model_name=model_name,
+            selected_variants=selected_variants,
+            is_gguf_download=is_gguf_download,
+        )
+        if _download_roots_ready(ready_roots):
             try:
                 from vserve.models import detect_model
-                info = detect_model(local_dir)
+                info = detect_model(ready_roots[0])
             except Exception:
                 info = None
             if info:
@@ -2220,9 +2258,10 @@ def _profile_files() -> list[pathlib.Path]:
     from vserve.config import cfg as _cfg
 
     paths = list(_cfg().configs_dir.glob("*.yaml"))
+    paths.extend(_cfg().configs_dir.glob("*.yml"))
     for backend in _BACKENDS:
         paths.extend((backend.root_dir / "configs" / "models").glob("*.json"))
-    return sorted(set(paths))
+    return sorted({path for path in paths if _is_known_profile_file(path)})
 
 
 @profile_app.command("list")
@@ -3445,6 +3484,18 @@ def status(
     model_path = cfg.get("model", "?")
     model_name = model_path.split("/")[-1] if "/" in str(model_path) else model_path
     port = cfg.get("port", 8888)
+    manifest_state = manifest.get("status") if isinstance(manifest, dict) else None
+
+    def _running_next_action() -> str:
+        if len(running_backends) > 1:
+            return "stop extra active backend"
+        if manifest_state in {"starting", "warming"}:
+            return "wait for health"
+        if manifest_state == "failed":
+            return "inspect failed launch"
+        if manifest_state and manifest_state != "ready":
+            return "check backend state"
+        return "ready"
 
     if json_output:
         typer.echo(_json.dumps({
@@ -3466,15 +3517,18 @@ def status(
             "config_source": str(config_source) if config_source else None,
             "config_readable": True,
             "active_manifest": manifest,
-            "next_action": "stop extra active backend" if len(running_backends) > 1 else "ready",
+            "next_action": _running_next_action(),
         }, sort_keys=True))
         return
 
     console.print(f"\n[bold green]{running_backend.display_name} is running[/bold green]")
+    if len(running_backends) > 1:
+        names = ", ".join(backend.display_name for backend in running_backends)
+        console.print(f"  [bold red]Multiple active backends[/bold red]  {names}")
+        console.print("  [yellow]Run vserve stop, then start one backend again.[/yellow]")
     if manifest:
-        state = manifest.get("status")
-        if state and state != "ready":
-            console.print(f"  [bold]State[/bold]      {state}")
+        if manifest_state and manifest_state != "ready":
+            console.print(f"  [bold]State[/bold]      {manifest_state}")
     console.print(f"  [bold]Model[/bold]      {model_name}")
     console.print(f"  [bold]Endpoint[/bold]   http://localhost:{port}/v1")
     console.print()
@@ -3804,6 +3858,7 @@ def doctor(
         try_read_profile_yaml,
         LOGS_DIR,
         find_systemd_unit_path,
+        unit_uses_environment_file,
     )
     from vserve.backends import running_backend as _running_backend
 
@@ -3838,7 +3893,18 @@ def doctor(
             _emit(f"          Fix: {fix}")
         warn_count += 1
 
+    def _fail_or_warn(required: bool, msg: str, fix: str = "") -> None:
+        if required:
+            _fail(msg, fix)
+        else:
+            _warn(msg, fix)
+
     _emit("\n[bold]vserve doctor[/bold]\n")
+
+    from vserve.config import cfg as _cfg
+    _c = _cfg()
+    vllm_runtime_present = VLLM_BIN.exists()
+    vllm_required = vllm_runtime_present or _c.llamacpp_root is None
 
     # -- Environment --
     _emit("  [bold]Environment[/bold]")
@@ -3856,16 +3922,19 @@ def doctor(
         _fail("nvcc not found", "Install: sudo apt install nvidia-cuda-toolkit  OR  https://developer.nvidia.com/cuda-downloads")
 
     # vLLM
-    try:
-        r = subprocess.run([str(VLLM_BIN), "--version"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            ver = r.stdout.strip() or r.stderr.strip() or "found"
-            _ok(f"vLLM {ver}")
-        else:
-            details = r.stderr.strip() or r.stdout.strip()
-            _fail(f"vLLM not working at {VLLM_BIN}", details or "Check the vLLM installation and environment")
-    except Exception:
-        _fail(f"vLLM not found at {VLLM_BIN}")
+    if vllm_required:
+        try:
+            r = subprocess.run([str(VLLM_BIN), "--version"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                ver = r.stdout.strip() or r.stderr.strip() or "found"
+                _ok(f"vLLM {ver}")
+            else:
+                details = r.stderr.strip() or r.stdout.strip()
+                _fail(f"vLLM not working at {VLLM_BIN}", details or "Check the vLLM installation and environment")
+        except Exception:
+            _fail(f"vLLM not found at {VLLM_BIN}")
+    else:
+        _warn("vLLM not configured (skipped — llama.cpp-only setup)")
 
     # GPU
     try:
@@ -3896,26 +3965,26 @@ def doctor(
                 _warn(f"{desc} (check error)")
 
     # -- Per-backend checks --
-    from vserve.config import cfg as _cfg
-    _c = _cfg()
-
     # ── vLLM ──
     _emit("\n  [bold]vLLM[/bold]")
 
     # Runtime compatibility
-    try:
-        from vserve.runtime import check_vllm_compatibility, collect_vllm_runtime_info
+    if not vllm_required:
+        _warn("vLLM checks skipped (llama.cpp-only setup)")
+    else:
+        try:
+            from vserve.runtime import check_vllm_compatibility, collect_vllm_runtime_info
 
-        runtime_info = collect_vllm_runtime_info(_c)
-        runtime_check = check_vllm_compatibility(runtime_info)
-        if runtime_check.supported:
-            _ok(f"Runtime supported ({runtime_info.vllm_version}, {runtime_check.range})")
-        else:
-            _fail("Unsupported vLLM runtime", "; ".join(runtime_check.errors))
-        for warning in runtime_check.warnings:
-            _warn(warning)
-    except Exception as exc:
-        _warn("Could not complete vLLM runtime compatibility check", str(exc))
+            runtime_info = collect_vllm_runtime_info(_c)
+            runtime_check = check_vllm_compatibility(runtime_info)
+            if runtime_check.supported:
+                _ok(f"Runtime supported ({runtime_info.vllm_version}, {runtime_check.range})")
+            else:
+                _fail("Unsupported vLLM runtime", "; ".join(runtime_check.errors))
+            for warning in runtime_check.warnings:
+                _warn(warning)
+        except Exception as exc:
+            _warn("Could not complete vLLM runtime compatibility check", str(exc))
 
     # Service user
     try:
@@ -3923,9 +3992,9 @@ def doctor(
         if r.returncode == 0:
             _ok(f"Service user '{_c.service_user}' exists")
         else:
-            _fail(f"Service user '{_c.service_user}' not found")
+            _fail_or_warn(vllm_required, f"Service user '{_c.service_user}' not found")
     except Exception:
-        _fail("Cannot check service user")
+        _fail_or_warn(vllm_required, "Cannot check service user")
 
     # systemd unit
     svc_path = find_systemd_unit_path(_c.service_name)
@@ -3935,22 +4004,33 @@ def doctor(
         except (OSError, UnicodeDecodeError) as exc:
             _warn(f"Could not read systemd unit: {svc_path.name}", str(exc))
         else:
+            unit_failed = False
             if "ProtectSystem=strict" in svc_content:
-                _fail("systemd unit has ProtectSystem=strict",
-                      "Remove it — breaks nvcc JIT compilation")
-            elif "TimeoutStartSec" not in svc_content:
+                _fail_or_warn(
+                    vllm_required,
+                    "systemd unit has ProtectSystem=strict",
+                    "Remove it — breaks nvcc JIT compilation",
+                )
+                unit_failed = vllm_required
+            if "TimeoutStartSec" not in svc_content:
                 _warn("No TimeoutStartSec in service — default 90s may be too short for JIT",
                       "Add TimeoutStartSec=600")
-            elif "EnvironmentFile" not in svc_content or ".env" not in svc_content:
-                _fail(
+            env_path = VLLM_ROOT / "configs" / ".env"
+            if not unit_uses_environment_file(svc_content, env_path):
+                _fail_or_warn(
+                    vllm_required,
                     "systemd unit does not load vserve configs/.env",
-                    f"Add EnvironmentFile={VLLM_ROOT / 'configs' / '.env'} so CUDA_VISIBLE_DEVICES is enforced",
+                    f"Add EnvironmentFile={env_path} so CUDA_VISIBLE_DEVICES is enforced",
                 )
-            else:
+                unit_failed = vllm_required
+            if not unit_failed:
                 _ok("systemd unit configured correctly")
     else:
-        _fail(f"No systemd unit found for {_c.service_name}.service",
-              "Create one: https://docs.vllm.ai  or see vserve docs/troubleshooting.md")
+        _fail_or_warn(
+            vllm_required,
+            f"No systemd unit found for {_c.service_name}.service",
+            "Create one: https://docs.vllm.ai  or see vserve docs/troubleshooting.md",
+        )
 
     # .env
     env_path = VLLM_ROOT / "configs" / ".env"
@@ -3967,7 +4047,7 @@ def doctor(
         except (OSError, UnicodeDecodeError) as exc:
             _warn(f".env unreadable: {env_path}", str(exc))
     else:
-        _fail(f"No .env at {env_path}")
+        _fail_or_warn(vllm_required, f"No .env at {env_path}")
 
     # Models directory
     vllm_models = VLLM_ROOT / "models"
@@ -4028,9 +4108,9 @@ def doctor(
                 if isinstance(model_path, (str, os.PathLike)) and model_path and Path(model_path).exists():
                     _ok(f"active.yaml → {target.name}")
                 else:
-                    _fail(f"active.yaml model path missing: {model_path}")
+                    _fail_or_warn(vllm_required, f"active.yaml model path missing: {model_path}")
         else:
-            _fail(f"active.yaml → broken symlink: {target}")
+            _fail_or_warn(vllm_required, f"active.yaml → broken symlink: {target}")
     elif _safe_path_exists(active):
         _ok("active.yaml exists (not a symlink)")
     else:
@@ -4049,7 +4129,11 @@ def doctor(
             if len(stale) > 10:
                 _warn(f"{len(stale)} stale sockets in {tmp_dir}", f"sudo find {tmp_dir} -type s -delete")
     else:
-        _fail(f"TMPDIR {tmp_dir} does not exist", f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}")
+        _fail_or_warn(
+            vllm_required,
+            f"TMPDIR {tmp_dir} does not exist",
+            f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}",
+        )
 
     # ── llama.cpp ──
     _emit("\n  [bold]llama.cpp[/bold]")
@@ -4106,7 +4190,13 @@ def doctor(
                 _warn(f"Could not read {lc_svc}.service", str(exc))
             else:
                 issues = []
-                if "CUDA_VISIBLE_DEVICES" not in lc_svc_content:
+                active_sh = lc_root / "configs" / "active.sh"
+                active_sh_has_cuda = False
+                try:
+                    active_sh_has_cuda = active_sh.exists() and "CUDA_VISIBLE_DEVICES" in active_sh.read_text()
+                except (OSError, UnicodeDecodeError):
+                    active_sh_has_cuda = False
+                if "CUDA_VISIBLE_DEVICES" not in lc_svc_content and not active_sh_has_cuda:
                     issues.append("missing CUDA_VISIBLE_DEVICES (may use wrong GPU)")
                 if "TimeoutStartSec" not in lc_svc_content:
                     issues.append("no TimeoutStartSec (large models need time)")
@@ -4285,7 +4375,30 @@ def cache_clean(
 
     _c = _cfg()
     root = _c.vllm_root
+    def _unsafe_cache_root_reason(path: pathlib.Path) -> str | None:
+        try:
+            if path.exists():
+                if path.is_symlink():
+                    return "root is a symlink"
+                if not path.is_dir():
+                    return "root is not a directory"
+                resolved = path.resolve(strict=True)
+            else:
+                resolved = path.resolve(strict=False)
+        except OSError as exc:
+            return str(exc)
+        dangerous = {pathlib.Path("/").resolve(), pathlib.Path.home().resolve()}
+        if resolved in dangerous:
+            return f"dangerous root {resolved}"
+        return None
+
+    root_problem = _unsafe_cache_root_reason(root)
+    if root_problem:
+        console.print(f"[red]Refusing to clean caches under unsafe vLLM root: {root} ({root_problem}).[/red]")
+        raise typer.Exit(1)
+
     total_freed = 0
+    failures: list[str] = []
     lock = _lock_or_exit("cache", "cleaning backend caches")
 
     try:
@@ -4323,7 +4436,11 @@ def cache_clean(
 
         # Always: stale sockets in tmp
         tmp_dir = root / "tmp"
-        if tmp_dir.exists():
+        if tmp_dir.is_symlink():
+            console.print(f"  [red]Refusing to clean symlinked tmp dir: {tmp_dir}[/red]")
+            failures.append(str(tmp_dir))
+            sockets = []
+        elif tmp_dir.exists():
             sockets = _stale_sockets(tmp_dir)
             if dry_run:
                 console.print(f"  [cyan]Would clean {len(sockets)} stale sockets from {tmp_dir}[/cyan]", soft_wrap=True)
@@ -4337,6 +4454,7 @@ def cache_clean(
                     console.print(f"  [green]Cleaned {len(sockets)} stale sockets from {tmp_dir}[/green]")
                 else:
                     console.print(f"  [red]Failed to clean sockets: {result.stderr.strip()}[/red]")
+                    failures.append(f"sockets in {tmp_dir}")
             else:
                 console.print(f"  [dim]No stale sockets in {tmp_dir}[/dim]")
 
@@ -4376,6 +4494,10 @@ def cache_clean(
                     return
             for cache_dir, label in cache_dirs:
                 if cache_dir.exists():
+                    if cache_dir.is_symlink():
+                        console.print(f"  [red]Refusing to clean symlinked {label} cache: {cache_dir}[/red]")
+                        failures.append(label)
+                        continue
                     sudo = ["sudo", "-n"] if yes else ["sudo"]
                     result = subprocess.run(
                         [*sudo, "rm", "-rf", str(cache_dir)],
@@ -4389,13 +4511,16 @@ def cache_clean(
                         console.print(f"  [green]Cleaned {label} cache ({size_label})[/green]")
                     else:
                         console.print(f"  [red]Failed to clean {label}: {result.stderr.strip()}[/red]")
+                        failures.append(label)
                 else:
                     console.print(f"  [dim]{label} cache not found[/dim]")
 
             if total_freed > 0:
                 console.print(f"\n  [bold]Freed {total_freed} MB total[/bold]")
-            console.print("  [yellow]Next vserve run will recompile kernels (~5-10 min)[/yellow]")
+                console.print("  [yellow]Next vserve run will recompile kernels (~5-10 min)[/yellow]")
         elif dry_run:
             console.print("  [bold]Dry run complete.[/bold]")
+        if failures:
+            raise typer.Exit(1)
     finally:
         lock.release()

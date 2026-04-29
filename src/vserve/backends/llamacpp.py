@@ -20,19 +20,21 @@ class LlamaCppBackend:
     def service_name(self) -> str:
         from vserve.config import cfg
 
-        return cfg().llamacpp_service_name
+        value = getattr(cfg(), "llamacpp_service_name", None)
+        return value if isinstance(value, str) else "llama-cpp"
 
     @property
     def service_user(self) -> str:
         from vserve.config import cfg
 
-        return cfg().llamacpp_service_user
+        value = getattr(cfg(), "llamacpp_service_user", None)
+        return value if isinstance(value, str) else "llama-cpp"
 
     @property
     def root_dir(self) -> Path:
         from vserve.config import cfg
-        root = cfg().llamacpp_root
-        return root if root is not None else Path("/opt/llama-cpp")
+        root = getattr(cfg(), "llamacpp_root", None)
+        return root if isinstance(root, Path) else Path("/opt/llama-cpp")
 
     def can_serve(self, model: ModelInfo) -> bool:
         """True if model directory contains GGUF files."""
@@ -44,6 +46,31 @@ class LlamaCppBackend:
             return candidate
         found = shutil.which("llama-server")
         return Path(found) if found else None
+
+    def _assert_unit_safe_for_privileged_action(self) -> None:
+        from vserve.config import (
+            find_systemd_unit_path,
+            unit_content_matches_backend,
+            validate_systemd_service_name,
+        )
+
+        validate_systemd_service_name(self.service_name)
+        unit = find_systemd_unit_path(self.service_name)
+        if unit is None:
+            return
+        try:
+            content = unit.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"Cannot verify {self.service_name}.service before privileged systemctl action: {exc}"
+            ) from None
+        if not unit_content_matches_backend(
+            content,
+            backend_name=self.name,
+            root=self.root_dir,
+            expected_paths=[self.root_dir / "configs" / "active.sh"],
+        ):
+            raise RuntimeError(f"{self.service_name}.service does not look like a vserve llama.cpp unit")
 
     def runtime_info(self) -> dict:
         entrypoint = self.find_entrypoint()
@@ -361,6 +388,8 @@ class LlamaCppBackend:
         # Per-model JSON
         model_json = config_path
 
+        self._assert_unit_safe_for_privileged_action()
+
         # Symlink active.sh → per-model script
         active.unlink(missing_ok=True)
         active.symlink_to(model_script.resolve())
@@ -387,6 +416,7 @@ class LlamaCppBackend:
             raise RuntimeError(f"systemctl start {self.service_name} failed: {result.stderr}")
 
     def stop(self, *, non_interactive: bool = False) -> None:
+        self._assert_unit_safe_for_privileged_action()
         command = ["sudo", "systemctl", "stop", self.service_name]
         if non_interactive:
             command.insert(1, "-n")

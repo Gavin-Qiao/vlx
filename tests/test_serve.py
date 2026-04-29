@@ -78,6 +78,37 @@ def test_systemctl_start_noninteractive_uses_sudo_n(mocker):
     assert mock_run.call_args.args[0][:3] == ["sudo", "-n", "systemctl"]
 
 
+def test_service_uses_env_file_requires_exact_vserve_env_path(mocker, tmp_path):
+    from vserve.serve import _service_uses_env_file
+
+    active = tmp_path / "configs" / "active.yaml"
+    active.parent.mkdir(parents=True)
+    mock_c = _mock_cfg(mocker, active_yaml=active)
+    env_path = mock_c.vllm_root / "configs" / ".env"
+    unit = tmp_path / "vllm.service"
+    unit.write_text("[Service]\nEnvironmentFile=/etc/default/other.env\n")
+    mocker.patch("vserve.serve.find_systemd_unit_path", return_value=unit)
+
+    assert _service_uses_env_file(env_path) is False
+
+    unit.write_text(f"[Service]\nEnvironmentFile=-{env_path}\n")
+    assert _service_uses_env_file(env_path) is True
+
+
+def test_systemctl_rejects_unit_that_does_not_belong_to_vserve(mocker, tmp_path):
+    _mock_cfg(mocker, service_name="ssh")
+    unit = tmp_path / "ssh.service"
+    unit.write_text("[Service]\nExecStart=/usr/sbin/sshd -D\n")
+    mocker.patch("vserve.serve.find_systemd_unit_path", return_value=unit)
+    run = mocker.patch("vserve.serve.subprocess.run")
+
+    ok, _out, err = __import__("vserve.serve", fromlist=["_systemctl"])._systemctl("start")
+
+    assert ok is False
+    assert "does not look like a vserve vLLM unit" in err
+    run.assert_not_called()
+
+
 def test_start_vllm_writes_active_manifest(mocker, tmp_path):
     config_file = tmp_path / "test.yaml"
     config_file.write_text("model: /opt/vllm/models/test\nport: 8888\n")

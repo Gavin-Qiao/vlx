@@ -84,6 +84,29 @@ def test_lock_refuses_symlink_file_without_clobbering_target(tmp_path):
     assert victim.read_text() == "keep me\n"
 
 
+def test_lock_acquire_does_not_path_chmod_after_lstat(tmp_path, monkeypatch):
+    lock_file = tmp_path / "vserve-race.lock"
+    lock_file.write_text("")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n")
+    victim.chmod(0o600)
+    original_chmod = os.chmod
+
+    def racing_chmod(path, mode):
+        if Path(path) == lock_file:
+            lock_file.unlink()
+            lock_file.symlink_to(victim)
+        return original_chmod(path, mode)
+
+    monkeypatch.setattr("vserve.lock.os.chmod", racing_chmod)
+
+    lock = VserveLock("race", "test")
+    lock.acquire()
+    lock.release()
+
+    assert (victim.stat().st_mode & 0o777) == 0o600
+
+
 def test_session_write_refuses_symlink_without_clobbering_target(tmp_path, monkeypatch):
     monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
     monkeypatch.setenv("USER", "alice")

@@ -325,6 +325,24 @@ class TestVllmBackend:
         assert b.available_reasoning_parsers() == {"qwen3"}
         assert run.call_args.args[0][0] == str(runtime_python)
 
+    def test_parser_probe_supports_vllm_020_manager_paths(self, mocker, tmp_path):
+        b = VllmBackend()
+        runtime_python = tmp_path / "venv" / "bin" / "python"
+        mocker.patch("vserve.config.cfg", return_value=Mock(vllm_python=runtime_python))
+        run = mocker.patch(
+            "subprocess.run",
+            return_value=Mock(
+                returncode=0,
+                stdout='{"tool_parsers": ["hermes"], "reasoning_parsers": ["qwen3"]}',
+                stderr="",
+            ),
+        )
+
+        assert b.available_tool_parsers() == {"hermes"}
+        script = run.call_args.args[0][2]
+        assert "vllm.tool_parsers" in script
+        assert "list_registered" in script
+
     def test_find_entrypoint_missing(self, mocker):
         b = VllmBackend()
         mock_c = Mock()

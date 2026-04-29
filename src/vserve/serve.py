@@ -4,12 +4,42 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vserve.config import cfg, find_systemd_unit_path, write_active_manifest
+from vserve.config import (
+    cfg,
+    find_systemd_unit_path,
+    unit_content_matches_backend,
+    unit_uses_environment_file,
+    validate_systemd_service_name,
+    write_active_manifest,
+)
+
+
+def _assert_vllm_unit_safe_for_privileged_action() -> None:
+    service_name = cfg().service_name
+    validate_systemd_service_name(service_name)
+    unit = find_systemd_unit_path(service_name)
+    if unit is None:
+        return
+    try:
+        content = unit.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"Cannot verify {service_name}.service before privileged systemctl action: {exc}") from None
+    if not unit_content_matches_backend(
+        content,
+        backend_name="vllm",
+        root=cfg().vllm_root,
+        expected_paths=[cfg().active_yaml],
+    ):
+        raise RuntimeError(f"{service_name}.service does not look like a vserve vLLM unit")
 
 
 def _systemctl(action: str, timeout: int = 30, *, non_interactive: bool = False) -> tuple[bool, str, str]:
     command = ["systemctl", action, cfg().service_name]
     if action in {"start", "stop", "restart", "reload"}:
+        try:
+            _assert_vllm_unit_safe_for_privileged_action()
+        except Exception as exc:
+            return False, "", str(exc)
         if non_interactive:
             command.insert(0, "-n")
         command.insert(0, "sudo")
@@ -127,7 +157,7 @@ def _service_uses_env_file(env_path: Path) -> bool:
         content = unit.read_text()
     except OSError:
         return True
-    return "EnvironmentFile" in content and (str(env_path) in content or "configs/.env" in content or ".env" in content)
+    return unit_uses_environment_file(content, env_path)
 
 
 def is_vllm_running() -> bool:

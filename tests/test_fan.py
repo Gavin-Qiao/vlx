@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, call, patch
 
+import pytest
+
 from vserve.fan import (
     compute_fan_speed,
     read_state,
@@ -272,6 +274,21 @@ def test_run_daemon_exists():
     """run_daemon is importable and callable."""
     from vserve.fan import run_daemon
     assert callable(run_daemon)
+
+
+def test_fan_state_writer_refuses_symlink_without_clobbering_target(tmp_path):
+    from vserve.fan import _write_state_file
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n")
+    state_path = tmp_path / "vserve-fan.json"
+    state_path.symlink_to(victim)
+
+    with pytest.raises(PermissionError, match="Refusing"):
+        _write_state_file(state_path, '{"fixed": 55}')
+
+    assert victim.read_text() == "keep me\n"
+    assert state_path.is_symlink()
 
 
 def test_apply_fan_sets_all_fans():

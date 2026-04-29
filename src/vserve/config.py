@@ -3,8 +3,11 @@
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,10 +22,26 @@ SYSTEMD_UNIT_DIRS = (
     Path("/usr/local/lib/systemd/system"),
     Path("/usr/lib/systemd/system"),
 )
+_SYSTEMD_SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]*$")
+
+
+def validate_systemd_service_name(service_name: str) -> str:
+    """Reject names that cannot be a single systemd service unit."""
+    if (
+        not service_name
+        or service_name in {".", ".."}
+        or "/" in service_name
+        or "\\" in service_name
+        or any(ch.isspace() for ch in service_name)
+        or not _SYSTEMD_SERVICE_RE.match(service_name)
+    ):
+        raise ValueError(f"Invalid systemd service name: {service_name!r}")
+    return service_name
 
 
 def find_systemd_unit_path(service_name: str) -> Path | None:
     """Return the first existing systemd unit path for a service."""
+    validate_systemd_service_name(service_name)
     unit_name = f"{service_name}.service"
     try:
         result = subprocess.run(
@@ -53,16 +72,81 @@ def find_systemd_unit_path(service_name: str) -> Path | None:
     return None
 
 
+def systemd_environment_files(content: str) -> list[Path]:
+    """Parse EnvironmentFile entries from systemd unit content."""
+    paths: list[Path] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != "EnvironmentFile":
+            continue
+        try:
+            tokens = shlex.split(value, comments=False, posix=True)
+        except ValueError:
+            tokens = value.split()
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            if token.startswith("-"):
+                token = token[1:]
+            if token:
+                paths.append(Path(token))
+    return paths
+
+
+def unit_uses_environment_file(content: str, env_path: Path) -> bool:
+    """Return true only when a unit references the exact vserve env file."""
+    expected = env_path.resolve(strict=False)
+    for candidate in systemd_environment_files(content):
+        try:
+            if candidate.resolve(strict=False) == expected:
+                return True
+        except OSError:
+            if candidate == env_path:
+                return True
+    return False
+
+
+def unit_content_matches_backend(
+    content: str,
+    *,
+    backend_name: str,
+    root: Path,
+    expected_paths: list[Path] | None = None,
+) -> bool:
+    """Best-effort ownership check before privileged systemctl actions."""
+    needles = []
+    root_text = str(root)
+    if root_text not in {"", "/"}:
+        needles.append(root_text)
+    needles.extend(str(path) for path in expected_paths or [] if str(path) not in {"", "/"})
+    if backend_name == "vllm":
+        needles.append("vllm")
+    elif backend_name == "llamacpp":
+        needles.extend(["llama-server", "llama-cpp", "llamacpp"])
+    return any(needle and needle in content for needle in needles)
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
     try:
-        with open(tmp, "w") as f:
+        with os.fdopen(fd, "w") as f:
+            fd = -1
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             tmp.unlink(missing_ok=True)
         except OSError:

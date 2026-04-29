@@ -260,6 +260,22 @@ def test_profile_show_refuses_external_path(tmp_path):
     assert "not a vserve profile" in result.output
 
 
+def test_profile_show_by_name_refuses_symlink_to_external_file(mocker, tmp_path):
+    profile_root = tmp_path / "configs"
+    profile_root.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("model: /secret/model\n")
+    (profile_root / "provider--Model.custom.yaml").symlink_to(outside)
+
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(configs_dir=profile_root))
+    mocker.patch("vserve.backends._BACKENDS", [])
+
+    result = runner.invoke(app, ["profile", "show", "custom"])
+
+    assert result.exit_code == 1
+    assert "/secret/model" not in result.output
+
+
 def test_run_save_profile_rejects_path_traversal(mocker, fake_model_dir):
     from vserve.models import detect_model
 
@@ -310,6 +326,35 @@ def test_materialize_subdirectory_variant_as_runnable_root(tmp_path):
     assert (materialized / "tokenizer.json").exists()
     assert (materialized / "model.safetensors.index.json").exists()
     assert (materialized / "model-00001-of-00001.safetensors").exists()
+    assert (local_dir / ".vserve-ignore").exists()
+
+
+def test_materialize_top_level_variants_as_separate_roots(tmp_path):
+    from vserve.cli import _materialize_subdirectory_variants
+    from vserve.variants import Variant
+
+    local_dir = tmp_path / "provider" / "Model"
+    local_dir.mkdir(parents=True)
+    (local_dir / "config.json").write_text("{}")
+    (local_dir / "tokenizer.json").write_text("{}")
+    (local_dir / "model-fp8.safetensors").write_bytes(b"fp8")
+    (local_dir / "model-bf16.safetensors").write_bytes(b"bf16")
+
+    roots = _materialize_subdirectory_variants(
+        local_dir,
+        model_name="Model",
+        selected_variants=[
+            Variant(label="fp8", files={"model-fp8.safetensors": 3}),
+            Variant(label="bf16", files={"model-bf16.safetensors": 4}),
+        ],
+        shared={"config.json": 2, "tokenizer.json": 2},
+    )
+
+    assert roots == [local_dir.parent / "Model-fp8", local_dir.parent / "Model-bf16"]
+    assert (roots[0] / "model-fp8.safetensors").exists()
+    assert not (roots[0] / "model-bf16.safetensors").exists()
+    assert (roots[1] / "model-bf16.safetensors").exists()
+    assert not (roots[1] / "model-fp8.safetensors").exists()
     assert (local_dir / ".vserve-ignore").exists()
 
 
@@ -370,6 +415,32 @@ def test_download_single_subdir_gguf_materializes_top_level_variant_root(mocker,
 
     assert (llama_root / "models" / "provider" / "Model-Q4_K_M" / "Model-Q4_K_M.gguf").exists()
     assert not (llama_root / "models" / "provider" / "Model-Q4_K_M" / "quant" / "Model-Q4_K_M.gguf").exists()
+
+
+def test_download_wait_for_gguf_lock_checks_variant_roots(mocker, tmp_path):
+    from vserve.cli import _download_model
+    from vserve.lock import LockHeld, LockInfo
+    from vserve.variants import Variant
+
+    llama_root = tmp_path / "llama"
+    ready_root = llama_root / "models" / "provider" / "Model-Q4_K_M"
+    ready_root.mkdir(parents=True)
+    (ready_root / "Model-Q4_K_M.gguf").write_bytes(b"ready")
+    variant = Variant(label="Q4_K_M", files={"Model-Q4_K_M.gguf": 4})
+
+    mocker.patch("vserve.variants.fetch_repo_variants", return_value=([variant], {}))
+    mocker.patch("vserve.cli._pick_variants", return_value=[variant])
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(llamacpp_root=llama_root))
+    mocker.patch("vserve.lock.wait_for_release", return_value=True)
+    lock = mocker.Mock()
+    lock.acquire.side_effect = [
+        LockHeld("download-provider--Model", LockInfo(pid=123, user="alice", since="now", command="download")),
+        AssertionError("download should not retry once the GGUF variant root is ready"),
+    ]
+    mocker.patch("vserve.cli.VserveLock", return_value=lock)
+
+    assert _download_model("provider/Model", tmp_path / "models", mocker.Mock(), mocker.Mock()) is True
 
 
 def test_download_rejects_mixed_gguf_and_non_gguf_selection(mocker, tmp_path):
@@ -634,6 +705,59 @@ def test_status_json_reports_multiple_active_backends(mocker, tmp_path):
     assert all("running" in b and "probe_error" in b for b in data["backends"])
 
 
+def test_status_text_warns_about_multiple_active_backends(mocker, tmp_path):
+    active = tmp_path / "active.yaml"
+    active.write_text("model: /models/test\nport: 8888\n")
+
+    vllm = mocker.Mock()
+    vllm.name = "vllm"
+    vllm.display_name = "vLLM"
+    vllm.is_running.return_value = True
+    vllm.active_manifest_path.return_value = tmp_path / "vllm-manifest.json"
+
+    llama = mocker.Mock()
+    llama.name = "llamacpp"
+    llama.display_name = "llama.cpp"
+    llama.is_running.return_value = True
+    llama.active_manifest_path.return_value = tmp_path / "llama-manifest.json"
+
+    mocker.patch("vserve.backends._BACKENDS", [vllm, llama])
+    mocker.patch("vserve.config.active_yaml_path", return_value=active)
+    mocker.patch("subprocess.check_output", return_value=b"0, 1024\n")
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert "Multiple active backends" in result.output
+    assert "vLLM, llama.cpp" in result.output
+
+
+def test_status_json_reports_warming_manifest_as_not_ready(mocker, tmp_path):
+    import json
+
+    active = tmp_path / "active.yaml"
+    active.write_text("model: /models/test\nport: 8888\n")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text('{"backend":"vllm","status":"warming","port":8888}\n')
+
+    vllm = mocker.Mock()
+    vllm.name = "vllm"
+    vllm.display_name = "vLLM"
+    vllm.is_running.return_value = True
+    vllm.active_manifest_path.return_value = manifest_path
+    vllm.health_url.return_value = "http://localhost:8888/health"
+
+    mocker.patch("vserve.backends._BACKENDS", [vllm])
+    mocker.patch("vserve.config.active_yaml_path", return_value=active)
+
+    result = runner.invoke(app, ["status", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["active_manifest"]["status"] == "warming"
+    assert data["next_action"] != "ready"
+
+
 def test_status_json_reports_active_with_probe_error_uncertainty(mocker, tmp_path):
     import json
 
@@ -862,6 +986,43 @@ def test_cache_clean_dry_run_counts_recursive_sockets(mocker, tmp_path):
     assert f"Would clean 1 stale sockets from {tmp_path / 'tmp'}" in result.output
 
 
+def test_cache_clean_refuses_symlinked_vllm_root_before_sudo(mocker, tmp_path):
+    outside = tmp_path / "outside"
+    (outside / ".cache" / "vllm").mkdir(parents=True)
+    root_link = tmp_path / "vllm-link"
+    root_link.symlink_to(outside)
+    run = mocker.patch("subprocess.run")
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([], False))
+    mocker.patch("vserve.cli._lock_or_exit", return_value=mocker.Mock())
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(vllm_root=root_link))
+
+    result = runner.invoke(app, ["cache", "clean", "--all", "--yes"])
+
+    assert result.exit_code == 1
+    assert "Refusing to clean caches under unsafe vLLM root" in result.output
+    run.assert_not_called()
+
+
+def test_cache_clean_delete_failure_exits_nonzero(mocker, tmp_path):
+    cache_dir = tmp_path / ".cache" / "vllm"
+    cache_dir.mkdir(parents=True)
+    mocker.patch("vserve.backends.probe_running_backends", return_value=([], False))
+    mocker.patch("vserve.cli._lock_or_exit", return_value=mocker.Mock())
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(vllm_root=tmp_path))
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["du", "-sm"]:
+            return mocker.Mock(returncode=0, stdout="1\tcache\n", stderr="")
+        return mocker.Mock(returncode=1, stdout="", stderr="permission denied")
+
+    mocker.patch("subprocess.run", side_effect=fake_run)
+
+    result = runner.invoke(app, ["cache", "clean", "--all", "--yes"])
+
+    assert result.exit_code == 1
+    assert "Failed to clean vLLM" in result.output
+
+
 def test_doctor_handles_invalid_utf8_systemd_unit(mocker, tmp_path):
     unit_path = tmp_path / "vllm.service"
     unit_path.write_bytes(b"\x80\x81")
@@ -910,6 +1071,124 @@ def test_doctor_handles_invalid_utf8_systemd_unit(mocker, tmp_path):
 
     assert result.exit_code == 0
     assert "Could not read systemd unit" in result.output
+
+
+def test_doctor_strict_fails_missing_exact_vllm_env_file_even_without_timeout(mocker, tmp_path):
+    import json
+
+    unit_path = tmp_path / "vllm.service"
+    vllm_root = tmp_path / "vllm-root"
+    (vllm_root / "configs" / "models").mkdir(parents=True)
+    (vllm_root / "configs" / ".env").write_text(
+        "CUDA_HOME=/usr/local/cuda\nTMPDIR=/tmp\nVLLM_RPC_BASE_PATH=/tmp\nCUDA_VISIBLE_DEVICES=0\n"
+    )
+    (vllm_root / "tmp").mkdir()
+    unit_path.write_text("[Service]\nExecStart=/opt/vllm/bin/vllm serve\n")
+
+    fake_cfg = mocker.Mock(
+        service_user="vllm",
+        service_name="vllm",
+        llamacpp_root=None,
+        port=8888,
+        logs_dir=tmp_path / "logs",
+    )
+    fake_cfg.logs_dir.mkdir()
+    fake_gpu = mocker.Mock(name="GPU", vram_total_gb=48)
+    vllm_bin = tmp_path / "vllm"
+
+    def fake_run(cmd, *args, **kwargs):
+        exe = str(cmd[0])
+        if exe == "nvcc":
+            return mocker.Mock(returncode=0, stdout="Cuda compilation tools, release 13.0\n", stderr="")
+        if exe == str(vllm_bin):
+            return mocker.Mock(returncode=0, stdout="vllm 0.20.0\n", stderr="")
+        if exe == "id":
+            return mocker.Mock(returncode=0, stdout="uid=1000(vllm)\n", stderr="")
+        return mocker.Mock(returncode=0, stdout="", stderr="")
+
+    mocker.patch("subprocess.run", side_effect=fake_run)
+    mocker.patch("subprocess.check_output", return_value=b"0\n")
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=fake_gpu)
+    mocker.patch("vserve.config.VLLM_BIN", vllm_bin)
+    mocker.patch("vserve.config.VLLM_ROOT", vllm_root)
+    mocker.patch("vserve.config.LOGS_DIR", fake_cfg.logs_dir)
+    mocker.patch("vserve.config.active_yaml_path", return_value=vllm_root / "configs" / "active.yaml")
+    mocker.patch("vserve.config.try_read_profile_yaml", return_value=None)
+    mocker.patch("vserve.config.find_systemd_unit_path", return_value=unit_path)
+    mocker.patch("vserve.config.cfg", return_value=fake_cfg)
+    mocker.patch("vserve.runtime.collect_vllm_runtime_info", return_value=mocker.Mock(vllm_version="0.20.0"))
+    mocker.patch("vserve.runtime.check_vllm_compatibility", return_value=mocker.Mock(supported=True, range="0.20.x", warnings=[]))
+    mocker.patch("vserve.backends._BACKENDS", [])
+    mocker.patch("vserve.backends.running_backend", return_value=None)
+    mocker.patch("vserve.cli._all_models", return_value=[])
+
+    result = runner.invoke(app, ["doctor", "--json", "--strict"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert any(
+        check["status"] == "fail" and "configs/.env" in check["message"]
+        for check in data["checks"]
+    )
+
+
+def test_doctor_strict_llamacpp_only_skips_vllm_required_failures(mocker, tmp_path):
+    import json
+
+    llama_root = tmp_path / "llama"
+    (llama_root / "bin").mkdir(parents=True)
+    (llama_root / "bin" / "llama-server").write_text("#!/bin/sh\n")
+    (llama_root / "models").mkdir()
+    (llama_root / "configs").mkdir()
+    (llama_root / "configs" / "active.sh").write_text("export CUDA_VISIBLE_DEVICES=0\n")
+    unit_path = tmp_path / "llama-cpp.service"
+    unit_path.write_text(f"[Service]\nExecStart={llama_root}/configs/active.sh\nTimeoutStartSec=600\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    fake_cfg = mocker.Mock(
+        service_user="vllm",
+        service_name="vllm",
+        llamacpp_root=llama_root,
+        llamacpp_service_user="llama-cpp",
+        llamacpp_service_name="llama-cpp",
+        port=8888,
+        logs_dir=logs_dir,
+    )
+    fake_gpu = mocker.Mock(name="GPU", vram_total_gb=48)
+
+    def fake_run(cmd, *args, **kwargs):
+        exe = str(cmd[0])
+        if exe == "nvcc":
+            return mocker.Mock(returncode=0, stdout="Cuda compilation tools, release 13.0\n", stderr="")
+        if exe == str(llama_root / "bin" / "llama-server"):
+            return mocker.Mock(returncode=0, stdout="llama-server version test\n", stderr="")
+        if exe == "id":
+            return mocker.Mock(returncode=0, stdout="uid=1000(service)\n", stderr="")
+        return mocker.Mock(returncode=0, stdout="", stderr="")
+
+    def fake_find_unit(name):
+        return unit_path if name == "llama-cpp" else None
+
+    mocker.patch("subprocess.run", side_effect=fake_run)
+    mocker.patch("subprocess.check_output", return_value=b"0\n")
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=fake_gpu)
+    mocker.patch("vserve.config.VLLM_BIN", tmp_path / "missing-vllm")
+    mocker.patch("vserve.config.VLLM_ROOT", tmp_path / "missing-vllm-root")
+    mocker.patch("vserve.config.LOGS_DIR", logs_dir)
+    mocker.patch("vserve.config.active_yaml_path", return_value=tmp_path / "missing-active.yaml")
+    mocker.patch("vserve.config.try_read_profile_yaml", return_value=None)
+    mocker.patch("vserve.config.find_systemd_unit_path", side_effect=fake_find_unit)
+    mocker.patch("vserve.config.cfg", return_value=fake_cfg)
+    mocker.patch("vserve.backends._BACKENDS", [])
+    mocker.patch("vserve.backends.running_backend", return_value=None)
+    mocker.patch("vserve.cli._all_models", return_value=[])
+
+    result = runner.invoke(app, ["doctor", "--json", "--strict"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["summary"]["fail"] == 0
+    assert not any("vLLM not found" in check["message"] for check in data["checks"])
 
 
 def test_init_command_exists():

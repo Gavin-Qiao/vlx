@@ -173,7 +173,7 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
         _log.warning("Skipping models root %s: %s", models_root, exc)
         return models
     for provider_dir in provider_dirs:
-        if not provider_dir.is_dir():
+        if provider_dir.is_symlink() or not provider_dir.is_dir():
             continue
         try:
             model_dirs = sorted(provider_dir.iterdir())
@@ -181,7 +181,7 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
             _log.warning("Skipping provider directory %s: %s", provider_dir, exc)
             continue
         for model_dir in model_dirs:
-            if not model_dir.is_dir():
+            if model_dir.is_symlink() or not model_dir.is_dir():
                 continue
             if (model_dir / ".vserve-ignore").exists():
                 continue

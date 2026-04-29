@@ -206,6 +206,24 @@ def test_scan_models_skips_ignored_materialization_sources(tmp_path):
     assert scan_models(tmp_path / "models") == []
 
 
+def test_scan_models_skips_symlinked_provider_and_model_roots(tmp_path):
+    outside = tmp_path / "outside"
+    outside_model = outside / "Model"
+    outside_model.mkdir(parents=True)
+    (outside_model / "config.json").write_text('{"architectures":["Test"],"model_type":"test"}')
+    (outside_model / "model.safetensors").write_bytes(b"weights")
+
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    (models_root / "linked-provider").symlink_to(outside)
+
+    real_provider = models_root / "real-provider"
+    real_provider.mkdir()
+    (real_provider / "linked-model").symlink_to(outside_model)
+
+    assert scan_models(models_root) == []
+
+
 def test_scan_models_logs_invalid_candidate(tmp_path, caplog):
     bad_dir = tmp_path / "models" / "broken" / "BadModel"
     bad_dir.mkdir(parents=True)

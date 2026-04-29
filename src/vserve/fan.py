@@ -3,6 +3,7 @@
 import logging
 import os
 import signal
+import stat
 import threading
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -49,6 +50,30 @@ _CURVE = [
 ]
 
 EMERGENCY_TEMP = 88  # ignore quiet hours above this
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _write_state_file(path: Path, content: str) -> None:
+    """Write fan daemon state without following symlinks."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o644)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 40:
+            raise PermissionError(f"Refusing to use symlink as vserve fan state file: {path}") from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Refusing to use non-regular vserve fan state file: {path}")
+        try:
+            os.fchmod(fd, 0o644)
+        except PermissionError:
+            pass
+        os.write(fd, content.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def read_state() -> dict | None:
@@ -207,8 +232,8 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
 
     try:
         PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PID_PATH.write_text(str(os.getpid()))
-        STATE_PATH.write_text(json.dumps({
+        _write_state_file(PID_PATH, str(os.getpid()))
+        _write_state_file(STATE_PATH, json.dumps({
             "quiet_start": quiet_start,
             "quiet_end": quiet_end,
             "quiet_max": quiet_max,
@@ -340,8 +365,8 @@ def run_fixed_daemon(speed: int) -> None:
 
     try:
         PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PID_PATH.write_text(str(os.getpid()))
-        STATE_PATH.write_text(json.dumps({"fixed": speed}))
+        _write_state_file(PID_PATH, str(os.getpid()))
+        _write_state_file(STATE_PATH, json.dumps({"fixed": speed}))
     except OSError:
         _cleanup_state_files()
         _fan_lock.release()

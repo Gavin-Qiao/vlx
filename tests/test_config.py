@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from vserve.config import (
@@ -296,6 +297,21 @@ def test_write_and_read_profile_yaml(tmp_path):
     assert "# test profile" in content
     loaded = read_profile_yaml(path)
     assert loaded["port"] == 8888
+
+
+def test_atomic_write_text_does_not_follow_predictable_temp_symlink(tmp_path):
+    from vserve.config import _atomic_write_text
+
+    target = tmp_path / "test.yaml"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n")
+    predictable_tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    predictable_tmp.symlink_to(victim)
+
+    _atomic_write_text(target, "model: safe\n")
+
+    assert target.read_text() == "model: safe\n"
+    assert victim.read_text() == "keep me\n"
 
 
 def test_try_read_profile_yaml_corrupt(tmp_path):

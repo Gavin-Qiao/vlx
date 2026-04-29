@@ -165,6 +165,19 @@ def test_orphan_safetensors():
     assert orphan.total_bytes == 10_000_000_000
 
 
+def test_pytorch_pt_pth_weights_are_not_offered_as_runnable_variants():
+    files = {
+        "config.json": 100,
+        "pytorch_model.pt": 1000,
+        "adapter.pth": 500,
+    }
+
+    variants, shared = discover_variants(files, {})
+
+    assert variants == []
+    assert shared == files
+
+
 def test_gguf_variants():
     """GGUF-only repo with multiple quant levels."""
     files = {
