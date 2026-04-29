@@ -9,18 +9,18 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![vLLM 0.20.x](https://img.shields.io/badge/vLLM-0.20.x-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-475%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-495%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
 
 ---
 
-## Beta Release: 0.5.2b1
+## Beta Release: 0.5.2b2
 
 `vserve` is now in beta.
 
-Highlights in `0.5.2b1`:
+Highlights in `0.5.2b2`:
 
 - lifecycle coordination is now backend-wide: `run` stops conflicting backends before launch, and `stop` drains all detected active backends
 - startup handling is stricter for automation and friendlier for operators: interactive `run` can return while a backend is still warming, while non-interactive `run` still requires a healthy API
@@ -324,7 +324,7 @@ The registry auto-detects the right backend from the model format. Runtime check
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 475 tests
+uv run pytest tests/              # 495 tests
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
 ```

@@ -65,7 +65,7 @@ class TestCompareVersions:
         assert V._compare_versions("0.5.2", "0.5.2a3") > 0
 
     def test_release_candidate_beats_beta(self):
-        assert V._compare_versions("0.5.2rc1", "0.5.2b1") > 0
+        assert V._compare_versions("0.5.2rc1", "0.5.2b2") > 0
 
 
 # ── read_cache / write_cache ───────────────────────────
@@ -92,7 +92,7 @@ class TestCache:
         assert V.CACHE_FILE.exists()
 
     def test_write_records_update_available_flag(self, monkeypatch):
-        monkeypatch.setattr(V, "__version__", "0.5.2b1")
+        monkeypatch.setattr(V, "__version__", "0.5.2b2")
         V.write_cache("0.5.2")
         cache = V.read_cache()
         assert cache["update_available"] is True
