@@ -141,6 +141,43 @@ class TestCheckPypi:
         with patch("vserve.version.urllib.request.urlopen", side_effect=OSError("fail")):
             assert V.check_pypi() is None
 
+    def test_ignores_pypi_release_without_github_release(self):
+        pypi_resp = MagicMock()
+        pypi_resp.read.return_value = json.dumps({
+            "info": {"version": "0.6.0"},
+            "releases": {
+                "0.5.3": [{"filename": "vserve-0.5.3.tar.gz", "yanked": False}],
+                "0.6.0": [{"filename": "vserve-0.6.0.tar.gz", "yanked": False}],
+            },
+        }).encode()
+        pypi_resp.__enter__ = lambda s: s
+        pypi_resp.__exit__ = MagicMock(return_value=False)
+
+        github_resp = MagicMock()
+        github_resp.read.return_value = json.dumps([
+            {"tag_name": "v0.5.3", "draft": False, "prerelease": False},
+        ]).encode()
+        github_resp.__enter__ = lambda s: s
+        github_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("vserve.version.urllib.request.urlopen", side_effect=[pypi_resp, github_resp]):
+            assert V.check_pypi() == "0.5.3"
+
+    def test_ignores_yanked_release(self):
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = json.dumps({
+            "info": {"version": "0.6.0"},
+            "releases": {
+                "0.5.3": [{"filename": "vserve-0.5.3.tar.gz", "yanked": False}],
+                "0.6.0": [{"filename": "vserve-0.6.0.tar.gz", "yanked": True}],
+            },
+        }).encode()
+        fake_resp.__enter__ = lambda s: s
+        fake_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("vserve.version.urllib.request.urlopen", side_effect=[fake_resp, OSError("github down")]):
+            assert V.check_pypi() == "0.5.3"
+
 
 # ── update_available ──────────────────────────────────
 
