@@ -277,6 +277,74 @@ def test_run_daemon_exists():
     assert callable(run_daemon)
 
 
+def test_run_daemon_cleans_state_when_nvml_init_fails(tmp_path, mocker):
+    import vserve.fan as fan_module
+
+    fan_module._paths_resolved = False
+    mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
+        logs_dir=tmp_path / "logs",
+        run_dir=tmp_path / "run",
+        gpu_index=0,
+    ))
+    released = False
+
+    class FakeLock:
+        def __init__(self, name, description):
+            pass
+
+        def acquire(self):
+            pass
+
+        def release(self):
+            nonlocal released
+            released = True
+
+    mocker.patch("vserve.lock.VserveLock", FakeLock)
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlInit.side_effect = RuntimeError("nvml unavailable")
+
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        fan_module.run_daemon()
+
+    assert released is True
+    assert not fan_module.PID_PATH.exists()
+    assert not fan_module.STATE_PATH.exists()
+
+
+def test_run_fixed_daemon_cleans_state_when_nvml_init_fails(tmp_path, mocker):
+    import vserve.fan as fan_module
+
+    fan_module._paths_resolved = False
+    mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
+        logs_dir=tmp_path / "logs",
+        run_dir=tmp_path / "run",
+        gpu_index=0,
+    ))
+    released = False
+
+    class FakeLock:
+        def __init__(self, name, description):
+            pass
+
+        def acquire(self):
+            pass
+
+        def release(self):
+            nonlocal released
+            released = True
+
+    mocker.patch("vserve.lock.VserveLock", FakeLock)
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlInit.side_effect = RuntimeError("nvml unavailable")
+
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        fan_module.run_fixed_daemon(55)
+
+    assert released is True
+    assert not fan_module.PID_PATH.exists()
+    assert not fan_module.STATE_PATH.exists()
+
+
 def test_fan_state_writer_refuses_symlink_without_clobbering_target(tmp_path):
     from vserve.fan import _write_state_file
 

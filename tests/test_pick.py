@@ -153,6 +153,26 @@ class TestPickWithTermMenu:
         result = _pick_many(["a", "b", "c"])
         assert result == []
 
+    def test_pick_variants_retries_empty_term_menu_confirmation(self, mocker):
+        """Pressing Enter with no toggled variant is not a back-navigation."""
+        from vserve.cli import _pick_variants
+        from vserve.variants import Variant
+
+        mocker.patch("vserve.cli._is_interactive", return_value=True)
+        mocker.patch("vserve.cli._has_gum", return_value=False)
+        mock_menu_cls = mocker.patch("simple_term_menu.TerminalMenu")
+        mock_menu_cls.return_value.show.side_effect = [(), (1,)]
+
+        variants = [
+            Variant(label="Q4_K_M", files={"m-Q4_K_M.gguf": 500}),
+            Variant(label="Q8_0", files={"m-Q8_0.gguf": 800}),
+        ]
+
+        result = _pick_variants(variants)
+
+        assert [variant.label for variant in result] == ["Q8_0"]
+        assert mock_menu_cls.return_value.show.call_count == 2
+
 
 class TestPickVariants:
     """_pick_variants uses _pick_many."""

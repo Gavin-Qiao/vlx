@@ -37,9 +37,11 @@ class VllmBackend:
 
     def can_serve(self, model: ModelInfo) -> bool:
         """True if model has top-level safetensors or .bin weights."""
+        from vserve.model_files import iter_top_level_files_with_suffix
+
         p = model.path
-        has_safetensors = any(p.glob("*.safetensors"))
-        has_bin = any(p.glob("*.bin"))
+        has_safetensors = bool(iter_top_level_files_with_suffix(p, ".safetensors"))
+        has_bin = bool(iter_top_level_files_with_suffix(p, ".bin"))
         return has_safetensors or has_bin
 
     def find_entrypoint(self) -> Path | None:

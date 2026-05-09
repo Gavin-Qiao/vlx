@@ -65,6 +65,23 @@ def test_detect_model_size_includes_bin_weights(tmp_path):
     assert info.model_size_gb == 2.0
 
 
+def test_detect_model_size_includes_uppercase_weight_suffix(tmp_path):
+    """Weight suffix checks should be consistent with variant discovery."""
+    import json
+    model_dir = tmp_path / "models" / "test" / "UppercaseWeights"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({
+        "architectures": ["TestLM"],
+        "model_type": "test",
+    }))
+    with (model_dir / "model.SAFETENSORS").open("wb") as f:
+        f.truncate(2 * 1024**3)
+
+    info = detect_model(model_dir)
+
+    assert info.model_size_gb == 2.0
+
+
 def test_detect_model_mha_uses_attention_heads_when_kv_heads_missing(tmp_path):
     """Standard MHA configs omit num_key_value_heads; KV heads equal attention heads."""
     import json
@@ -446,6 +463,18 @@ def test_detect_gguf_model_no_config(tmp_path):
     (model_dir / "model-Q4_K_M.gguf").write_bytes(b"\0" * 8192)
     # No config.json, no tokenizer_config.json
     m = detect_model(model_dir)
+    assert m.is_gguf is True
+    assert m.architecture == "gguf"
+
+
+def test_detect_uppercase_gguf_model_no_config(tmp_path):
+    """GGUF detection must match the downloader's case-insensitive variant classification."""
+    model_dir = tmp_path / "models" / "user" / "Model-GGUF"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model-Q4_K_M.GGUF").write_bytes(b"\0" * 8192)
+
+    m = detect_model(model_dir)
+
     assert m.is_gguf is True
     assert m.architecture == "gguf"
 

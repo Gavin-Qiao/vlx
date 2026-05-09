@@ -95,6 +95,19 @@ class TestLlamaCppBuildConfig:
         cfg = b.build_config(m, choices)
         assert cfg["model"].endswith(".gguf")
 
+    def test_config_model_path_accepts_uppercase_gguf_extension(self, tmp_path):
+        b = LlamaCppBackend()
+        model_dir = tmp_path / "models" / "provider" / "Model"
+        model_dir.mkdir(parents=True)
+        (model_dir / "Model-Q4_K_M.GGUF").write_bytes(b"\0")
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        choices = {"context": 4096, "n_gpu_layers": 10, "parallel": 1, "port": 8888, "tools": False}
+        cfg = b.build_config(m, choices)
+
+        assert cfg["model"].endswith("Model-Q4_K_M.GGUF")
+
     def test_config_selects_one_coherent_split_shard_set(self, tmp_path):
         b = LlamaCppBackend()
         model_dir = tmp_path / "models" / "provider" / "Model"

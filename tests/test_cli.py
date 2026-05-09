@@ -417,6 +417,36 @@ def test_download_single_subdir_gguf_materializes_top_level_variant_root(mocker,
     assert not (llama_root / "models" / "provider" / "Model-Q4_K_M" / "quant" / "Model-Q4_K_M.gguf").exists()
 
 
+def test_download_uppercase_gguf_variant_downloads_weight_file(mocker, tmp_path):
+    from vserve.cli import _download_model
+    from vserve.variants import Variant
+
+    llama_root = tmp_path / "llama"
+    variant = Variant(label="Q4_K_M", files={"quant/Model-Q4_K_M.GGUF": 4})
+    mocker.patch("vserve.variants.fetch_repo_variants", return_value=([variant], {"config.json": 1}))
+    mocker.patch("vserve.cli._pick_variants", return_value=[variant])
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("vserve.config.cfg", return_value=mocker.Mock(llamacpp_root=llama_root))
+    mocker.patch("vserve.models.detect_model", return_value=None)
+
+    downloaded: list[str] = []
+
+    def fake_hf_hub_download(*, repo_id, filename, local_dir):
+        downloaded.append(filename)
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"data")
+        return str(path)
+
+    mocker.patch("huggingface_hub.hf_hub_download", side_effect=fake_hf_hub_download)
+
+    assert _download_model("provider/Model", tmp_path / "models", mocker.Mock(), mocker.Mock()) is True
+
+    assert "quant/Model-Q4_K_M.GGUF" in downloaded
+    assert (llama_root / "models" / "provider" / "Model-Q4_K_M" / "Model-Q4_K_M.GGUF").exists()
+    assert not (llama_root / "models" / "provider" / "Model-Q4_K_M" / "quant" / "Model-Q4_K_M.GGUF").exists()
+
+
 def test_download_wait_for_gguf_lock_checks_variant_roots(mocker, tmp_path):
     from vserve.cli import _download_model
     from vserve.lock import LockHeld, LockInfo
@@ -441,6 +471,20 @@ def test_download_wait_for_gguf_lock_checks_variant_roots(mocker, tmp_path):
     mocker.patch("vserve.cli.VserveLock", return_value=lock)
 
     assert _download_model("provider/Model", tmp_path / "models", mocker.Mock(), mocker.Mock()) is True
+
+
+def test_download_roots_ready_requires_weight_file(tmp_path):
+    from vserve.cli import _download_roots_ready
+
+    root = tmp_path / "models" / "provider" / "Partial"
+    root.mkdir(parents=True)
+    (root / "config.json").write_text("{}")
+
+    assert _download_roots_ready([root]) is False
+
+    (root / "model.safetensors").write_bytes(b"weights")
+
+    assert _download_roots_ready([root]) is True
 
 
 def test_download_rejects_mixed_gguf_and_non_gguf_selection(mocker, tmp_path):
@@ -1289,6 +1333,87 @@ def test_init_llamacpp_only_skips_vllm_prompt_and_banner_install(mocker, tmp_pat
     assert "optional — needed for safetensors models" in result.output
     assert "required for vserve run/stop" not in result.output
     assert "Install login banner?" not in result.output
+
+
+def test_fan_off_treats_permission_denied_pid_probe_as_live(mocker, tmp_path):
+    import os
+
+    import vserve.fan as fan_module
+
+    fan_module._paths_resolved = False
+    mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
+        logs_dir=tmp_path / "logs",
+        run_dir=tmp_path / "run",
+    ))
+    fan_module._resolve_paths()
+    fan_module.PID_PATH.parent.mkdir(parents=True)
+    fan_module.PID_PATH.write_text("4242")
+    fan_module.STATE_PATH.write_text('{"fixed": 55}')
+
+    def fake_kill(pid: int, signal_number: int) -> None:
+        if signal_number == 0:
+            raise PermissionError("not owner")
+        raise AssertionError("should re-exec with sudo before sending SIGTERM")
+
+    original_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(path: Path) -> bytes:
+        if str(path) == "/proc/4242/cmdline":
+            return b"python\0-m\0vserve.fan\0"
+        return original_read_bytes(path)
+
+    mocker.patch("os.kill", side_effect=fake_kill)
+    mocker.patch("os.geteuid", return_value=1000)
+    execvp = mocker.patch("os.execvp", side_effect=SystemExit(42))
+    mocker.patch.object(Path, "read_bytes", fake_read_bytes)
+
+    result = runner.invoke(app, ["fan", "off"])
+
+    assert result.exit_code == 42
+    execvp.assert_called_once()
+    assert execvp.call_args.args[0] == "sudo"
+    assert fan_module.PID_PATH.exists()
+    assert fan_module.STATE_PATH.exists()
+    assert os.kill.call_count == 1
+
+
+def test_fan_off_does_not_remove_state_when_daemon_refuses_to_stop(mocker, tmp_path):
+    import signal
+
+    import vserve.fan as fan_module
+
+    fan_module._paths_resolved = False
+    mocker.patch("vserve.fan.cfg", return_value=mocker.Mock(
+        logs_dir=tmp_path / "logs",
+        run_dir=tmp_path / "run",
+    ))
+    fan_module._resolve_paths()
+    fan_module.PID_PATH.parent.mkdir(parents=True)
+    fan_module.PID_PATH.write_text("4242")
+    fan_module.STATE_PATH.write_text('{"fixed": 55}')
+
+    original_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(path: Path) -> bytes:
+        if str(path) == "/proc/4242/cmdline":
+            return b"python\0-m\0vserve.fan\0"
+        return original_read_bytes(path)
+
+    def fake_kill(pid: int, signal_number: int) -> None:
+        assert pid == 4242
+        assert signal_number in (0, signal.SIGTERM)
+
+    mocker.patch("os.kill", side_effect=fake_kill)
+    mocker.patch("os.geteuid", return_value=0)
+    mocker.patch("time.sleep")
+    mocker.patch.object(Path, "read_bytes", fake_read_bytes)
+
+    result = runner.invoke(app, ["fan", "off"])
+
+    assert result.exit_code == 1
+    assert "did not stop" in result.output
+    assert fan_module.PID_PATH.exists()
+    assert fan_module.STATE_PATH.exists()
 
 
 def test_doctor_summary_label_counts_warnings():

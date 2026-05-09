@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from vserve.model_files import iter_top_level_files_with_suffix
+
 _log = logging.getLogger(__name__)
 
 
@@ -78,10 +80,10 @@ def quant_flag(method: str | None) -> str:
 
 def detect_model(model_dir: Path) -> ModelInfo:
     config_path = model_dir / "config.json"
-    gguf_files = list(model_dir.glob("*.gguf"))
+    gguf_files = iter_top_level_files_with_suffix(model_dir, ".gguf")
 
-    has_safetensors = any(model_dir.glob("*.safetensors"))
-    has_bin = any(model_dir.glob("*.bin"))
+    has_safetensors = bool(iter_top_level_files_with_suffix(model_dir, ".safetensors"))
+    has_bin = bool(iter_top_level_files_with_suffix(model_dir, ".bin"))
     if gguf_files and not has_safetensors and not has_bin:
         # GGUF model — may or may not have config.json alongside
         size_bytes = sum(f.stat().st_size for f in gguf_files)
@@ -143,8 +145,8 @@ def detect_model(model_dir: Path) -> ModelInfo:
     if head_dim_val is None and hidden_size and num_attn_heads:
         head_dim_val = hidden_size // num_attn_heads
 
-    size_bytes = sum(f.stat().st_size for f in model_dir.glob("*.safetensors"))
-    size_bytes += sum(f.stat().st_size for f in model_dir.glob("*.bin"))
+    size_bytes = sum(f.stat().st_size for f in iter_top_level_files_with_suffix(model_dir, ".safetensors"))
+    size_bytes += sum(f.stat().st_size for f in iter_top_level_files_with_suffix(model_dir, ".bin"))
     size_gb = round(size_bytes / (1024**3), 1)
 
     return ModelInfo(
@@ -187,7 +189,7 @@ def scan_models(models_root: Path) -> list[ModelInfo]:
                 continue
             try:
                 has_config = (model_dir / "config.json").exists()
-                has_gguf = any(model_dir.glob("*.gguf"))
+                has_gguf = bool(iter_top_level_files_with_suffix(model_dir, ".gguf"))
                 if not has_config and not has_gguf:
                     continue
                 models.append(detect_model(model_dir))

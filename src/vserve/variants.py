@@ -209,13 +209,13 @@ def _label_from_orphan(path: str) -> str:
 
 def _label_from_gguf(path: str) -> str:
     filename = path.rsplit("/", 1)[-1]
-    stem = filename.removesuffix(".gguf")
+    stem = filename[:-5] if filename.lower().endswith(".gguf") else filename
     split = _split_gguf_group(path)
     if split is not None:
         return split[1]
     for sep in ["-", ".", "_"]:
         parts = stem.rsplit(sep, 1)
-        if len(parts) == 2 and parts[1].startswith(("Q", "IQ")):
+        if len(parts) == 2 and parts[1].upper().startswith(("Q", "IQ")):
             return parts[1]
     return stem
 
@@ -230,7 +230,7 @@ def _split_gguf_group(path: str) -> tuple[str, str] | None:
 
 def _split_gguf_part(path: str) -> tuple[str, str, int, int] | None:
     filename = path.rsplit("/", 1)[-1]
-    match = re.match(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", filename)
+    match = re.match(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", filename, flags=re.IGNORECASE)
     if match is None:
         return None
     base = match.group("base")
@@ -243,6 +243,6 @@ def _split_gguf_part(path: str) -> tuple[str, str, int, int] | None:
 def _label_from_gguf_stem(stem: str) -> str:
     for sep in ["-", ".", "_"]:
         parts = stem.rsplit(sep, 1)
-        if len(parts) == 2 and parts[1].startswith(("Q", "IQ")):
+        if len(parts) == 2 and parts[1].upper().startswith(("Q", "IQ")):
             return parts[1]
     return stem

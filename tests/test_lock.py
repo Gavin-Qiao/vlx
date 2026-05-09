@@ -12,6 +12,7 @@ import pytest
 from vserve.lock import (
     LockHeld, LockInfo, VserveLock, _format_elapsed, wait_for_release,
     check_session, write_session, read_session, SessionHeld, SessionUnknown,
+    _pid_alive,
 )
 
 
@@ -181,6 +182,15 @@ def test_lock_released_on_process_death(tmp_path):
     lock = VserveLock("die", "reacquire")
     lock.acquire()  # should not raise
     lock.release()
+
+
+def test_pid_alive_treats_permission_denied_as_alive(monkeypatch):
+    def fake_kill(pid, signal):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr("vserve.lock.os.kill", fake_kill)
+
+    assert _pid_alive(1234) is True
 
 
 # ── Per-model download lock names ────────────────────

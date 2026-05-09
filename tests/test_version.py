@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from typer.testing import CliRunner
 
+import vserve.cli as CLI
 from vserve.cli import app
 from vserve import version as V
 
@@ -253,6 +254,7 @@ class TestUpdateCommand:
 
     def test_stable_release_not_treated_as_up_to_date(self, monkeypatch):
         monkeypatch.setattr(V, "background_refresh", lambda: None)
+        monkeypatch.setattr(CLI, "__version__", "0.5.2b2")
         with patch("vserve.version.check_pypi", return_value="0.5.2"), \
              patch("shutil.which", return_value=None):
             result = runner.invoke(app, ["update"])

@@ -12,6 +12,8 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
+from vserve.model_files import is_weight_file_name, iter_recursive_files_with_suffix
+
 SUPPORTED_VLLM_RANGE = ">=0.20,<0.21"
 PINNED_STABLE_VLLM = "0.20.0"
 DETECTOR_SCHEMA_VERSION = 2
@@ -265,10 +267,7 @@ def _model_file_identity(model_path: Path) -> list[dict[str, int | str]]:
         if not path.is_file():
             continue
         rel = path.relative_to(model_path).as_posix()
-        if not (
-            rel.endswith((".safetensors", ".bin", ".gguf"))
-            or rel.endswith(".index.json")
-        ):
+        if not (is_weight_file_name(rel) or rel.lower().endswith(".index.json")):
             continue
         try:
             stat = path.stat()
@@ -283,7 +282,7 @@ def _model_file_identity(model_path: Path) -> list[dict[str, int | str]]:
 
 
 def _gguf_metadata_hash(model_path: Path) -> str | None:
-    gguf_files = sorted(model_path.rglob("*.gguf"))
+    gguf_files = iter_recursive_files_with_suffix(model_path, ".gguf")
     if not gguf_files:
         return None
     digest = hashlib.sha256()

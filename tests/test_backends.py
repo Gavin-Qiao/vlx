@@ -86,6 +86,20 @@ class TestVllmBackend:
         m = detect_model(fake_model_dir)
         assert b.can_serve(m) is True
 
+    def test_can_serve_uppercase_safetensors_suffix(self, tmp_path):
+        b = VllmBackend()
+        model_dir = tmp_path / "models" / "user" / "UppercaseWeights"
+        model_dir.mkdir(parents=True)
+        (model_dir / "model.SAFETENSORS").write_bytes(b"\0")
+
+        from vserve.models import ModelInfo
+        m = ModelInfo(
+            path=model_dir, provider="user", model_name="UppercaseWeights",
+            architecture="TestLM", model_type="test", quant_method=None,
+            max_position_embeddings=4096, is_moe=False, model_size_gb=0.1,
+        )
+        assert b.can_serve(m) is True
+
     def test_cannot_serve_gguf_only(self, tmp_path):
         b = VllmBackend()
         model_dir = tmp_path / "models" / "user" / "Model-GGUF"

@@ -261,6 +261,25 @@ def test_gguf_iq_quant():
     assert variants[0].label == "IQ4_XS"
 
 
+def test_uppercase_gguf_extension_is_grouped_and_labeled():
+    files = {
+        "Model-Q4_K_M-00001-of-00002.GGUF": 2_000_000_000,
+        "Model-Q4_K_M-00002-of-00002.GGUF": 2_000_000_000,
+        "Model-Q8_0.GGUF": 8_000_000_000,
+    }
+
+    variants, shared = discover_variants(files, {})
+
+    labels = {v.label for v in variants}
+    assert labels == {"Q4_K_M", "Q8_0"}
+    q4 = next(v for v in variants if v.label == "Q4_K_M")
+    assert set(q4.files) == {
+        "Model-Q4_K_M-00001-of-00002.GGUF",
+        "Model-Q4_K_M-00002-of-00002.GGUF",
+    }
+    assert shared == {}
+
+
 def test_skipped_files():
     """Files in metal/ and .git are skipped entirely."""
     files = {

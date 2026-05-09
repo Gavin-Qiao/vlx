@@ -849,11 +849,14 @@ def _parse_multi_select(answer: str, item_count: int) -> list[int] | None:
     return indices
 
 
-def _pick_many(items: list[str], title: str = "") -> list[int]:
+def _pick_many(items: list[str], title: str = "", *, require_selection: bool = False) -> list[int]:
     """Multi-select menu. Returns list of indices.
 
     Uses gum → simple-term-menu → numbered prompt (best available).
     """
+    def prompt_for_selection() -> None:
+        console.print("[yellow]Select at least one item, or cancel to go back.[/yellow]")
+
     if not _is_interactive():
         for i, item in enumerate(items, 1):
             console.print(f"  {i}) {item}")
@@ -868,40 +871,53 @@ def _pick_many(items: list[str], title: str = "") -> list[int]:
 
     if _has_gum():
         import subprocess
-        cmd = [
-            "gum", "choose", "--no-limit",
-            "--cursor.foreground", "6",
-            "--selected.foreground", "2", "--selected.bold",
-        ]
-        if title:
-            cmd.extend(["--header", title])
-        cmd.extend(items)
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-        _restore_terminal()
-        if r.returncode != 0 or not r.stdout.strip():
-            return []  # cancelled or nothing selected → back
-        selected_lines = {ln.strip() for ln in r.stdout.strip().split("\n")}
-        return [i for i, item in enumerate(items) if item.strip() in selected_lines]
+        while True:
+            cmd = [
+                "gum", "choose", "--no-limit",
+                "--cursor.foreground", "6",
+                "--selected.foreground", "2", "--selected.bold",
+            ]
+            if title:
+                cmd.extend(["--header", title])
+            cmd.extend(items)
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+            _restore_terminal()
+            if r.returncode != 0:
+                return []  # cancelled or nothing selected → back
+            if not r.stdout.strip():
+                if require_selection:
+                    prompt_for_selection()
+                    continue
+                return []
+            selected_lines = {ln.strip() for ln in r.stdout.strip().split("\n")}
+            selected_indices = [i for i, item in enumerate(items) if item.strip() in selected_lines]
+            if selected_indices or not require_selection:
+                return selected_indices
+            prompt_for_selection()
 
     try:
-        from simple_term_menu import TerminalMenu
-        menu = TerminalMenu(
-            items, title=title,
-            multi_select=True,
-            show_multi_select_hint=True,
-            menu_cursor="❯ ",
-            menu_cursor_style=("fg_cyan", "bold"),
-            multi_select_cursor_style=("fg_green", "bold"),
-            menu_highlight_style=("standout",),
-            cycle_cursor=True,
-            status_bar="  ↑↓ navigate · x/space toggle · enter confirm · q cancel",
-            status_bar_style=("fg_gray",),
-        )
-        result = menu.show()
-        _restore_terminal()
-        if result is None:
-            return []
-        return list(result) if isinstance(result, tuple) else [result]
+        while True:
+            from simple_term_menu import TerminalMenu
+            menu = TerminalMenu(
+                items, title=title,
+                multi_select=True,
+                show_multi_select_hint=True,
+                menu_cursor="❯ ",
+                menu_cursor_style=("fg_cyan", "bold"),
+                multi_select_cursor_style=("fg_green", "bold"),
+                menu_highlight_style=("standout",),
+                cycle_cursor=True,
+                status_bar="  ↑↓ navigate · x/space toggle · enter confirm · q cancel",
+                status_bar_style=("fg_gray",),
+            )
+            result = menu.show()
+            _restore_terminal()
+            if result is None:
+                return []
+            selected_indices = list(result) if isinstance(result, tuple) else [result]
+            if selected_indices or not require_selection:
+                return selected_indices
+            prompt_for_selection()
     except Exception:
         _restore_terminal()
         pass
@@ -1003,7 +1019,11 @@ def _pick_variants(variants: list) -> list:
         return variants
 
     lines = [format_variant_line(v, index=i) for i, v in enumerate(variants, 1)]
-    indices = _pick_many(lines, title="Select variant(s) — x/space to toggle, enter to confirm:")
+    indices = _pick_many(
+        lines,
+        title="Select variant(s) — x/space to toggle, enter to confirm:",
+        require_selection=True,
+    )
     return [variants[i] for i in indices]
 
 
@@ -1025,7 +1045,13 @@ def _materialize_subdirectory_variant(
 
 
 def _root_has_top_level_weights(path: pathlib.Path) -> bool:
-    return any(path.glob("*.safetensors")) or any(path.glob("*.bin")) or any(path.glob("*.gguf"))
+    from vserve.model_files import iter_top_level_files_with_suffix
+
+    return (
+        bool(iter_top_level_files_with_suffix(path, ".safetensors"))
+        or bool(iter_top_level_files_with_suffix(path, ".bin"))
+        or bool(iter_top_level_files_with_suffix(path, ".gguf"))
+    )
 
 
 def _variant_common_prefix(files: list[str]) -> str | None:
@@ -1123,7 +1149,9 @@ def _gguf_variant_root(base_dir: pathlib.Path, *, model_name: str, variant) -> p
 
 
 def _variant_contains_gguf(variant) -> bool:
-    return any(str(filename).lower().endswith(".gguf") for filename in getattr(variant, "files", {}))
+    from vserve.model_files import is_gguf_name
+
+    return any(is_gguf_name(filename) for filename in getattr(variant, "files", {}))
 
 
 def _expected_download_roots(
@@ -1144,9 +1172,11 @@ def _expected_download_roots(
 def _download_roots_ready(roots: list[pathlib.Path]) -> bool:
     if not roots:
         return False
+    from vserve.model_files import iter_recursive_weight_files
+
     for root in roots:
         try:
-            if not root.exists() or not any(root.iterdir()):
+            if not root.exists() or not iter_recursive_weight_files(root):
                 return False
         except OSError:
             return False
@@ -1177,7 +1207,9 @@ def _strip_downloaded_file_prefix(downloaded: pathlib.Path, root: pathlib.Path, 
 def _clear_stale_gguf_files(root: pathlib.Path) -> None:
     if not root.exists():
         return
-    for stale in sorted(root.rglob("*.gguf")):
+    from vserve.model_files import iter_recursive_files_with_suffix
+
+    for stale in iter_recursive_files_with_suffix(root, ".gguf"):
         try:
             stale.unlink()
         except OSError:
@@ -1322,6 +1354,7 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
     try:
         if is_gguf_download:
             from huggingface_hub import hf_hub_download  # type: ignore[import-untyped]
+            from vserve.model_files import is_gguf_name
             for variant in selected_variants:
                 variant_dir = _gguf_variant_root(
                     local_dir,
@@ -1332,14 +1365,14 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
                 _clear_stale_gguf_files(variant_dir)
                 downloaded_dirs.append(variant_dir)
                 for filename in variant.files:
-                    if filename.endswith(".gguf"):
+                    if is_gguf_name(filename):
                         downloaded_path = pathlib.Path(
                             hf_hub_download(repo_id=model_id, filename=filename, local_dir=variant_dir)
                         )
                         _strip_downloaded_file_prefix(downloaded_path, variant_dir, filename)
                 # Also grab tokenizer_config.json and shared non-GGUF files in each runnable root.
                 for filename in ["tokenizer_config.json", *shared.keys()]:
-                    if filename.endswith(".gguf"):
+                    if is_gguf_name(filename):
                         continue
                     try:
                         downloaded_path = pathlib.Path(
@@ -3082,35 +3115,65 @@ def fan(
         except OSError:
             pass
 
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
     def _daemon_pid() -> int | None:
         if not PID_PATH.exists():
             return None
         try:
             pid = int(PID_PATH.read_text().strip())
-            os.kill(pid, 0)
-            # Verify it's actually our daemon, not a recycled PID
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
-            if "vserve.fan" not in cmdline:
-                _safe_unlink(PID_PATH)
-                _safe_unlink(STATE_PATH)
-                return None
-            return pid
         except (ValueError, OSError):
             _safe_unlink(PID_PATH)
             _safe_unlink(STATE_PATH)
             return None
+        if not _pid_alive(pid):
+            _safe_unlink(PID_PATH)
+            _safe_unlink(STATE_PATH)
+            return None
+        try:
+            # Verify it's actually our daemon, not a recycled PID.
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+        except PermissionError:
+            return pid
+        except OSError:
+            _safe_unlink(PID_PATH)
+            _safe_unlink(STATE_PATH)
+            return None
+        if "vserve.fan" not in cmdline:
+            _safe_unlink(PID_PATH)
+            _safe_unlink(STATE_PATH)
+            return None
+        return pid
 
     def _stop_daemon() -> bool:
         pid = _daemon_pid()
         if pid is None:
             return False
-        os.kill(pid, sig.SIGTERM)
+        try:
+            os.kill(pid, sig.SIGTERM)
+        except ProcessLookupError:
+            _safe_unlink(PID_PATH)
+            _safe_unlink(STATE_PATH)
+            return True
+        except PermissionError:
+            console.print(f"[red]Permission denied stopping fan daemon pid {pid}.[/red]")
+            raise typer.Exit(1) from None
         for _ in range(50):
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.1)
-            except OSError:
+            if not _pid_alive(pid):
                 break
+            time.sleep(0.1)
+        if _pid_alive(pid):
+            console.print(f"[red]Fan daemon pid {pid} did not stop within 5 seconds.[/red]")
+            raise typer.Exit(1)
         _safe_unlink(PID_PATH)
         _safe_unlink(STATE_PATH)
         return True
@@ -3690,7 +3753,8 @@ def init():
     if llamacpp_root:
         lc_models = llamacpp_root / "models"
         if lc_models.is_dir():
-            gguf_count = sum(1 for _ in lc_models.rglob("*.gguf"))
+            from vserve.model_files import iter_recursive_files_with_suffix
+            gguf_count = len(iter_recursive_files_with_suffix(lc_models, ".gguf"))
             _ok(f"GGUF models {gguf_count} found at {lc_models}")
         else:
             _warn(f"GGUF models {lc_models} does not exist")
@@ -4212,7 +4276,8 @@ def doctor(
         lc_models = lc_root / "models"
         if lc_models.exists():
             try:
-                model_count = sum(1 for p in lc_models.rglob("*.gguf") if p.is_file())
+                from vserve.model_files import iter_recursive_files_with_suffix
+                model_count = len(iter_recursive_files_with_suffix(lc_models, ".gguf"))
             except OSError as exc:
                 _warn(f"Models dir unreadable: {lc_models}", str(exc))
             else:

@@ -256,10 +256,13 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     import pynvml
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
-
+    handle = None
+    nvml_started = False
     try:
+        pynvml.nvmlInit()
+        nvml_started = True
+        handle = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
+
         # Enable manual fan control via NVML — no X11/Xvfb needed
         _set_manual_control(handle)
 
@@ -322,18 +325,22 @@ def run_daemon(quiet_start: int = 9, quiet_end: int = 18, quiet_max: int = 60) -
                     _log.exception("Fan update failed (%d consecutive)", consecutive_failures)
 
             stop.wait(timeout=POLL_INTERVAL)
+    except Exception:
+        _log.exception("Fan daemon failed during startup")
     finally:
         # Restore auto fan control via NVML — best effort
         restored = False
-        try:
-            _restore_auto_control(handle)
-            restored = True
-        except Exception:
-            _log.exception("Failed to restore auto fan control")
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        if handle is not None:
+            try:
+                _restore_auto_control(handle)
+                restored = True
+            except Exception:
+                _log.exception("Failed to restore auto fan control")
+        if nvml_started:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
         _cleanup_state_files()
         _fan_lock.release()
         if restored:
@@ -385,10 +392,13 @@ def run_fixed_daemon(speed: int) -> None:
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     import pynvml
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
-
+    handle = None
+    nvml_started = False
     try:
+        pynvml.nvmlInit()
+        nvml_started = True
+        handle = pynvml.nvmlDeviceGetHandleByIndex(_configured_gpu_index())
+
         _set_manual_control(handle)
         _apply_fan(speed, handle)
         _log.info("Fan fixed at %d%%", speed)
@@ -399,17 +409,21 @@ def run_fixed_daemon(speed: int) -> None:
             except Exception:
                 _log.exception("Fan re-apply failed")
             stop.wait(timeout=POLL_INTERVAL)
+    except Exception:
+        _log.exception("Fan fixed daemon failed during startup")
     finally:
         restored = False
-        try:
-            _restore_auto_control(handle)
-            restored = True
-        except Exception:
-            _log.exception("Failed to restore auto fan control")
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        if handle is not None:
+            try:
+                _restore_auto_control(handle)
+                restored = True
+            except Exception:
+                _log.exception("Failed to restore auto fan control")
+        if nvml_started:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
         _cleanup_state_files()
         _fan_lock.release()
         if restored:

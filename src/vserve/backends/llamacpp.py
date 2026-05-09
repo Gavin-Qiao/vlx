@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from vserve.model_files import iter_top_level_files_with_suffix
+
 if TYPE_CHECKING:
     from vserve.gpu import GpuInfo
     from vserve.models import ModelInfo
@@ -38,7 +40,7 @@ class LlamaCppBackend:
 
     def can_serve(self, model: ModelInfo) -> bool:
         """True if model directory contains GGUF files."""
-        return getattr(model, "is_gguf", False) or any(model.path.glob("*.gguf"))
+        return getattr(model, "is_gguf", False) or bool(iter_top_level_files_with_suffix(model.path, ".gguf"))
 
     def find_entrypoint(self) -> Path | None:
         candidate = self.root_dir / "bin" / "llama-server"
@@ -188,11 +190,11 @@ class LlamaCppBackend:
         """Select one coherent GGUF variant from a model directory."""
         import re
 
-        gguf_files = sorted(model_path.glob("*.gguf"))
+        gguf_files = iter_top_level_files_with_suffix(model_path, ".gguf")
         if not gguf_files:
             return None
 
-        shard_pattern = re.compile(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
+        shard_pattern = re.compile(r"(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", flags=re.IGNORECASE)
         groups: dict[str, dict[int, Path]] = {}
         totals: dict[str, int] = {}
         singles: list[Path] = []
@@ -472,7 +474,7 @@ class LlamaCppBackend:
 
     def _read_gguf_chat_template(self, model_path: Path) -> str | None:
         """Read chat template from GGUF file metadata."""
-        gguf_files = sorted(model_path.glob("*.gguf"))
+        gguf_files = iter_top_level_files_with_suffix(model_path, ".gguf")
         if not gguf_files:
             return None
         try:
