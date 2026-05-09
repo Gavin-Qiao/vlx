@@ -6,6 +6,11 @@
 [ -z "$BASH_VERSION" ] && [ -z "$ZSH_VERSION" ] && return 0
 command -v gum &>/dev/null || return 0
 
+_esc="$(printf '\033')"
+_reset="${_esc}[0m"
+_c() { printf '%s[38;5;%sm%s%s' "$_esc" "$1" "$2" "$_reset"; }
+_cb() { printf '%s[1;38;5;%sm%s%s' "$_esc" "$1" "$2" "$_reset"; }
+
 # ── Read vserve config ──────────────────────────────────
 
 _vserve_cfg="$HOME/.config/vserve/config.yaml"
@@ -83,11 +88,27 @@ if [ -n "$_llamacpp_root" ] && [ -d "$_llamacpp_root/models" ]; then
     _mc=$((_mc + _lc_mc))
 fi
 
-_gpu_q="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,name --format=csv,noheader,nounits 2>/dev/null)"
-_drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null)"
-_cuda="$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[\d.]+')"
+_is_uint() {
+    case "$1" in
+        ""|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
-_gpu_util=0 _gpu_mem_used=0 _gpu_mem_total=1 _gpu_name="unknown"
+_gpu_q=""
+_drv="unknown"
+_cuda="unknown"
+_gpu_ok=0
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if _gpu_q_out="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,name --format=csv,noheader,nounits 2>/dev/null)"; then
+        _gpu_q="$(printf '%s\n' "$_gpu_q_out" | sed -n '1p')"
+        _drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | sed -n '1p')"
+        _cuda="$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[\d.]+' | sed -n '1p')"
+        _gpu_ok=1
+    fi
+fi
+
+_gpu_util=0 _gpu_mem_used=0 _gpu_mem_total=0 _gpu_name="GPU unavailable"
 if [ -n "$_gpu_q" ]; then
     _gpu_util="$(echo "$_gpu_q" | cut -d',' -f1 | tr -d ' ')"
     _gpu_mem_used="$(echo "$_gpu_q" | cut -d',' -f2 | tr -d ' ')"
@@ -95,90 +116,154 @@ if [ -n "$_gpu_q" ]; then
     _gpu_name="$(echo "$_gpu_q" | cut -d',' -f4 | sed 's/^ //; s/ *$//')"
 fi
 
-_gpu_mem_used_gb="$(awk "BEGIN {printf \"%.1f\", ${_gpu_mem_used}/1024}")"
-_gpu_mem_total_gb="$(awk "BEGIN {printf \"%.1f\", ${_gpu_mem_total}/1024}")"
-_mem_pct=$((_gpu_mem_used * 100 / _gpu_mem_total))
+_is_uint "$_gpu_util" || _gpu_util=0
+_is_uint "$_gpu_mem_used" || _gpu_mem_used=0
+_is_uint "$_gpu_mem_total" || _gpu_mem_total=0
+
+_gpu_mem_used_gb="$(awk -v mem="$_gpu_mem_used" 'BEGIN {printf "%.1f", mem/1024}')"
+_gpu_mem_total_gb="$(awk -v mem="$_gpu_mem_total" 'BEGIN {printf "%.1f", mem/1024}')"
+if [ "$_gpu_mem_total" -gt 0 ]; then
+    _mem_pct=$((_gpu_mem_used * 100 / _gpu_mem_total))
+else
+    _mem_pct=0
+fi
 
 _mkbar() {
     local pct=$1 width=20 color=$2
     local filled=$((pct * width / 100))
     local empty=$((width - filled))
+    local i=0
     local bar_f="" bar_e=""
-    [ $filled -gt 0 ] && bar_f="$(printf '%0.s█' $(seq 1 $filled))"
-    [ $empty -gt 0 ]  && bar_e="$(printf '%0.s░' $(seq 1 $empty))"
-    echo "$(gum style --foreground "$color" "$bar_f")$(gum style --foreground 238 "$bar_e")"
+
+    while [ "$i" -lt "$filled" ]; do
+        bar_f="${bar_f}█"
+        i=$((i + 1))
+    done
+    i=0
+    while [ "$i" -lt "$empty" ]; do
+        bar_e="${bar_e}░"
+        i=$((i + 1))
+    done
+
+    printf '%s%s' "$(_c "$color" "$bar_f")" "$(_c 238 "$bar_e")"
 }
 
-_proc_data="$(nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader,nounits 2>/dev/null)"
+_proc_data=""
+if [ "$_gpu_ok" -eq 1 ]; then
+    if _proc_query="$(nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader,nounits 2>/dev/null)"; then
+        _proc_data="$_proc_query"
+    fi
+fi
 
 # ── Layout ───────────────────────────────────────────
 
-_lbl() { gum style --foreground 243 --width 16 "$1"; }
+_section_title() {
+    local title="$1" color="$2"
+    printf '%s %s %s\n' "$(_c 238 '╭─')" "$(_cb "$color" "$title")" "$(_c 238 '────────────────────────────────────────')"
+}
 
-[ "$_s" = "active" ] \
-    && _status="$(gum style --foreground 78 --bold 'ONLINE')" \
-    || _status="$(gum style --foreground 167 'OFFLINE')"
+_metric() {
+    local label="$1" value="$2"
+    printf '%s %s\n' "$(_c 244 "$(printf '%-13s' "$label")")" "$value"
+}
 
-_header="$(gum join --horizontal \
-    "$(gum style --bold --foreground 37 'vserve')" \
-    "$(gum style --foreground 243 '  inference server')")"
+_pill() {
+    local color="$1" label="$2"
+    printf '%s %s' "$(_c "$color" '●')" "$(_cb "$color" "$label")"
+}
 
-_sec_server="$(gum join --vertical \
-    "$(gum join --horizontal "$(_lbl STATUS)"   "$_status")" \
-    "$(gum join --horizontal "$(_lbl MODEL)"    "$(gum style --foreground 252 "${_m:-no model active}")")" \
-    "$(gum join --horizontal "$(_lbl ENDPOINT)" "$(gum style --foreground 252 "http://localhost:${_port}/v1")")" \
-    "$(gum join --horizontal "$(_lbl MODELS)"   "$(gum style --foreground 252 "${_mc} downloaded")")" \
-)"
+_muted_rule="$(_c 238 '╰───────────────────────────────────────────────')"
 
-_sec_gpu="$(gum join --vertical \
-    "$(gum join --horizontal "$(_lbl DEVICE)"  "$(gum style --foreground 252 "${_gpu_name}")")" \
-    "$(gum join --horizontal "$(_lbl DRIVER)"  "$(gum style --foreground 252 "${_drv}")" "$(gum style --foreground 240 "  CUDA ${_cuda}")")" \
-    "$(gum join --horizontal "$(_lbl COMPUTE)" "$(_mkbar "$_gpu_util" 186)" "  $(gum style --foreground 252 "${_gpu_util}%")")" \
-    "$(gum join --horizontal "$(_lbl VRAM)"    "$(_mkbar "$_mem_pct" 37)"   "  $(gum style --foreground 252 "${_gpu_mem_used_gb} / ${_gpu_mem_total_gb} GB")")" \
-)"
+if [ "$_s" = "active" ]; then
+    _status="$(_pill 78 'ONLINE')"
+else
+    _status="$(_pill 167 'OFFLINE')"
+fi
+_backend_label="${_active_backend:-standby}"
+_endpoint="http://localhost:${_port}/v1"
+
+_header="$(printf '%s %s %s %s\n%s\n' \
+    "$(_cb 37 'vserve')" \
+    "$(_c 245 'CONTROL DECK')" \
+    "$(_c 238 '•')" \
+    "$_status" \
+    "$(_c 244 "backend ${_backend_label}  ·  ${_endpoint}")")"
+
+_sec_server="$(printf '%s\n%s\n%s\n%s\n%s\n%s' \
+    "$(_section_title 'SERVING' 78)" \
+    "$(_metric STATE "$_status")" \
+    "$(_metric MODEL "$(_c 252 "${_m:-no model active}")")" \
+    "$(_metric ENDPOINT "$(_c 252 "$_endpoint")")" \
+    "$(_metric CATALOG "$(_c 252 "${_mc} downloaded models")")" \
+    "$_muted_rule")"
+
+_gpu_state="$(_pill 78 'READY')"
+if [ "$_gpu_ok" -ne 1 ]; then
+    _gpu_state="$(_pill 220 'UNAVAILABLE')"
+fi
+
+_sec_gpu="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+    "$(_section_title 'GPU TELEMETRY' 81)" \
+    "$(_metric STATE "$_gpu_state")" \
+    "$(_metric DEVICE "$(_c 252 "${_gpu_name}")")" \
+    "$(_metric RUNTIME "$(_c 252 "${_drv}") $(_c 240 "CUDA ${_cuda}")")" \
+    "$(_metric COMPUTE "$(_mkbar "$_gpu_util" 186)  $(_c 252 "${_gpu_util}%")")" \
+    "$(_metric VRAM "$(_mkbar "$_mem_pct" 37)  $(_c 252 "${_gpu_mem_used_gb} / ${_gpu_mem_total_gb} GB")")" \
+    "$_muted_rule")"
 
 if [ -n "$_proc_data" ]; then
-    _ph="$(gum join --horizontal \
-        "$(gum style --foreground 243 --bold --width 18 'PROCESS')" \
-        "$(gum style --foreground 243 --bold --width 12 'USER')" \
-        "$(gum style --foreground 243 --bold --width 12 'VRAM')" \
-        "$(gum style --foreground 243 --bold --width 12 'UPTIME')" \
-        "$(gum style --foreground 243 --bold 'PID')")"
+    _ph="$(printf '%s\n%s %s %s %s %s' \
+        "$(_section_title 'GPU WORKLOAD' 186)" \
+        "$(_cb 244 "$(printf '%-18s' PROCESS)")" \
+        "$(_cb 244 "$(printf '%-12s' USER)")" \
+        "$(_cb 244 "$(printf '%-12s' VRAM)")" \
+        "$(_cb 244 "$(printf '%-12s' UPTIME)")" \
+        "$(_cb 244 PID)")"
 
     _prows="$_ph"
     while IFS=',' read -r pid mem name; do
         pid="$(echo "$pid" | tr -d ' ')"
         mem="$(echo "$mem" | tr -d ' ')"
         name="$(echo "$name" | sed 's/^ //; s|.*/||')"
-        mem_gb="$(awk "BEGIN {printf \"%.1f GB\", ${mem}/1024}")"
+        _is_uint "$pid" || continue
+        _is_uint "$mem" || mem=0
+        mem_gb="$(awk -v mem="$mem" 'BEGIN {printf "%.1f GB", mem/1024}')"
         owner="$(ps -o user= -p "$pid" 2>/dev/null || echo "?")"
         uptime="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')" ; [ -z "$uptime" ] && uptime="?"
-        _row="$(gum join --horizontal \
-            "$(gum style --foreground 252 --width 18 "$name")" \
-            "$(gum style --foreground 240 --width 12 "$owner")" \
-            "$(gum style --foreground 186 --width 12 "$mem_gb")" \
-            "$(gum style --foreground 240 --width 12 "$uptime")" \
-            "$(gum style --foreground 240 "$pid")")"
-        _prows="$(gum join --vertical "$_prows" "$_row")"
+        _row="$(printf '%s %s %s %s %s\n' \
+            "$(_c 252 "$(printf '%-18s' "$name")")" \
+            "$(_c 240 "$(printf '%-12s' "$owner")")" \
+            "$(_c 186 "$(printf '%-12s' "$mem_gb")")" \
+            "$(_c 240 "$(printf '%-12s' "$uptime")")" \
+            "$(_c 240 "$pid")")"
+        _prows="$(printf '%s\n%s' "$_prows" "$_row")"
     done <<< "$_proc_data"
-    _sec_proc="$_prows"
+    _sec_proc="$(printf '%s\n%s' "$_prows" "$_muted_rule")"
 else
-    _sec_proc="$(gum style --foreground 240 'No GPU processes')"
+    _sec_proc="$(printf '%s\n%s\n%s' \
+        "$(_section_title 'GPU WORKLOAD' 186)" \
+        "$(_c 240 'No GPU processes')" \
+        "$_muted_rule")"
 fi
 
-_sep="$(gum style --foreground 238 '────────────────────────────────────────────────────────')"
+_sep="$(_c 238 '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')"
 
-_sec_cmds="$(gum join --vertical \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve list')"              "$(gum style --foreground 240 'list models with limits & capabilities')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve add [model]')"       "$(gum style --foreground 240 'search & download from HuggingFace')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve rm [model]')"        "$(gum style --foreground 240 'remove a downloaded model')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve tune [model]')"      "$(gum style --foreground 240 'calculate context & concurrency limits')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve run [model]')"       "$(gum style --foreground 240 'start serving (interactive config)')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve stop')"              "$(gum style --foreground 240 'stop the inference server')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve status')"            "$(gum style --foreground 240 'show what is currently serving')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve fan [auto|off|30-100]')" "$(gum style --foreground 240 'GPU fan control')")" \
-    "$(gum join --horizontal "$(gum style --foreground 37 --width 28 'vserve doctor')"            "$(gum style --foreground 240 'check system readiness')")" \
-)"
+_cmd_row() {
+    printf '%s %s %s\n' "$(_c 238 '›')" "$(_c 37 "$(printf '%-28s' "$1")")" "$(_c 240 "$2")"
+}
+
+_sec_cmds="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+    "$(_section_title 'COMMAND DECK' 37)" \
+    "$(_cmd_row 'vserve list' 'list models with limits & capabilities')" \
+    "$(_cmd_row 'vserve add [model]' 'search & download from HuggingFace')" \
+    "$(_cmd_row 'vserve rm [model]' 'remove a downloaded model')" \
+    "$(_cmd_row 'vserve tune [model]' 'calculate context & concurrency limits')" \
+    "$(_cmd_row 'vserve run [model]' 'start serving (interactive config)')" \
+    "$(_cmd_row 'vserve stop' 'stop the inference server')" \
+    "$(_cmd_row 'vserve status' 'show what is currently serving')" \
+    "$(_cmd_row 'vserve fan [auto|off|30-100]' 'GPU fan control')" \
+    "$(_cmd_row 'vserve doctor' 'check system readiness')" \
+    "$_muted_rule")"
 
 # ── Update check ────────────────────────────────────
 _update_cache="$HOME/.cache/vserve/update-check.json"
@@ -188,27 +273,34 @@ if [ -f "$_update_cache" ]; then
     _uc_latest="$(grep -o '"latest" *: *"[^"]*"' "$_update_cache" | sed 's/.*: *"//;s/"//')"
     _uc_has_update="$(grep -o '"update_available" *: *[^,}]*' "$_update_cache" | sed 's/.*: *//')"
     if [ "$_uc_has_update" = "true" ] && [ -n "$_uc_current" ] && [ -n "$_uc_latest" ]; then
-        _sec_update="$(gum join --vertical \
-            "" \
-            "$(gum join --horizontal \
-                "$(gum style --foreground 220 --bold "  Update available:")" \
-                "$(gum style --foreground 252 " $_uc_current →")" \
-                "$(gum style --foreground 78 --bold " $_uc_latest")")" \
-            "$(gum style --foreground 243 "  Run: vserve update")")"
+        _sec_update="
+$(_cb 220 '  Update available:') $(_c 252 " $_uc_current →") $(_cb 78 " $_uc_latest")
+$(_c 243 '  Run: vserve update')"
     fi
 fi
 
-_body="$(gum join --vertical \
-    "" "$_header" "" "$_sec_server" "" "$_sep" "" "$_sec_gpu" "" \
-    "$_sec_proc" "" "$_sep" "" "$_sec_cmds" "$_sec_update" "" \
-)"
+_body="
+$_header
+
+$_sec_server
+
+$_sep
+
+$_sec_gpu
+
+$_sec_proc
+
+$_sep
+
+$_sec_cmds$_sec_update
+"
 
 gum style --border rounded --border-foreground 24 --padding "0 3" --margin "1 2" "$_body"
 
-unset -f _lbl _mkbar
-unset _vserve_cfg _cfg_values _vllm_root _llamacpp_root _llamacpp_svc _svc_name _port
-unset _s _m _mc _lc_mc _active _active_backend _gpu_q _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
+unset -f _c _cb _section_title _metric _pill _cmd_row _mkbar _is_uint
+unset _esc _reset _vserve_cfg _cfg_values _vllm_root _llamacpp_root _llamacpp_svc _svc_name _port
+unset _s _m _mc _lc_mc _active _active_backend _gpu_q _gpu_q_out _gpu_ok _drv _cuda _gpu_util _gpu_mem_used _gpu_mem_total _gpu_name
 unset _gpu_mem_used_gb _gpu_mem_total_gb _mem_pct
-unset _proc_data _ph _prows _row
+unset _proc_data _proc_query _ph _prows _row
 unset _update_cache _uc_current _uc_latest _uc_has_update
-unset _header _status _sec_server _sec_gpu _sec_proc _sec_cmds _sep _sec_update _body
+unset _header _status _backend_label _endpoint _gpu_state _muted_rule _sec_server _sec_gpu _sec_proc _sec_cmds _sep _sec_update _body
