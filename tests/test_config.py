@@ -176,6 +176,8 @@ def test_active_yaml_path():
 
 
 def test_write_and_read_limits(tmp_path):
+    from vserve.config import LIMITS_SCHEMA_VERSION
+
     data = {
         "model_path": "/opt/vllm/models/test/model",
         "limits": {"4096": {"auto": 64, "fp8": 128}},
@@ -183,13 +185,15 @@ def test_write_and_read_limits(tmp_path):
     path = tmp_path / "test.limits.json"
     write_limits(path, data)
     loaded = read_limits(path)
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == LIMITS_SCHEMA_VERSION
     assert loaded["limits"]["4096"]["fp8"] == 128
 
 
 def test_limits_cache_matches_requires_schema_and_fingerprint(tmp_path):
+    from vserve.config import LIMITS_SCHEMA_VERSION
+
     data = {
-        "schema_version": 2,
+        "schema_version": LIMITS_SCHEMA_VERSION,
         "backend": "vllm",
         "fingerprint": {
             "model_path": "/opt/vllm/models/test/model",

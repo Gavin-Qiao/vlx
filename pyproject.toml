@@ -1,6 +1,6 @@
 [project]
 name = "vserve"
-version = "0.5.5"
+version = "0.5.6"
 description = "CLI for managing LLM inference on GPU workstations"
 readme = "README.md"
 license = "MIT"
@@ -47,6 +47,22 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vserve"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.claude",
+    "/.codex",
+    "/.github",
+    "/.githooks",
+    "/.pytest_cache",
+    "/.serena",
+    "/.worktrees",
+    "/dist",
+    "/docs/plans",
+    "/docs/specs",
+    "/docs/superpowers",
+    "/node_modules",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -9,42 +9,40 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![vLLM 0.20.x](https://img.shields.io/badge/vLLM-0.20.x-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-495%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-547%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
 
 ---
 
-## Beta Release: 0.5.2b2
+## Release: 0.5.6
 
 `vserve` is now in beta.
 
-Highlights in `0.5.2b2`:
+Highlights in `0.5.6`:
 
-- lifecycle coordination is now backend-wide: `run` stops conflicting backends before launch, and `stop` drains all detected active backends
-- startup handling is stricter for automation and friendlier for operators: interactive `run` can return while a backend is still warming, while non-interactive `run` still requires a healthy API
-- `vserve run` now polls health every 3 seconds and shows the latest 5 `journalctl` lines while waiting, which makes JIT/kernel warmup much easier to follow
-- config, profile, limits, and local state parsing is hardened against malformed files
-- doctor/update/runtime paths are more defensive around probe failures, unreadable files, and backend/service uncertainty
-- vLLM runtime support is pinned to stable `>=0.20,<0.21`; `vserve runtime check vllm` reports installed vLLM, torch, CUDA, Transformers, and dependency health
-- tuning caches are versioned and tied to model, GPU, backend, and runtime fingerprints, so stale limits are recalculated after runtime drift
+- vLLM tuning now models PagedAttention block rounding, FP8/TurboQuant KV-cache dtypes, and scheduler profiles for interactivity, balanced use, and throughput
+- generated vLLM profiles can include `performance-mode`, `optimization-level`, `block-size`, `kv-cache-memory-bytes`, and prefix-cache choices when supported by the runtime
+- llama.cpp tuning reads GGUF metadata directly and handles long-context Qwen hybrid/recurrent and Gemma sliding-window attention layouts
+- `vserve tune --bench` adds opt-in bounded microbenchmarks for vLLM and llama.cpp without making downloads start a serving backend
+- model listing uses "Weights" size terminology across vLLM and GGUF models
 
 Current beta caveats:
 
 - non-interactive startup remains intentionally strict: if the backend never reaches a healthy API state within the timeout window, `run` exits nonzero even if the service is still warming
 - multi-user coordination is best-effort operational safety, not a security boundary
+- TurboQuant capacity is reported analytically from vLLM's exposed KV dtype choices; benchmark representative profiles before treating it as a production quality setting
 
 ---
 
 ## Install
 
-Beta/pre-release channel (primary while `vserve` is in beta):
+Install from PyPI:
 
 ```bash
-uv tool install --prerelease allow vserve
-pip install --pre vserve
-vserve update --nightly
+uv tool install vserve
+pip install vserve
 ```
 
 For llama.cpp GGUF tuning support:
@@ -111,6 +109,8 @@ No configuration needed — download a model and `vserve run` picks the right en
 The default for transformer models in safetensors format. Optimized for high-throughput serving with PagedAttention, KV cache management, and automatic batching.
 
 - Auto-tunes `--max-model-len`, `--max-num-seqs`, `--kv-cache-dtype` based on your GPU
+- Calculates PagedAttention block-rounded capacity for native, FP8, and TurboQuant KV-cache dtypes
+- Recommends scheduler profiles with chunked-prefill-oriented token budgets and vLLM 0.20 optimization knobs
 - Tool calling with parser auto-detection (Qwen, Llama, Mistral, DeepSeek, Gemma, GPT-OSS)
 - Systemd service management via `vllm.service`
 
@@ -119,6 +119,7 @@ The default for transformer models in safetensors format. Optimized for high-thr
 For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible API.
 
 - Auto-calculates `--n-gpu-layers`, `--ctx-size`, `--parallel` based on VRAM
+- Reads GGUF metadata without the optional `gguf` package and accounts for layerwise KV heads, sliding-window attention, and recurrent state
 - Partial GPU offload — serve models that don't fully fit in VRAM
 - Tool calling via `--jinja` (no parser configuration needed)
 - Systemd service management via `llama-cpp.service`
@@ -131,6 +132,7 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 
 - **Download** — search HuggingFace, see available weight variants (FP8, NVFP4, BF16, GGUF) with sizes, download only one backend format at a time, and materialize each runnable variant into its own model root
 - **Auto-tune** — calculate exactly what context lengths and concurrency your GPU can handle, based on model architecture and available VRAM
+- **Benchmark** — opt into bounded backend microbenchmarks with `vserve tune --bench`
 - **Tool calling** — auto-detects the correct parser from the model's chat template (vLLM) or uses `--jinja` (llama.cpp)
 - **Run/Stop** — interactive config wizard, systemd service management, health check with timeout
 - **Fan control** — temperature-based curve daemon with quiet hours, or hold a fixed speed
@@ -149,6 +151,7 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 | `vserve add [model]` | Search and download from HuggingFace with variant picker |
 | `vserve rm <name>` | Remove a downloaded model |
 | `vserve tune [model]` | Calculate context/concurrency limits |
+| `vserve tune [model] --bench` | Run bounded benchmarks for tuned vLLM or llama.cpp profiles |
 | `vserve run [model]` | Configure and start serving (auto-tunes if needed) |
 | `vserve run MODEL... --yes --context N --slots N` | Non-interactive serving from flags |
 | `vserve run MODEL... --yes --replace` | Non-interactive restart; without `--replace`, running backends are refused |
@@ -324,7 +327,7 @@ The registry auto-detects the right backend from the model format. Runtime check
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 495 tests
+uv run pytest tests/              # 547 tests
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
 ```

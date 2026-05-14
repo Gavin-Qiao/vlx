@@ -110,12 +110,13 @@ def test_run_yes_uses_tuned_defaults_and_detected_tool_parser(mocker, fake_model
     backend.build_config.return_value = {"model": str(model.path), "port": 8888}
     backend.available_tool_parsers.return_value = {"hermes"}
     backend.available_reasoning_parsers.return_value = {"qwen3"}
+    from vserve.config import LIMITS_SCHEMA_VERSION
     mocker.patch("vserve.cli._all_models", return_value=[model])
     mocker.patch("vserve.backends.get_backend", return_value=backend)
     mocker.patch("vserve.cli._session_or_exit")
     mocker.patch("vserve.config.limits_cache_matches", return_value=True)
     mocker.patch("vserve.cli.read_limits", return_value={
-        "schema_version": 2,
+        "schema_version": LIMITS_SCHEMA_VERSION,
         "backend": "vllm",
         "limits": {"4096": {"auto": 2}, "8192": {"auto": 4, "fp8": 8}},
         "tool_call_parser": "hermes",
@@ -181,8 +182,9 @@ def test_ensure_scripted_limits_retunes_stale_cache(mocker, fake_model_dir):
     backend.display_name = "vLLM"
     backend.tune.return_value = {"backend": "vllm", "limits": {"8192": {"auto": 4}}}
     gpu = mocker.Mock(name="GPU", vram_total_gb=48.0, driver="drv", cuda="13.0")
+    from vserve.config import LIMITS_SCHEMA_VERSION
     mocker.patch("vserve.cli.read_limits", return_value={
-        "schema_version": 2,
+        "schema_version": LIMITS_SCHEMA_VERSION,
         "backend": "vllm",
         "fingerprint": {"old": True},
         "limits": {"4096": {"auto": 1}},
@@ -212,6 +214,128 @@ def test_vllm_scripted_defaults_reject_requested_oom_context(fake_model_dir):
             slots=None,
             kv_cache_dtype=None,
         )
+
+
+def test_vllm_scripted_defaults_prefers_balanced_recommendation(fake_model_dir):
+    from vserve.cli import _choose_vllm_scripted_defaults
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    limits = {
+        "limits": {
+            "4096": {"auto": 8},
+            "8192": {"auto": 4, "fp8": 8},
+            "16384": {"auto": None, "fp8": 4},
+        },
+        "recommendations": {
+            "balanced": {
+                "context": 8192,
+                "kv_cache_dtype": "auto",
+                "max_num_seqs": 4,
+                "max_num_batched_tokens": 8192,
+                "performance_mode": "balanced",
+            },
+        },
+    }
+
+    context, kv_dtype, slots, scheduler = _choose_vllm_scripted_defaults(
+        model,
+        limits,
+        context=None,
+        slots=None,
+        kv_cache_dtype=None,
+    )
+
+    assert context == 8192
+    assert kv_dtype == "auto"
+    assert slots == 4
+    assert scheduler["max_num_batched_tokens"] == 8192
+    assert scheduler["performance_mode"] == "balanced"
+
+
+def test_vllm_scripted_defaults_respects_explicit_context_over_recommendation(fake_model_dir):
+    from vserve.cli import _choose_vllm_scripted_defaults
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    limits = {
+        "limits": {
+            "8192": {"auto": 4},
+            "16384": {"fp8": 4},
+        },
+        "recommendations": {
+            "balanced": {
+                "context": 8192,
+                "kv_cache_dtype": "auto",
+                "max_num_seqs": 4,
+                "max_num_batched_tokens": 8192,
+                "performance_mode": "balanced",
+            },
+        },
+    }
+
+    context, kv_dtype, slots, scheduler = _choose_vllm_scripted_defaults(
+        model,
+        limits,
+        context=16384,
+        slots=None,
+        kv_cache_dtype=None,
+    )
+
+    assert context == 16384
+    assert kv_dtype == "fp8"
+    assert slots == 4
+    assert scheduler == {}
+
+
+def test_vllm_scripted_defaults_does_not_auto_pick_turboquant(fake_model_dir):
+    from vserve.cli import _choose_vllm_scripted_defaults
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    limits = {
+        "limits": {
+            "8192": {"auto": None, "fp8": 2, "turboquant_k8v4": 6},
+            "16384": {"auto": None, "fp8": None, "turboquant_k8v4": 3},
+        },
+    }
+
+    context, kv_dtype, slots, scheduler = _choose_vllm_scripted_defaults(
+        model,
+        limits,
+        context=None,
+        slots=None,
+        kv_cache_dtype=None,
+    )
+
+    assert context == 8192
+    assert kv_dtype == "fp8"
+    assert slots == 2
+    assert scheduler == {}
+
+
+def test_vllm_scripted_defaults_allows_explicit_turboquant(fake_model_dir):
+    from vserve.cli import _choose_vllm_scripted_defaults
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    limits = {
+        "limits": {
+            "8192": {"auto": None, "fp8": None, "turboquant_k8v4": 3},
+        },
+    }
+
+    context, kv_dtype, slots, _scheduler = _choose_vllm_scripted_defaults(
+        model,
+        limits,
+        context=8192,
+        slots=None,
+        kv_cache_dtype="turboquant_k8v4",
+    )
+
+    assert context == 8192
+    assert kv_dtype == "turboquant_k8v4"
+    assert slots == 3
 
 
 def test_run_profile_path_infers_backend_without_model(mocker, tmp_path):
@@ -502,6 +626,60 @@ def test_download_rejects_mixed_gguf_and_non_gguf_selection(mocker, tmp_path):
 
     with pytest.raises(typer.Exit):
         _download_model("provider/Model", tmp_path / "models", mocker.Mock(), mocker.Mock())
+
+
+def test_auto_tune_downloaded_model_does_not_benchmark_vllm_by_default(mocker, fake_model_dir):
+    from vserve.cli import _auto_tune_downloaded_model
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.tune.return_value = {
+        "backend": "vllm",
+        "limits": {"4096": {"auto": 2}},
+        "recommendations": {"balanced": {"context": 4096, "kv_cache_dtype": "auto", "max_num_seqs": 2}},
+    }
+    mocker.patch("vserve.backends.get_backend", return_value=backend)
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=mocker.Mock(name="GPU", vram_total_gb=48.0, driver="drv", cuda="13.0"))
+    mocker.patch("vserve.gpu.resolve_gpu_memory_utilization", return_value=0.9)
+    mocker.patch("vserve.runtime.build_tuning_fingerprint", return_value={"fresh": True})
+    write_limits = mocker.patch("vserve.config.write_limits")
+    bench = mocker.patch("vserve.cli._run_tuning_benchmarks", return_value={"status": "ok", "results": []})
+
+    _auto_tune_downloaded_model(model)
+
+    bench.assert_not_called()
+    saved = write_limits.call_args.args[1]
+    assert "benchmark_results" not in saved
+
+
+def test_auto_tune_downloaded_model_does_not_benchmark_llamacpp_by_default(mocker, fake_gguf_model_dir):
+    from vserve.cli import _auto_tune_downloaded_model
+    from vserve.models import detect_model
+
+    model = detect_model(fake_gguf_model_dir)
+    backend = mocker.Mock()
+    backend.name = "llamacpp"
+    backend.display_name = "llama.cpp"
+    backend.tune.return_value = {
+        "backend": "llamacpp",
+        "limits": {"4096": 4},
+        "n_gpu_layers": 32,
+    }
+    mocker.patch("vserve.backends.get_backend", return_value=backend)
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=mocker.Mock(name="GPU", vram_total_gb=48.0, driver="drv", cuda="13.0"))
+    mocker.patch("vserve.gpu.resolve_gpu_memory_utilization", return_value=0.9)
+    mocker.patch("vserve.runtime.build_tuning_fingerprint", return_value={"fresh": True})
+    write_limits = mocker.patch("vserve.config.write_limits")
+    bench = mocker.patch("vserve.cli._run_tuning_benchmarks", return_value={"status": "ok", "results": []})
+
+    _auto_tune_downloaded_model(model)
+
+    bench.assert_not_called()
+    saved = write_limits.call_args.args[1]
+    assert "benchmark_results" not in saved
 
 
 def test_stop_command_exists():

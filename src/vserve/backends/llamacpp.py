@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import shutil
+import struct
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable
 
 from vserve.model_files import iter_top_level_files_with_suffix
 
@@ -125,8 +126,6 @@ class LlamaCppBackend:
         metadata = self._read_gguf_metadata(primary_file)
         num_layers = metadata.get("num_layers", 32)
         max_context = metadata.get("max_context", 4096)
-        num_kv_heads = metadata.get("num_kv_heads", 8)
-        head_dim = metadata.get("head_dim", 128)
 
         usable_gb = gpu.vram_total_gb * gpu_mem_util
         layer_size_gb = model_size_gb / num_layers if num_layers > 0 else model_size_gb
@@ -136,22 +135,15 @@ class LlamaCppBackend:
         n_gpu_layers = min(num_layers, int(available_for_layers / layer_size_gb)) if layer_size_gb > 0 else num_layers
         full_offload = n_gpu_layers >= num_layers
 
-        # KV cache: FP16 by default
-        kv_per_token_bytes = 2 * num_kv_heads * head_dim * num_layers * 2
-
         gpu_model_gb = n_gpu_layers * layer_size_gb
         remaining_gb = usable_gb - gpu_model_gb
-        remaining_bytes = max(0, remaining_gb) * (1024**3)
+        remaining_bytes = int(max(0, remaining_gb) * (1024**3))
 
         from vserve.probe import _context_steps
         steps = _context_steps(max_context) if max_context >= 4096 else [4096]
         limits: dict[str, int | None] = {}
         for ctx in steps:
-            if kv_per_token_bytes > 0:
-                total_kv_tokens = int(remaining_bytes // kv_per_token_bytes)
-                parallel = total_kv_tokens // ctx if ctx > 0 else 0
-            else:
-                parallel = 0
+            parallel = self._max_parallel_slots_for_context(metadata, remaining_bytes, ctx)
             limits[str(ctx)] = parallel if parallel >= 1 else None
 
         # Embedding model detection
@@ -224,8 +216,170 @@ class LlamaCppBackend:
         best = max(candidates, key=lambda files: (sum(path.stat().st_size for path in files), files[0].name))
         return best[0], best
 
+    @staticmethod
+    def _positive_int(value: object) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _total_kv_heads(cls, value: object, num_layers: int) -> int:
+        default = 8 * max(1, num_layers)
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return max(1, value) * max(1, num_layers)
+        if isinstance(value, list):
+            heads = [item for item in (cls._positive_int(item) for item in value) if item is not None]
+            if not heads:
+                return default
+            if len(heads) >= num_layers:
+                return sum(heads[:num_layers])
+            return sum(heads) + heads[-1] * max(0, num_layers - len(heads))
+        return default
+
+    @classmethod
+    def _max_parallel_slots_for_context(cls, metadata: dict, remaining_bytes: int, context: int) -> int:
+        if context <= 0 or remaining_bytes <= 0:
+            return 0
+        first_slot_bytes = cls._llamacpp_kv_cache_bytes(metadata, context=context, parallel=1)
+        if first_slot_bytes <= 0 or first_slot_bytes > remaining_bytes:
+            return 0
+
+        low = 1
+        high = 1
+        while high < 4096:
+            candidate = min(high * 2, 4096)
+            if cls._llamacpp_kv_cache_bytes(metadata, context=context, parallel=candidate) > remaining_bytes:
+                high = candidate - 1
+                break
+            high = candidate
+            if high == 4096:
+                break
+
+        while low < high:
+            mid = (low + high + 1) // 2
+            if cls._llamacpp_kv_cache_bytes(metadata, context=context, parallel=mid) <= remaining_bytes:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    @classmethod
+    def _llamacpp_kv_cache_bytes(cls, metadata: dict, *, context: int, parallel: int) -> int:
+        num_layers = cls._positive_int(metadata.get("num_layers")) or 32
+        key_length = cls._positive_int(metadata.get("key_length")) or cls._positive_int(metadata.get("head_dim")) or 128
+        value_length = cls._positive_int(metadata.get("value_length")) or cls._positive_int(metadata.get("head_dim")) or key_length
+        key_length_swa = cls._positive_int(metadata.get("key_length_swa")) or key_length
+        value_length_swa = cls._positive_int(metadata.get("value_length_swa")) or value_length
+        num_kv_heads = metadata.get("num_kv_heads", 8)
+
+        total = 0
+        for layer_index in range(num_layers):
+            if cls._is_recurrent_layer(metadata, layer_index):
+                continue
+            heads = cls._kv_heads_for_layer(num_kv_heads, layer_index)
+            if cls._is_swa_layer(metadata, layer_index):
+                cells = cls._swa_cache_cells(metadata, context)
+                total += heads * (key_length_swa + value_length_swa) * 2 * cells * parallel
+            else:
+                total += heads * (key_length + value_length) * 2 * context * parallel
+        total += cls._llamacpp_recurrent_state_bytes(metadata, parallel=parallel)
+        return total
+
+    @classmethod
+    def _kv_heads_for_layer(cls, value: object, layer_index: int) -> int:
+        if isinstance(value, bool):
+            return 8
+        if isinstance(value, int):
+            return max(1, value)
+        if isinstance(value, list):
+            heads = [item for item in (cls._positive_int(item) for item in value) if item is not None]
+            if heads:
+                return heads[layer_index] if layer_index < len(heads) else heads[-1]
+        return 8
+
+    @classmethod
+    def _is_recurrent_layer(cls, metadata: dict, layer_index: int) -> bool:
+        full_attention_interval = cls._positive_int(metadata.get("full_attention_interval"))
+        if full_attention_interval is None:
+            return False
+        return (layer_index + 1) % full_attention_interval != 0
+
+    @classmethod
+    def _is_swa_layer(cls, metadata: dict, layer_index: int) -> bool:
+        if cls._positive_int(metadata.get("sliding_window")) is None:
+            return False
+        pattern = metadata.get("sliding_window_pattern")
+        if isinstance(pattern, list):
+            values = []
+            for item in pattern:
+                if isinstance(item, bool):
+                    values.append(int(item))
+                elif isinstance(item, int):
+                    values.append(int(item))
+            if values:
+                return bool(values[layer_index % len(values)])
+        period = cls._positive_int(pattern)
+        if period is not None:
+            return layer_index % period < period - 1
+        return False
+
+    @classmethod
+    def _swa_cache_cells(cls, metadata: dict, context: int) -> int:
+        n_swa = cls._positive_int(metadata.get("sliding_window"))
+        if n_swa is None:
+            return context
+        n_ubatch = 512
+        size = min(context, n_swa + n_ubatch)
+        return ((size + 255) // 256) * 256
+
+    @classmethod
+    def _llamacpp_recurrent_state_bytes(cls, metadata: dict, *, parallel: int) -> int:
+        num_layers = cls._positive_int(metadata.get("num_layers")) or 32
+        recurrent_layers = sum(1 for layer_index in range(num_layers) if cls._is_recurrent_layer(metadata, layer_index))
+        if recurrent_layers <= 0:
+            return 0
+        n_embd_r, n_embd_s = cls._recurrent_state_dimensions(metadata)
+        if n_embd_r <= 0 and n_embd_s <= 0:
+            return 0
+        rs_size = max(1, parallel)
+        return recurrent_layers * (n_embd_r + n_embd_s) * rs_size * 4
+
+    @classmethod
+    def _recurrent_state_dimensions(cls, metadata: dict) -> tuple[int, int]:
+        embedding_length = cls._positive_int(metadata.get("embedding_length")) or 0
+        wkv_head_size = cls._positive_int(metadata.get("wkv_head_size")) or 0
+        if wkv_head_size and embedding_length:
+            token_shift_count = cls._positive_int(metadata.get("token_shift_count")) or 2
+            return token_shift_count * embedding_length, embedding_length * wkv_head_size
+
+        shortconv_l_cache = cls._positive_int(metadata.get("shortconv_l_cache")) or 0
+        if shortconv_l_cache and embedding_length:
+            return embedding_length * max(0, shortconv_l_cache - 1), 0
+
+        kda_head_dim = cls._positive_int(metadata.get("kda_head_dim")) or 0
+        if kda_head_dim:
+            num_attn_heads = cls._positive_int(metadata.get("num_attn_heads")) or 1
+            ssm_conv_kernel = cls._positive_int(metadata.get("ssm_conv_kernel")) or 4
+            d_inner = num_attn_heads * kda_head_dim
+            return 3 * max(0, ssm_conv_kernel - 1) * d_inner, kda_head_dim * kda_head_dim * num_attn_heads
+
+        ssm_conv_kernel = cls._positive_int(metadata.get("ssm_conv_kernel")) or 0
+        ssm_inner_size = cls._positive_int(metadata.get("ssm_inner_size")) or 0
+        ssm_state_size = cls._positive_int(metadata.get("ssm_state_size")) or 0
+        ssm_group_count = cls._positive_int(metadata.get("ssm_group_count")) or 0
+        if not (ssm_conv_kernel and ssm_inner_size and ssm_state_size):
+            return 0, 0
+        n_embd_r = max(0, ssm_conv_kernel - 1) * (ssm_inner_size + 2 * ssm_group_count * ssm_state_size)
+        n_embd_s = ssm_state_size * ssm_inner_size
+        return n_embd_r, n_embd_s
+
     def _read_gguf_metadata(self, gguf_path: Path) -> dict:
         """Read model metadata from GGUF file header."""
+        metadata = self._read_gguf_header_metadata(gguf_path)
+        if metadata:
+            return metadata
         try:
             from gguf import GGUFReader  # type: ignore[import-not-found, import-untyped]
             reader = GGUFReader(str(gguf_path))
@@ -255,6 +409,8 @@ class LlamaCppBackend:
             num_attn_heads = _get_int(f"{arch}.attention.head_count", 32)
             embedding_length = _get_int(f"{arch}.embedding_length", 4096)
             head_dim = embedding_length // num_attn_heads if num_attn_heads else 128
+            key_length = _get_int(f"{arch}.attention.key_length", head_dim)
+            value_length = _get_int(f"{arch}.attention.value_length", head_dim)
 
             # Detect pooling type (embedding models)
             pooling_field = reader.fields.get("tokenizer.ggml.pooling_type")
@@ -271,17 +427,272 @@ class LlamaCppBackend:
                 "max_context": max_context,
                 "num_kv_heads": num_kv_heads,
                 "head_dim": head_dim,
+                "key_length": key_length,
+                "value_length": value_length,
                 "pooling": pooling,
             }
         except ImportError:
-            raise ImportError(
-                "The 'gguf' package is required for llama.cpp tuning. "
-                "Install it with: pip install 'vserve[llamacpp]'"
-            ) from None
+            metadata = self._read_gguf_header_metadata(gguf_path)
+            if metadata:
+                return metadata
+            import sys
+            print(
+                "[vserve] warning: gguf package not installed; estimating llama.cpp tuning metadata",
+                file=sys.stderr,
+            )
+            return {}
         except Exception:
+            metadata = self._read_gguf_header_metadata(gguf_path)
+            if metadata:
+                return metadata
             import sys
             print(f"[vserve] warning: failed to read GGUF metadata from {gguf_path}", file=sys.stderr)
             return {}
+
+    @classmethod
+    def _read_gguf_header_metadata(cls, gguf_path: Path) -> dict:
+        """Read the small GGUF metadata table without importing the optional gguf package."""
+        try:
+            values: dict[str, Any] = {}
+            with gguf_path.open("rb") as fh:
+                if cls._read_exact(fh, 4) != b"GGUF":
+                    return {}
+                version = cls._read_u32(fh)
+                if version not in {1, 2, 3}:
+                    return {}
+                _tensor_count = cls._read_u64(fh)
+                metadata_count = cls._read_u64(fh)
+                arch: str | None = None
+                for _ in range(metadata_count):
+                    key = cls._read_gguf_string(fh)
+                    value_type = cls._read_u32(fh)
+                    if key == "tokenizer.ggml.tokens" and arch and cls._has_core_gguf_metadata(values, arch):
+                        break
+                    keep = cls._is_wanted_gguf_metadata_key(key)
+                    value = cls._read_gguf_value(fh, value_type, keep=keep)
+                    if keep:
+                        values[key] = value
+                    if key == "general.architecture" and isinstance(value, str):
+                        arch = value
+            return cls._normalize_gguf_metadata(values)
+        except (OSError, UnicodeDecodeError, ValueError, struct.error):
+            return {}
+
+    @staticmethod
+    def _is_wanted_gguf_metadata_key(key: str) -> bool:
+        return (
+            key == "general.architecture"
+            or key == "tokenizer.ggml.pooling_type"
+            or key.endswith(".block_count")
+            or key.endswith(".context_length")
+            or key.endswith(".embedding_length")
+            or key.endswith(".attention.head_count")
+            or key.endswith(".attention.head_count_kv")
+            or key.endswith(".attention.key_length")
+            or key.endswith(".attention.value_length")
+            or key.endswith(".attention.key_length_swa")
+            or key.endswith(".attention.value_length_swa")
+            or key.endswith(".attention.sliding_window")
+            or key.endswith(".attention.sliding_window_pattern")
+            or key.endswith(".attention.shared_kv_layers")
+            or key.endswith(".full_attention_interval")
+            or key.endswith(".ssm.conv_kernel")
+            or key.endswith(".ssm.inner_size")
+            or key.endswith(".ssm.state_size")
+            or key.endswith(".ssm.time_step_rank")
+            or key.endswith(".ssm.group_count")
+            or key.endswith(".kda.head_dim")
+            or key.endswith(".wkv.head_size")
+            or key.endswith(".token_shift_count")
+            or key.endswith(".shortconv.l_cache")
+        )
+
+    @staticmethod
+    def _has_core_gguf_metadata(values: dict[str, Any], arch: str) -> bool:
+        return (
+            f"{arch}.block_count" in values
+            and f"{arch}.context_length" in values
+            and f"{arch}.attention.head_count" in values
+            and f"{arch}.attention.head_count_kv" in values
+            and (
+                f"{arch}.embedding_length" in values
+                or (
+                    f"{arch}.attention.key_length" in values
+                    and f"{arch}.attention.value_length" in values
+                )
+            )
+        )
+
+    @classmethod
+    def _normalize_gguf_metadata(cls, values: dict[str, Any]) -> dict:
+        arch = values.get("general.architecture")
+        if not isinstance(arch, str) or not arch:
+            return {}
+        num_layers = cls._gguf_int(values.get(f"{arch}.block_count"), 32)
+        max_context = cls._gguf_int(values.get(f"{arch}.context_length"), 4096)
+        num_attn_heads = cls._gguf_int(values.get(f"{arch}.attention.head_count"), 32)
+        embedding_length = cls._gguf_int(values.get(f"{arch}.embedding_length"), 4096)
+        head_dim = embedding_length // num_attn_heads if num_attn_heads else 128
+        key_length = cls._gguf_int(values.get(f"{arch}.attention.key_length"), head_dim)
+        value_length = cls._gguf_int(values.get(f"{arch}.attention.value_length"), head_dim)
+        key_length_swa = cls._gguf_int(values.get(f"{arch}.attention.key_length_swa"), key_length)
+        value_length_swa = cls._gguf_int(values.get(f"{arch}.attention.value_length_swa"), value_length)
+
+        kv_heads_value = values.get(f"{arch}.attention.head_count_kv")
+        if isinstance(kv_heads_value, list):
+            num_kv_heads: int | list[int] = [
+                int(item) for item in kv_heads_value
+                if isinstance(item, int) and not isinstance(item, bool)
+            ] or [8]
+        else:
+            num_kv_heads = cls._gguf_int(kv_heads_value, 8)
+
+        pooling_raw = cls._gguf_int(values.get("tokenizer.ggml.pooling_type"), -1)
+        pooling = {0: "none", 1: "mean", 2: "cls", 3: "last", 4: "rank"}.get(pooling_raw)
+        sliding_window_pattern = values.get(f"{arch}.attention.sliding_window_pattern")
+        if isinstance(sliding_window_pattern, list):
+            pattern_values = []
+            for item in sliding_window_pattern:
+                if isinstance(item, bool):
+                    pattern_values.append(int(item))
+                elif isinstance(item, int):
+                    pattern_values.append(int(item))
+            sliding_window_pattern = pattern_values
+        elif isinstance(sliding_window_pattern, int) and not isinstance(sliding_window_pattern, bool):
+            sliding_window_pattern = int(sliding_window_pattern)
+        else:
+            sliding_window_pattern = None
+
+        return {
+            "arch": arch,
+            "num_layers": num_layers,
+            "max_context": max_context,
+            "embedding_length": embedding_length,
+            "num_attn_heads": num_attn_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": key_length,
+            "key_length": key_length,
+            "value_length": value_length,
+            "key_length_swa": key_length_swa,
+            "value_length_swa": value_length_swa,
+            "sliding_window": cls._gguf_int(values.get(f"{arch}.attention.sliding_window"), 0),
+            "sliding_window_pattern": sliding_window_pattern,
+            "shared_kv_layers": cls._gguf_int(values.get(f"{arch}.attention.shared_kv_layers"), 0),
+            "full_attention_interval": cls._gguf_int(values.get(f"{arch}.full_attention_interval"), 0),
+            "ssm_conv_kernel": cls._gguf_int(values.get(f"{arch}.ssm.conv_kernel"), 0),
+            "ssm_inner_size": cls._gguf_int(values.get(f"{arch}.ssm.inner_size"), 0),
+            "ssm_state_size": cls._gguf_int(values.get(f"{arch}.ssm.state_size"), 0),
+            "ssm_time_step_rank": cls._gguf_int(values.get(f"{arch}.ssm.time_step_rank"), 0),
+            "ssm_group_count": cls._gguf_int(values.get(f"{arch}.ssm.group_count"), 0),
+            "kda_head_dim": cls._gguf_int(values.get(f"{arch}.kda.head_dim"), 0),
+            "wkv_head_size": cls._gguf_int(values.get(f"{arch}.wkv.head_size"), 0),
+            "token_shift_count": cls._gguf_int(values.get(f"{arch}.token_shift_count"), 0),
+            "shortconv_l_cache": cls._gguf_int(values.get(f"{arch}.shortconv.l_cache"), 0),
+            "pooling": pooling,
+        }
+
+    @staticmethod
+    def _gguf_int(value: object, default: int) -> int:
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return int(value)
+        return default
+
+    @staticmethod
+    def _read_exact(fh: BinaryIO, size: int) -> bytes:
+        data = fh.read(size)
+        if len(data) != size:
+            raise ValueError("truncated GGUF metadata")
+        return data
+
+    @classmethod
+    def _read_u32(cls, fh: BinaryIO) -> int:
+        return struct.unpack("<I", cls._read_exact(fh, 4))[0]
+
+    @classmethod
+    def _read_u64(cls, fh: BinaryIO) -> int:
+        return struct.unpack("<Q", cls._read_exact(fh, 8))[0]
+
+    @classmethod
+    def _read_gguf_string(cls, fh: BinaryIO) -> str:
+        size = cls._read_u64(fh)
+        return cls._read_exact(fh, size).decode("utf-8")
+
+    @classmethod
+    def _read_gguf_value(cls, fh: BinaryIO, value_type: int, *, keep: bool) -> Any:
+        formats = {
+            0: "<B",
+            1: "<b",
+            2: "<H",
+            3: "<h",
+            4: "<I",
+            5: "<i",
+            6: "<f",
+            10: "<Q",
+            11: "<q",
+            12: "<d",
+        }
+        if value_type in formats:
+            fmt = formats[value_type]
+            data = cls._read_exact(fh, struct.calcsize(fmt))
+            return struct.unpack(fmt, data)[0] if keep else None
+        if value_type == 7:
+            data = cls._read_exact(fh, 1)
+            return bool(struct.unpack("<?", data)[0]) if keep else None
+        if value_type == 8:
+            size = cls._read_u64(fh)
+            if keep:
+                return cls._read_exact(fh, size).decode("utf-8")
+            cls._skip_bytes(fh, size)
+            return None
+        if value_type == 9:
+            element_type = cls._read_u32(fh)
+            length = cls._read_u64(fh)
+            if keep:
+                return [
+                    cls._read_gguf_value(fh, element_type, keep=True)
+                    for _ in range(length)
+                ]
+            fixed_size = cls._gguf_fixed_value_size(element_type)
+            if fixed_size is not None:
+                cls._skip_bytes(fh, fixed_size * length)
+            else:
+                for _ in range(length):
+                    cls._read_gguf_value(fh, element_type, keep=False)
+            return None
+        raise ValueError(f"unsupported GGUF metadata value type {value_type}")
+
+    @staticmethod
+    def _gguf_fixed_value_size(value_type: int) -> int | None:
+        sizes = {
+            0: 1,
+            1: 1,
+            2: 2,
+            3: 2,
+            4: 4,
+            5: 4,
+            6: 4,
+            7: 1,
+            10: 8,
+            11: 8,
+            12: 8,
+        }
+        return sizes.get(value_type)
+
+    @staticmethod
+    def _skip_bytes(fh: BinaryIO, size: int) -> None:
+        if size <= 0:
+            return
+        try:
+            fh.seek(size, 1)
+        except OSError:
+            remaining = size
+            while remaining:
+                chunk = fh.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ValueError("truncated GGUF metadata")
+                remaining -= len(chunk)
 
     @staticmethod
     def _guess_pooling(model_name: str) -> str:

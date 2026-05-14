@@ -625,7 +625,7 @@ def list_models(model_terms: list[str] = typer.Argument(None, help="Model name t
     table = Table(title="Downloaded Models")
     table.add_column("Model", style="bold")
     table.add_column("Backend")
-    table.add_column("Size", justify="right")
+    table.add_column("Disk", justify="right")
     table.add_column("Limits")
     table.add_column("Max Context", justify="right")
     table.add_column("Tools", style="green")
@@ -688,7 +688,7 @@ def _show_model_detail(m: ModelInfo):
 
     console.print(f"\n[bold]{m.full_name}[/bold]")
     console.print(f"  Arch: {m.architecture}  Quant: {m.quant_method or 'none'}  MoE: {m.is_moe}")
-    console.print(f"  Size: {m.model_size_gb} GB  Max positions: {m.max_position_embeddings}\n")
+    console.print(f"  Weight files: {m.model_size_gb} GB  Max positions: {m.max_position_embeddings}\n")
 
     if not lim:
         console.print(f"  [dim]Not probed yet.[/dim] Run: vserve tune {m.model_name.lower()}\n")
@@ -708,13 +708,17 @@ def _show_model_detail(m: ModelInfo):
     else:
         table = Table(title="Context / Concurrency Limits")
         table.add_column("Context", justify="right")
-        table.add_column("kv auto", justify="right")
-        table.add_column("kv fp8", justify="right")
+        dtype_order = _vllm_limit_dtype_order(lim, limits)
+        for dtype in dtype_order:
+            table.add_column(_vllm_kv_label(dtype), justify="right")
         for ctx_str in sorted(limits.keys(), key=int):
             entry = limits[ctx_str]
-            auto = str(entry.get("auto")) if entry.get("auto") is not None else "OOM"
-            fp8 = str(entry.get("fp8")) if entry.get("fp8") is not None else "OOM"
-            table.add_row(f"{int(ctx_str) // 1024}k", auto, fp8)
+            choices = _vllm_limits_entry(entry)
+            row = [f"{int(ctx_str) // 1024}k"]
+            for dtype in dtype_order:
+                value = choices.get(dtype)
+                row.append(str(value) if value is not None else "OOM")
+            table.add_row(*row)
 
     console.print(table)
     console.print()
@@ -1409,46 +1413,53 @@ def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download
             info = None
         if info:
             console.print(f"\n[green]Downloaded {info.full_name}[/green]")
-            console.print(f"  Size: {info.model_size_gb:.1f} GB")
+            console.print(f"  Weight files: {info.model_size_gb:.1f} GB")
             console.print(f"  Quant: {info.quant_method or 'none'}")
             if info.max_position_embeddings:
                 console.print(f"  Context: {info.max_position_embeddings:,} tokens")
 
-            # Auto-tune after download
-            try:
-                from vserve.backends import get_backend
-                from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
-                from vserve.config import cfg as _cfg3, write_limits
-                from vserve.runtime import build_tuning_fingerprint
-                backend = get_backend(info)
-                gpu = get_gpu_info()
-                gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3())
-                console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
-                limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
-                runtime_info = None
-                runtime_info_fn = getattr(backend, "runtime_info", None)
-                if callable(runtime_info_fn):
-                    try:
-                        runtime_info = runtime_info_fn()
-                    except Exception:
-                        runtime_info = None
-                limits_data["backend"] = backend.name
-                limits_data["fingerprint"] = build_tuning_fingerprint(
-                    model_info=info,
-                    gpu=gpu,
-                    backend=backend.name,
-                    gpu_mem_util=gpu_mem_util,
-                    runtime_info=runtime_info,
-                )
-                lim_path = limits_path(info.provider, info.model_name)
-                write_limits(lim_path, limits_data)
-                console.print(f"[green]Tuned.[/green] Ready: vserve run {info.model_name}")
-            except Exception as e:
-                console.print(f"  [yellow]Auto-tune skipped: {e}[/yellow]")
-                console.print(f"  Run: vserve tune {info.model_name}")
+            _auto_tune_downloaded_model(info)
         else:
             console.print(f"\n[green]Downloaded to {downloaded_dir}[/green]")
     return True
+
+
+def _auto_tune_downloaded_model(info: ModelInfo) -> None:
+    """Analytically tune after download without starting a serving backend."""
+    try:
+        from vserve.backends import get_backend
+        from vserve.gpu import get_gpu_info, resolve_gpu_memory_utilization
+        from vserve.config import cfg as _cfg3, write_limits
+        from vserve.runtime import build_tuning_fingerprint
+
+        backend = get_backend(info)
+        gpu = get_gpu_info()
+        gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3())
+        console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
+        limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
+        runtime_info = None
+        runtime_info_fn = getattr(backend, "runtime_info", None)
+        if callable(runtime_info_fn):
+            try:
+                runtime_info = runtime_info_fn()
+            except Exception:
+                runtime_info = None
+        limits_data["backend"] = backend.name
+        limits_data["fingerprint"] = build_tuning_fingerprint(
+            model_info=info,
+            gpu=gpu,
+            backend=backend.name,
+            gpu_mem_util=gpu_mem_util,
+            runtime_info=runtime_info,
+        )
+        lim_path = limits_path(info.provider, info.model_name)
+        write_limits(lim_path, limits_data)
+        console.print(f"[green]Tuned.[/green] Ready: vserve run {info.model_name}")
+        if backend.name in {"vllm", "llamacpp"}:
+            console.print(f"[dim]Benchmark later: vserve tune {info.model_name} --bench[/dim]")
+    except Exception as e:
+        console.print(f"  [yellow]Auto-tune skipped: {e}[/yellow]")
+        console.print(f"  Run: vserve tune {info.model_name}")
 
 
 def _model_rm_impl(model: str | None, force: bool = False):
@@ -1529,10 +1540,27 @@ def tune(
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
     recalc: bool = typer.Option(False, "--recalc", help="Force recalculation even if cached"),
     gpu_util: float = typer.Option(None, "--gpu-util", help="GPU memory utilization (0.5-0.99, auto if omitted)"),
+    bench: bool = typer.Option(False, "--bench", help="Run a bounded backend micro-benchmark after tuning"),
+    bench_seconds: int = typer.Option(120, "--bench-seconds", help="Maximum benchmark seconds per model (30-600)"),
+    bench_startup_seconds: int = typer.Option(300, "--bench-startup-seconds", help="Maximum backend startup seconds per benchmark candidate (60-900)"),
+    bench_candidates: int = typer.Option(1, "--bench-candidates", help="Number of recommended profiles to benchmark (1-3)"),
+    bench_requests: int = typer.Option(8, "--bench-requests", help="Requests per benchmark candidate (1-32)"),
 ):
     """Calculate context and concurrency limits for a model."""
     if gpu_util is not None and not 0.5 <= gpu_util <= 0.99:
         console.print("[red]--gpu-util must be between 0.5 and 0.99[/red]")
+        raise typer.Exit(1)
+    if not 30 <= bench_seconds <= 600:
+        console.print("[red]--bench-seconds must be between 30 and 600[/red]")
+        raise typer.Exit(1)
+    if not 60 <= bench_startup_seconds <= 900:
+        console.print("[red]--bench-startup-seconds must be between 60 and 900[/red]")
+        raise typer.Exit(1)
+    if not 1 <= bench_candidates <= 3:
+        console.print("[red]--bench-candidates must be between 1 and 3[/red]")
+        raise typer.Exit(1)
+    if not 1 <= bench_requests <= 32:
+        console.print("[red]--bench-requests must be between 1 and 32[/red]")
         raise typer.Exit(1)
 
     from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, resolve_gpu_memory_utilization
@@ -1618,32 +1646,52 @@ def tune(
             runtime_info=runtime_info,
         )
 
+        limits_data: dict | None = None
+        used_cache = False
+
         # Check cached limits against the full versioned fingerprint.
         lim_path = limits_path(m.provider, m.model_name)
         if not recalc:
             existing = read_limits(lim_path)
             if existing is not None and limits_cache_matches(existing, backend=backend.name, fingerprint=fingerprint):
-                console.print(f"[bold]{m.full_name}[/bold]  [dim](cached — use --recalc to refresh)[/dim]")
-                _print_limits_table(existing, m)
+                limits_data = existing
+                used_cache = True
+                if not bench:
+                    console.print(f"[bold]{m.full_name}[/bold]  [dim](cached — use --recalc to refresh)[/dim]")
+                    _print_limits_table(existing, m)
+                    continue
+
+        if limits_data is None:
+            # For vLLM backend, check architecture fields
+            if backend.name == "vllm" and (m.num_kv_heads is None or m.head_dim is None or m.num_layers is None):
+                console.print(f"[bold]{m.full_name}[/bold]")
+                console.print("  [red]Missing architecture fields in config.json[/red]")
+                console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
                 continue
 
-        # For vLLM backend, check architecture fields
-        if backend.name == "vllm" and (m.num_kv_heads is None or m.head_dim is None or m.num_layers is None):
-            console.print(f"[bold]{m.full_name}[/bold]")
-            console.print("  [red]Missing architecture fields in config.json[/red]")
-            console.print(f"  num_kv_heads={m.num_kv_heads}, head_dim={m.head_dim}, num_layers={m.num_layers}")
-            continue
-
-        try:
-            limits_data = backend.tune(m, gpu, gpu_mem_util=gpu_util)
-        except Exception as e:
-            console.print(f"[bold]{m.full_name}[/bold]  [red]{e}[/red]")
-            continue
+            try:
+                limits_data = backend.tune(m, gpu, gpu_mem_util=gpu_util)
+            except Exception as e:
+                console.print(f"[bold]{m.full_name}[/bold]  [red]{e}[/red]")
+                continue
 
         limits_data["backend"] = backend.name
         limits_data["fingerprint"] = fingerprint
+        if bench:
+            console.print(f"[bold]{m.full_name}[/bold]  [dim]({'cached + ' if used_cache else ''}{backend.display_name} benchmark)[/dim]")
+            limits_data["benchmark_results"] = _run_tuning_benchmarks(
+                m,
+                backend,
+                limits_data,
+                gpu_mem_util=gpu_util,
+                bench_seconds=bench_seconds,
+                bench_candidates=bench_candidates,
+                bench_requests=bench_requests,
+                bench_startup_seconds=bench_startup_seconds,
+            )
         write_limits(lim_path, limits_data)
-        console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {backend.display_name})[/dim]")
+        if not bench:
+            console.print(f"[bold]{m.full_name}[/bold]  [dim]({m.model_size_gb} GB, {backend.display_name})[/dim]")
         _print_limits_table(limits_data, m)
         tp = limits_data.get("tool_call_parser")
         rp = limits_data.get("reasoning_parser")
@@ -1737,6 +1785,298 @@ def tune(
         console.print()
 
 
+def _benchmark_candidate_names(limits_data: dict, max_candidates: int) -> list[str]:
+    recommendations = limits_data.get("recommendations")
+    if not isinstance(recommendations, dict):
+        return []
+    ordered = ["interactivity", "balanced", "throughput"]
+    return [
+        name for name in ordered
+        if isinstance(recommendations.get(name), dict)
+    ][:max_candidates]
+
+
+def _llamacpp_benchmark_candidates(m: ModelInfo, limits_data: dict, max_candidates: int) -> list[dict]:
+    limits = limits_data.get("limits")
+    if not isinstance(limits, dict):
+        return []
+    working: list[tuple[int, int]] = []
+    for ctx_str, entry in limits.items():
+        try:
+            ctx = int(str(ctx_str))
+        except ValueError:
+            continue
+        slots = _llamacpp_slots_from_limits_entry(entry)
+        if slots is not None:
+            working.append((ctx, int(slots)))
+    if not working:
+        return []
+    working.sort(key=lambda item: item[0])
+    n_gpu_layers = limits_data.get("n_gpu_layers")
+    if not isinstance(n_gpu_layers, int) or isinstance(n_gpu_layers, bool):
+        n_gpu_layers = limits_data.get("num_layers")
+    if not isinstance(n_gpu_layers, int) or isinstance(n_gpu_layers, bool):
+        n_gpu_layers = 0
+    is_embedding = bool(limits_data.get("is_embedding") or m.is_embedding)
+    pooling = limits_data.get("pooling") if isinstance(limits_data.get("pooling"), str) else None
+    candidates: list[dict] = []
+    for index, (ctx, slots) in enumerate(working[:max_candidates], start=1):
+        candidates.append({
+            "profile": "interactive" if index == 1 else f"context-{ctx}",
+            "context": ctx,
+            "parallel": min(max(1, slots), 4),
+            "n_gpu_layers": n_gpu_layers,
+            "embedding": is_embedding,
+            "pooling": pooling,
+        })
+    return candidates
+
+
+def _exception_is_startup_timeout(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "health" in text or "timeout" in text or "timed out" in text
+
+
+def _measurement_succeeded(result: dict) -> bool:
+    measurement = result.get("measurement")
+    if not isinstance(measurement, dict):
+        return False
+    if measurement.get("status") != "ok":
+        return False
+    completed = measurement.get("requests_completed")
+    return isinstance(completed, int) and completed > 0
+
+
+def _wait_backend_stopped(backend, *, timeout_s: int) -> bool:
+    import time
+
+    deadline = time.monotonic() + max(1, timeout_s)
+    while time.monotonic() < deadline:
+        try:
+            if not backend.is_running():
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def _run_tuning_benchmarks(
+    m: ModelInfo,
+    backend,
+    limits_data: dict,
+    *,
+    gpu_mem_util: float,
+    bench_seconds: int,
+    bench_candidates: int,
+    bench_requests: int,
+    bench_startup_seconds: int = 300,
+) -> dict:
+    """Start the serving backend briefly and measure recommended profiles within hard bounds."""
+    from datetime import datetime, timezone
+    import json
+    from vserve.bench import run_openai_completion_benchmark, run_openai_embedding_benchmark
+    from vserve.config import profile_path as _profile_path, write_profile_yaml
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    backend_name = getattr(backend, "name", None)
+    if backend_name not in {"vllm", "llamacpp"}:
+        return {
+            "status": "skipped",
+            "reason": "benchmarks are currently implemented for vLLM and llama.cpp only",
+            "benchmarked_at": started_at,
+        }
+    try:
+        if backend.is_running():
+            return {
+                "status": "skipped",
+                "reason": f"{backend.display_name} is already running",
+                "benchmarked_at": started_at,
+            }
+    except Exception:
+        return {
+            "status": "skipped",
+            "reason": "could not determine backend running state",
+            "benchmarked_at": started_at,
+        }
+
+    results: list[dict] = []
+    if backend_name == "vllm":
+        candidate_names = _benchmark_candidate_names(limits_data, bench_candidates)
+        recommendations = limits_data.get("recommendations")
+        if not candidate_names or not isinstance(recommendations, dict):
+            return {
+                "status": "skipped",
+                "reason": "no vLLM recommendations available to benchmark",
+                "benchmarked_at": started_at,
+            }
+        candidates: list[dict] = []
+        for name in candidate_names:
+            rec = recommendations.get(name)
+            if not isinstance(rec, dict):
+                continue
+            context = rec.get("context")
+            kv_dtype = rec.get("kv_cache_dtype")
+            max_num_seqs = rec.get("max_num_seqs")
+            if not isinstance(context, int) or not isinstance(kv_dtype, str) or not isinstance(max_num_seqs, int):
+                continue
+            candidates.append({
+                "profile": name,
+                "context": context,
+                "choices": {
+                    "context": context,
+                    "kv_dtype": kv_dtype,
+                    "slots": min(max_num_seqs, 4),
+                    "batched_tokens": rec.get("max_num_batched_tokens"),
+                    "gpu_mem_util": gpu_mem_util,
+                    "port": 8888,
+                    "tools": False,
+                    "tool_parser": None,
+                    "reasoning_parser": None,
+                    "performance_mode": rec.get("performance_mode"),
+                    "optimization_level": rec.get("optimization_level"),
+                    "block_size": rec.get("block_size"),
+                    "enable_prefix_caching": True,
+                },
+                "summary": {
+                    "profile": name,
+                    "context": context,
+                    "kv_cache_dtype": kv_dtype,
+                    "max_num_seqs": min(max_num_seqs, 4),
+                    "max_num_batched_tokens": rec.get("max_num_batched_tokens"),
+                },
+                "config_kind": "yaml",
+            })
+    else:
+        candidates = []
+        for candidate in _llamacpp_benchmark_candidates(m, limits_data, bench_candidates):
+            choices = {
+                "context": candidate["context"],
+                "n_gpu_layers": candidate["n_gpu_layers"],
+                "parallel": candidate["parallel"],
+                "port": 8888,
+                "tools": False,
+                "embedding": candidate["embedding"],
+                "pooling": candidate["pooling"],
+            }
+            candidates.append({
+                "profile": candidate["profile"],
+                "context": candidate["context"],
+                "choices": choices,
+                "summary": {
+                    "profile": candidate["profile"],
+                    "context": candidate["context"],
+                    "parallel": candidate["parallel"],
+                    "n_gpu_layers": candidate["n_gpu_layers"],
+                },
+                "config_kind": "json",
+            })
+        if not candidates:
+            return {
+                "status": "skipped",
+                "reason": "no llama.cpp capacity limits available to benchmark",
+                "benchmarked_at": started_at,
+            }
+
+    measurement_timeout_seconds = min(float(bench_seconds), 45.0)
+
+    for candidate in candidates:
+        name = str(candidate["profile"])
+        choices = candidate["choices"]
+        assert isinstance(choices, dict)
+        port = 8888
+        port_value = choices.get("port")
+        if isinstance(port_value, int) and not isinstance(port_value, bool):
+            port = port_value
+        cfg = backend.build_config(m, choices)
+        if candidate["config_kind"] == "yaml":
+            cfg_path = _profile_path(m.provider, m.model_name, f"bench-{name}")
+            write_profile_yaml(cfg_path, cfg, comment=f"vserve tune --bench — {name}")
+        else:
+            cfg_path = backend.root_dir / "configs" / "models" / f"{m.provider}--{m.model_name}.bench-{name}.json"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        candidate_result = dict(candidate["summary"])
+        started_here = False
+        try:
+            started_here = True
+            _launch_backend(
+                backend,
+                cfg_path,
+                f"{m.full_name} bench {name}",
+                non_interactive=True,
+                replace=False,
+                health_timeout_s=bench_startup_seconds,
+            )
+            is_embedding = bool(choices.get("embedding") or m.is_embedding)
+            benchmark_fn = run_openai_embedding_benchmark if is_embedding else run_openai_completion_benchmark
+            measurement = benchmark_fn(
+                f"http://localhost:{port}",
+                model=str(m.path),
+                request_count=bench_requests,
+                timeout_s=measurement_timeout_seconds,
+            )
+            candidate_result["measurement"] = measurement
+        except Exception as exc:
+            candidate_result["status"] = "startup_timeout" if _exception_is_startup_timeout(exc) else "error"
+            candidate_result["error"] = str(exc)
+        finally:
+            if started_here:
+                try:
+                    backend.stop(non_interactive=True)
+                except Exception as exc:
+                    candidate_result["stop_error"] = str(exc)
+                if not _wait_backend_stopped(backend, timeout_s=min(bench_startup_seconds, 120)):
+                    candidate_result["stop_wait_timeout"] = True
+                clear_session()
+        results.append(candidate_result)
+
+    if any(_measurement_succeeded(result) for result in results):
+        status = "ok"
+    elif any(result.get("status") == "startup_timeout" for result in results):
+        status = "startup_timeout"
+    elif results:
+        status = "measurement_error"
+    else:
+        status = "skipped"
+    return {
+        "status": status,
+        "benchmarked_at": started_at,
+        "max_seconds": bench_seconds,
+        "measurement_timeout_seconds": measurement_timeout_seconds,
+        "startup_timeout_seconds": bench_startup_seconds,
+        "candidate_limit": bench_candidates,
+        "request_count": bench_requests,
+        "results": results,
+    }
+
+
+def _print_benchmark_summary(limits_data: dict) -> None:
+    benchmark_results = limits_data.get("benchmark_results")
+    if not isinstance(benchmark_results, dict):
+        return
+    status = benchmark_results.get("status", "unknown")
+    result_parts = []
+    raw_results = benchmark_results.get("results")
+    if isinstance(raw_results, list):
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            profile = item.get("profile")
+            measurement = item.get("measurement")
+            if isinstance(profile, str) and isinstance(measurement, dict):
+                tps = measurement.get("tokens_per_second")
+                if tps is None:
+                    tps = measurement.get("items_per_second")
+                    rate_label = "items/s"
+                else:
+                    rate_label = "tok/s"
+                p95 = measurement.get("p95_latency_ms")
+                result_parts.append(f"{profile}: {tps} {rate_label}, p95 {p95} ms")
+    suffix = f" ({'; '.join(result_parts)})" if result_parts else ""
+    console.print(f"  [dim]Benchmark: {status}{suffix}[/dim]")
+
+
 def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
     """Print the context × concurrency limit table."""
     avail = limits_data.get("available_kv_gb")
@@ -1768,26 +2108,41 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
 
         console.print(table)
     else:
-        # vLLM format: {"4096": {"auto": 64, "fp8": 128}, ...}
+        # vLLM format: {"4096": {"auto": 64, "fp8": 128, ...}, ...}
         table = Table(show_header=True, box=None, padding=(0, 2))
         table.add_column("Context", style="bold")
-        table.add_column("Auto KV", justify="right")
-        table.add_column("FP8 KV", justify="right")
+        dtype_order = _vllm_limit_dtype_order(limits_data, limits)
+        for dtype in dtype_order:
+            table.add_column(_vllm_kv_label(dtype), justify="right")
 
         for ctx_str in sorted(limits, key=int):
             entry = limits[ctx_str]
             ctx_val = int(ctx_str)
             ctx_label = f"{ctx_val:,}"
+            choices = _vllm_limits_entry(entry)
+            row = [ctx_label]
+            for dtype in dtype_order:
+                value = choices.get(dtype)
+                row.append(f"{value} slots" if value else "[dim]OOM[/dim]")
 
-            auto_val = entry.get("auto")
-            fp8_val = entry.get("fp8")
-
-            auto_str = f"{auto_val} slots" if auto_val else "[dim]OOM[/dim]"
-            fp8_str = f"{fp8_val} slots" if fp8_val else "[dim]OOM[/dim]"
-
-            table.add_row(ctx_label, auto_str, fp8_str)
-
+            table.add_row(*row)
         console.print(table)
+        recommendations = limits_data.get("recommendations")
+        if isinstance(recommendations, dict) and recommendations:
+            rendered = []
+            for name in ("interactivity", "balanced", "throughput"):
+                rec = recommendations.get(name)
+                if not isinstance(rec, dict):
+                    continue
+                ctx = rec.get("context")
+                seqs = rec.get("max_num_seqs")
+                kv = rec.get("kv_cache_dtype")
+                bt = rec.get("max_num_batched_tokens")
+                if ctx and seqs and kv and bt:
+                    rendered.append(f"{name}: {int(ctx):,}/{kv}/{seqs} seqs/{int(bt):,} batch")
+            if rendered:
+                console.print(f"  [dim]Profiles: {'; '.join(rendered)}[/dim]")
+    _print_benchmark_summary(limits_data)
     console.print()
 
 
@@ -1798,6 +2153,7 @@ def _launch_backend(
     *,
     non_interactive: bool = False,
     replace: bool = False,
+    health_timeout_s: int | None = None,
 ) -> None:
     """Stop any running backend, start with given config, wait for health."""
     import json
@@ -1810,7 +2166,7 @@ def _launch_backend(
 
     # Read config (YAML for vLLM, JSON for llama.cpp)
     needs_precache = False
-    health_timeout_s = 300
+    resolved_health_timeout_s = health_timeout_s or 300
     health_poll_s = 3
     try:
         def _service_running_state() -> bool | None:
@@ -1923,8 +2279,8 @@ def _launch_backend(
             from vserve.config import cfg as _cfg
             fi_cache = _cfg().vllm_root / ".cache" / "flashinfer"
             needs_precache = not fi_cache.is_dir() or not list(fi_cache.glob("**/*.so"))
-            if needs_precache:
-                health_timeout_s = 600
+            if needs_precache and health_timeout_s is None:
+                resolved_health_timeout_s = 600
                 console.print("  [yellow]First run — compiling kernels (~5-10 min).[/yellow]")
 
         try:
@@ -1947,7 +2303,7 @@ def _launch_backend(
         health = backend.health_url(port)
 
         console.print(f"  [dim]Waiting for {health} ...[/dim]")
-        for i in range(max(1, (health_timeout_s + health_poll_s - 1) // health_poll_s)):
+        for i in range(max(1, (resolved_health_timeout_s + health_poll_s - 1) // health_poll_s)):
             time.sleep(health_poll_s)
             elapsed_s = (i + 1) * health_poll_s
             try:
@@ -2125,7 +2481,7 @@ def _scripted_config(
         return cfg_path
 
     if need_tuned_defaults:
-        chosen_context, chosen_kv, chosen_slots = _choose_vllm_scripted_defaults(
+        chosen_context, chosen_kv, chosen_slots, recommended_scheduler = _choose_vllm_scripted_defaults(
             m,
             limits_data,
             context=context,
@@ -2137,6 +2493,7 @@ def _scripted_config(
         assert slots is not None
         assert kv_cache_dtype is not None
         chosen_context, chosen_kv, chosen_slots = context, kv_cache_dtype, slots
+        recommended_scheduler = {}
     tool_info: dict = {}
     resolved_parser = tool_parser
     if tools or tool_parser:
@@ -2178,13 +2535,17 @@ def _scripted_config(
         "context": chosen_context,
         "kv_dtype": chosen_kv,
         "slots": chosen_slots,
-        "batched_tokens": batched_tokens,
+        "batched_tokens": batched_tokens if batched_tokens is not None else recommended_scheduler.get("max_num_batched_tokens"),
         "gpu_mem_util": effective_gpu_util,
         "port": port,
         "tools": bool(tools or tool_parser) and bool(resolved_parser),
         "tool_parser": resolved_parser if (tools or tool_parser) else None,
         "reasoning_parser": resolved_reasoning,
         "trust_remote_code": trust_remote_code,
+        "performance_mode": recommended_scheduler.get("performance_mode"),
+        "optimization_level": recommended_scheduler.get("optimization_level"),
+        "block_size": recommended_scheduler.get("block_size"),
+        "enable_prefix_caching": True,
     }
     cfg = backend.build_config(m, vllm_choices)
     profile_name = save_profile or "custom"
@@ -2352,6 +2713,40 @@ def _vllm_limits_entry(entry: object) -> dict[str, int | None]:
     return {"auto": entry}
 
 
+def _vllm_limit_dtype_order(limits_data: dict, limits: dict) -> list[str]:
+    dtypes_obj = limits_data.get("kv_cache_dtypes")
+    if isinstance(dtypes_obj, dict):
+        ordered = [key for key in dtypes_obj if isinstance(key, str)]
+        if ordered:
+            return ordered
+    seen: list[str] = []
+    for _ctx, entry in sorted(limits.items(), key=lambda item: int(str(item[0]))):
+        for dtype in _vllm_limits_entry(entry):
+            if dtype not in seen:
+                seen.append(dtype)
+    preferred = ["auto", "fp8"]
+    return [dtype for dtype in preferred if dtype in seen] + [
+        dtype for dtype in seen if dtype not in preferred
+    ]
+
+
+def _vllm_kv_label(dtype: str) -> str:
+    labels = {
+        "auto": "Auto KV",
+        "fp8": "FP8 KV",
+        "fp8_e4m3": "FP8 e4m3",
+        "fp8_e5m2": "FP8 e5m2",
+        "turboquant_k8v4": "TQ k8v4",
+        "turboquant_4bit_nc": "TQ 4bit",
+        "turboquant_k3v4_nc": "TQ k3v4",
+        "turboquant_3bit_nc": "TQ 3bit",
+    }
+    return labels.get(dtype, dtype)
+
+
+_VLLM_AUTOMATIC_KV_DTYPES = ("auto", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc")
+
+
 def _build_current_tuning_fingerprint(m: ModelInfo, backend, *, gpu, gpu_mem_util: float) -> dict:
     from vserve.runtime import build_tuning_fingerprint
 
@@ -2398,9 +2793,26 @@ def _choose_vllm_scripted_defaults(
     context: int | None,
     slots: int | None,
     kv_cache_dtype: str | None,
-) -> tuple[int, str, int]:
+) -> tuple[int, str, int, dict]:
     limits = limits_data.get("limits", {})
     limits = limits if isinstance(limits, dict) else {}
+    recommendation: dict = {}
+    if context is None and slots is None and kv_cache_dtype is None:
+        recommendations = limits_data.get("recommendations")
+        if isinstance(recommendations, dict):
+            balanced = recommendations.get("balanced")
+            if isinstance(balanced, dict):
+                rec_context = balanced.get("context")
+                rec_kv = balanced.get("kv_cache_dtype")
+                rec_slots = balanced.get("max_num_seqs")
+                if (
+                    isinstance(rec_context, int)
+                    and isinstance(rec_kv, str)
+                    and isinstance(rec_slots, int)
+                    and _vllm_limits_entry(limits.get(str(rec_context), {})).get(rec_kv) is not None
+                ):
+                    return rec_context, rec_kv, rec_slots, dict(balanced)
+
     working_contexts: list[int] = []
     for ctx_str, entry in limits.items():
         try:
@@ -2411,7 +2823,7 @@ def _choose_vllm_scripted_defaults(
         if kv_cache_dtype is not None:
             if choices.get(kv_cache_dtype) is not None:
                 working_contexts.append(ctx)
-        elif any(value is not None for value in choices.values()):
+        elif any(choices.get(dtype) is not None for dtype in _VLLM_AUTOMATIC_KV_DTYPES):
             working_contexts.append(ctx)
 
     if not working_contexts:
@@ -2424,13 +2836,11 @@ def _choose_vllm_scripted_defaults(
         if ctx_entry.get(kv_cache_dtype) is None:
             raise ValueError(f"No tuned vLLM capacity for context {chosen_context} with KV dtype {kv_cache_dtype}")
         chosen_kv = kv_cache_dtype
-    elif ctx_entry.get("auto") is not None:
-        chosen_kv = "auto"
     else:
-        viable_kvs = [key for key, value in ctx_entry.items() if value is not None]
-        if not viable_kvs:
+        candidate_kv = next((dtype for dtype in _VLLM_AUTOMATIC_KV_DTYPES if ctx_entry.get(dtype) is not None), None)
+        if candidate_kv is None:
             raise ValueError(f"No tuned vLLM capacity for context {chosen_context}")
-        chosen_kv = viable_kvs[0]
+        chosen_kv = candidate_kv
 
     if slots is not None:
         chosen_slots = slots
@@ -2439,7 +2849,7 @@ def _choose_vllm_scripted_defaults(
         if tuned_slots is None:
             raise ValueError(f"No tuned vLLM slot count for context {chosen_context} with KV dtype {chosen_kv}")
         chosen_slots = int(tuned_slots)
-    return chosen_context, chosen_kv, chosen_slots
+    return chosen_context, chosen_kv, chosen_slots, recommendation
 
 
 def _choose_llamacpp_scripted_defaults(

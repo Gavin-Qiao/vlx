@@ -2,7 +2,12 @@
 
 import pytest
 
-from vserve.probe import _context_steps, calculate_limits, kv_bytes_per_token
+from vserve.probe import (
+    _context_steps,
+    calculate_limits,
+    kv_bytes_per_token,
+    max_concurrent_sequences,
+)
 
 
 def test_context_steps_are_powers_of_two():
@@ -19,6 +24,42 @@ def test_kv_bytes_per_token_auto():
 def test_kv_bytes_per_token_fp8():
     result = kv_bytes_per_token(num_kv_heads=4, head_dim=128, num_layers=32, dtype="fp8")
     assert result == 2 * 4 * 128 * 32 * 1
+
+
+def test_kv_bytes_per_token_turboquant_k8v4_uses_packed_kv_math():
+    result = kv_bytes_per_token(
+        num_kv_heads=4,
+        head_dim=128,
+        num_layers=32,
+        dtype="turboquant_k8v4",
+    )
+
+    # Per head/layer: FP8 keys = 128 bytes, 4-bit values = 64 bytes + fp16 scale/zero.
+    assert result == 4 * 32 * (128 + 64 + 4)
+
+
+def test_kv_bytes_per_token_turboquant_4bit_nc_includes_norm_metadata():
+    result = kv_bytes_per_token(
+        num_kv_heads=4,
+        head_dim=128,
+        num_layers=32,
+        dtype="turboquant_4bit_nc",
+    )
+
+    # Per head/layer: 4-bit keys + fp16 vec_norm, 4-bit values + fp16 scale/zero.
+    assert result == 4 * 32 * ((64 + 2) + (64 + 4))
+
+
+def test_max_concurrent_sequences_rounds_context_to_cache_blocks():
+    # 100 resident KV tokens, but a 17-token request consumes two 16-token blocks.
+    result = max_concurrent_sequences(
+        available_kv_bytes=1000,
+        bytes_per_token=10,
+        context_length=17,
+        block_size=16,
+    )
+
+    assert result == 3
 
 
 def test_fp8_is_half_of_auto():
@@ -73,7 +114,7 @@ def test_calculate_limits_tiny_vram(fake_model_dir):
     from vserve.models import detect_model
     m = detect_model(fake_model_dir)
 
-    result = calculate_limits(model_info=m, vram_total_gb=0.1, gpu_mem_util=0.90)
+    result = calculate_limits(model_info=m, vram_total_gb=0.01, gpu_mem_util=0.90)
     for entry in result["limits"].values():
         for v in entry.values():
             assert v is None
@@ -113,6 +154,36 @@ def test_calculate_limits_output_format(fake_model_dir):
     for entry in result["limits"].values():
         assert "auto" in entry
         assert "fp8" in entry
+
+
+def test_calculate_limits_includes_vllm_v1_tuning_metadata(fake_model_dir):
+    from vserve.models import detect_model
+    m = detect_model(fake_model_dir)
+
+    result = calculate_limits(model_info=m, vram_total_gb=48.0)
+
+    assert result["tuning_model"]["backend"] == "vllm-v1"
+    assert result["tuning_model"]["block_size"] == 16
+    assert result["tuning_model"]["capacity_math"] == "paged-block-rounded"
+    assert "turboquant_k8v4" in result["kv_cache_dtypes"]
+    assert result["kv_cache_dtypes"]["auto"]["bytes_per_token"] > result["kv_cache_dtypes"]["fp8"]["bytes_per_token"]
+    assert result["kv_cache_dtypes"]["turboquant_k8v4"]["compression_ratio_vs_auto"] > 2
+
+
+def test_calculate_limits_recommends_scheduler_profiles(fake_model_dir):
+    from vserve.models import detect_model
+    m = detect_model(fake_model_dir)
+
+    result = calculate_limits(model_info=m, vram_total_gb=48.0)
+    recommendations = result["recommendations"]
+
+    assert set(recommendations) == {"interactivity", "balanced", "throughput"}
+    assert recommendations["interactivity"]["performance_mode"] == "interactivity"
+    assert recommendations["balanced"]["performance_mode"] == "balanced"
+    assert recommendations["throughput"]["performance_mode"] == "throughput"
+    assert recommendations["interactivity"]["max_num_batched_tokens"] <= recommendations["balanced"]["max_num_batched_tokens"]
+    assert recommendations["throughput"]["max_num_batched_tokens"] > 8192
+    assert recommendations["balanced"]["kv_cache_dtype"] == "auto"
 
 
 def test_sanity_qwen3_27b_on_rtx_pro_5000():

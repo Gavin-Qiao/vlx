@@ -239,6 +239,38 @@ class TestVllmBackend:
         assert cfg["reasoning-parser"] == "qwen3"
         assert cfg["max-num-batched-tokens"] == 4096
 
+    def test_build_config_with_sota_scheduler_and_cache_knobs(self, fake_model_dir):
+        b = VllmBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_model_dir)
+
+        choices = {
+            "context": 8192,
+            "kv_dtype": "turboquant_k8v4",
+            "slots": 4,
+            "batched_tokens": 12288,
+            "gpu_mem_util": 0.90,
+            "port": 8888,
+            "tools": False,
+            "tool_parser": None,
+            "reasoning_parser": None,
+            "performance_mode": "throughput",
+            "optimization_level": 2,
+            "block_size": 16,
+            "kv_cache_memory_bytes": 12 * 1024**3,
+            "enable_prefix_caching": True,
+        }
+
+        cfg = b.build_config(m, choices)
+
+        assert cfg["kv-cache-dtype"] == "turboquant_k8v4"
+        assert cfg["max-num-batched-tokens"] == 12288
+        assert cfg["performance-mode"] == "throughput"
+        assert cfg["optimization-level"] == 2
+        assert cfg["block-size"] == 16
+        assert cfg["kv-cache-memory-bytes"] == 12 * 1024**3
+        assert cfg["enable-prefix-caching"] is True
+
     def test_build_config_reasoning_without_tools(self, fake_model_dir):
         b = VllmBackend()
         b.available_reasoning_parsers = Mock(return_value={"qwen3"})  # type: ignore[method-assign]

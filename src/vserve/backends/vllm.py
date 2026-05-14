@@ -218,6 +218,16 @@ print(json.dumps({
         bt = choices.get("batched_tokens")
         if bt is not None:
             cfg["max-num-batched-tokens"] = bt
+        if choices.get("performance_mode") is not None:
+            cfg["performance-mode"] = choices["performance_mode"]
+        if choices.get("optimization_level") is not None:
+            cfg["optimization-level"] = choices["optimization_level"]
+        if choices.get("block_size") is not None:
+            cfg["block-size"] = choices["block_size"]
+        if choices.get("kv_cache_memory_bytes") is not None:
+            cfg["kv-cache-memory-bytes"] = choices["kv_cache_memory_bytes"]
+        if choices.get("enable_prefix_caching") is not None:
+            cfg["enable-prefix-caching"] = bool(choices["enable_prefix_caching"])
 
         qf = self.quant_flag(model.quant_method)
         if qf:

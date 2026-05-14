@@ -1,8 +1,45 @@
 """Tests for the llama.cpp backend."""
 
+import struct
 from unittest.mock import Mock
 
 from vserve.backends.llamacpp import LlamaCppBackend
+
+
+GGUF_UINT32 = 4
+GGUF_BOOL = 7
+GGUF_STRING = 8
+GGUF_ARRAY = 9
+
+
+def _gguf_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return struct.pack("<Q", len(encoded)) + encoded
+
+
+def _gguf_value(value_type: int, value) -> bytes:
+    if value_type == GGUF_UINT32:
+        return struct.pack("<I", int(value))
+    if value_type == GGUF_STRING:
+        return _gguf_string(str(value))
+    if value_type == GGUF_BOOL:
+        return struct.pack("<?", bool(value))
+    if value_type == GGUF_ARRAY:
+        element_type, items = value
+        payload = struct.pack("<IQ", int(element_type), len(items))
+        for item in items:
+            payload += _gguf_value(element_type, item)
+        return payload
+    raise AssertionError(f"unsupported test GGUF value type: {value_type}")
+
+
+def _write_minimal_gguf(path, entries: dict[str, tuple[int, object]]) -> None:
+    payload = b"GGUF" + struct.pack("<IQQ", 3, 0, len(entries))
+    for key, (value_type, value) in entries.items():
+        payload += _gguf_string(key)
+        payload += struct.pack("<I", value_type)
+        payload += _gguf_value(value_type, value)
+    path.write_bytes(payload)
 
 
 class TestLlamaCppCanServe:
@@ -201,6 +238,120 @@ class TestLlamaCppDetectTools:
         assert result["supports_tools"] is False
 
 
+class TestLlamaCppMetadata:
+    def test_read_gguf_metadata_without_optional_package(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        gguf_path = tmp_path / "model.gguf"
+        _write_minimal_gguf(
+            gguf_path,
+            {
+                "general.architecture": (GGUF_STRING, "llama"),
+                "llama.block_count": (GGUF_UINT32, 32),
+                "llama.context_length": (GGUF_UINT32, 262144),
+                "llama.embedding_length": (GGUF_UINT32, 4096),
+                "llama.attention.head_count": (GGUF_UINT32, 32),
+                "llama.attention.head_count_kv": (GGUF_UINT32, 8),
+                "llama.attention.key_length": (GGUF_UINT32, 128),
+                "llama.attention.value_length": (GGUF_UINT32, 128),
+                "tokenizer.ggml.pooling_type": (GGUF_UINT32, 1),
+            },
+        )
+
+        metadata = LlamaCppBackend()._read_gguf_metadata(gguf_path)
+
+        assert metadata["arch"] == "llama"
+        assert metadata["num_layers"] == 32
+        assert metadata["max_context"] == 262144
+        assert metadata["num_kv_heads"] == 8
+        assert metadata["key_length"] == 128
+        assert metadata["value_length"] == 128
+        assert metadata["pooling"] == "mean"
+
+    def test_read_gguf_metadata_accepts_layerwise_kv_heads(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        gguf_path = tmp_path / "model.gguf"
+        _write_minimal_gguf(
+            gguf_path,
+            {
+                "general.architecture": (GGUF_STRING, "gemma4"),
+                "gemma4.block_count": (GGUF_UINT32, 3),
+                "gemma4.context_length": (GGUF_UINT32, 262144),
+                "gemma4.embedding_length": (GGUF_UINT32, 2816),
+                "gemma4.attention.head_count": (GGUF_UINT32, 16),
+                "gemma4.attention.head_count_kv": (GGUF_ARRAY, (GGUF_UINT32, [8, 2, 8])),
+                "gemma4.attention.key_length": (GGUF_UINT32, 512),
+                "gemma4.attention.value_length": (GGUF_UINT32, 512),
+            },
+        )
+
+        metadata = LlamaCppBackend()._read_gguf_metadata(gguf_path)
+
+        assert metadata["num_layers"] == 3
+        assert metadata["max_context"] == 262144
+        assert metadata["num_kv_heads"] == [8, 2, 8]
+        assert metadata["key_length"] == 512
+        assert metadata["value_length"] == 512
+
+    def test_read_gguf_metadata_includes_hybrid_attention_fields(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        gguf_path = tmp_path / "model.gguf"
+        _write_minimal_gguf(
+            gguf_path,
+            {
+                "general.architecture": (GGUF_STRING, "qwen35"),
+                "qwen35.block_count": (GGUF_UINT32, 64),
+                "qwen35.context_length": (GGUF_UINT32, 262144),
+                "qwen35.embedding_length": (GGUF_UINT32, 5120),
+                "qwen35.attention.head_count": (GGUF_UINT32, 24),
+                "qwen35.attention.head_count_kv": (GGUF_UINT32, 4),
+                "qwen35.attention.key_length": (GGUF_UINT32, 256),
+                "qwen35.attention.value_length": (GGUF_UINT32, 256),
+                "qwen35.ssm.conv_kernel": (GGUF_UINT32, 4),
+                "qwen35.ssm.inner_size": (GGUF_UINT32, 2560),
+                "qwen35.ssm.state_size": (GGUF_UINT32, 128),
+                "qwen35.ssm.time_step_rank": (GGUF_UINT32, 128),
+                "qwen35.ssm.group_count": (GGUF_UINT32, 4),
+                "qwen35.full_attention_interval": (GGUF_UINT32, 4),
+            },
+        )
+
+        metadata = LlamaCppBackend()._read_gguf_metadata(gguf_path)
+
+        assert metadata["full_attention_interval"] == 4
+        assert metadata["ssm_conv_kernel"] == 4
+        assert metadata["ssm_inner_size"] == 2560
+        assert metadata["ssm_state_size"] == 128
+        assert metadata["ssm_group_count"] == 4
+
+    def test_read_gguf_metadata_includes_swa_fields(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        gguf_path = tmp_path / "model.gguf"
+        _write_minimal_gguf(
+            gguf_path,
+            {
+                "general.architecture": (GGUF_STRING, "gemma4"),
+                "gemma4.block_count": (GGUF_UINT32, 6),
+                "gemma4.context_length": (GGUF_UINT32, 262144),
+                "gemma4.embedding_length": (GGUF_UINT32, 2816),
+                "gemma4.attention.head_count": (GGUF_UINT32, 16),
+                "gemma4.attention.head_count_kv": (GGUF_ARRAY, (GGUF_UINT32, [8, 8, 8, 8, 8, 2])),
+                "gemma4.attention.key_length": (GGUF_UINT32, 512),
+                "gemma4.attention.value_length": (GGUF_UINT32, 512),
+                "gemma4.attention.sliding_window": (GGUF_UINT32, 1024),
+                "gemma4.attention.sliding_window_pattern": (GGUF_ARRAY, (GGUF_BOOL, [True, True, True, True, True, False])),
+                "gemma4.attention.key_length_swa": (GGUF_UINT32, 256),
+                "gemma4.attention.value_length_swa": (GGUF_UINT32, 256),
+            },
+        )
+
+        metadata = LlamaCppBackend()._read_gguf_metadata(gguf_path)
+
+        assert metadata["sliding_window"] == 1024
+        assert metadata["sliding_window_pattern"] == [1, 1, 1, 1, 1, 0]
+        assert metadata["key_length_swa"] == 256
+        assert metadata["value_length_swa"] == 256
+
+
 class TestLlamaCppTune:
     def _mock_metadata(self, mocker):
         mocker.patch.object(
@@ -230,6 +381,138 @@ class TestLlamaCppTune:
         assert "model_path" in result
         assert "supports_tools" in result
         assert result["backend"] == "llamacpp"
+
+    def test_tune_estimates_when_gguf_reader_is_missing(self, fake_gguf_model_dir, mocker):
+        """Missing optional gguf reader should not block useful estimated tuning."""
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+
+        assert result["backend"] == "llamacpp"
+        assert result["metadata_estimated"] is True
+        assert result["limits"]
+
+    def test_tune_uses_builtin_gguf_context_when_reader_is_missing(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        mocker.patch.object(LlamaCppBackend, "detect_tools", return_value={})
+        model_dir = tmp_path / "models" / "provider" / "LongContext-GGUF"
+        model_dir.mkdir(parents=True)
+        _write_minimal_gguf(
+            model_dir / "LongContext-Q4_K_M.gguf",
+            {
+                "general.architecture": (GGUF_STRING, "llama"),
+                "llama.block_count": (GGUF_UINT32, 32),
+                "llama.context_length": (GGUF_UINT32, 262144),
+                "llama.embedding_length": (GGUF_UINT32, 4096),
+                "llama.attention.head_count": (GGUF_UINT32, 32),
+                "llama.attention.head_count_kv": (GGUF_UINT32, 8),
+                "llama.attention.key_length": (GGUF_UINT32, 128),
+                "llama.attention.value_length": (GGUF_UINT32, 128),
+            },
+        )
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = LlamaCppBackend().tune(m, gpu, gpu_mem_util=0.90)
+
+        assert result["max_context"] == 262144
+        assert "metadata_estimated" not in result
+        assert "262144" in result["limits"]
+
+    def test_tune_qwen35_counts_only_full_attention_layers_for_context_capacity(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        mocker.patch.object(LlamaCppBackend, "detect_tools", return_value={})
+        model_dir = tmp_path / "models" / "unsloth" / "Qwen3.6-27B-GGUF-Q4_K_XL"
+        model_dir.mkdir(parents=True)
+        gguf_path = model_dir / "Qwen3.6-27B-UD-Q4_K_XL.gguf"
+        _write_minimal_gguf(
+            gguf_path,
+            {
+                "general.architecture": (GGUF_STRING, "qwen35"),
+                "qwen35.block_count": (GGUF_UINT32, 64),
+                "qwen35.context_length": (GGUF_UINT32, 262144),
+                "qwen35.embedding_length": (GGUF_UINT32, 5120),
+                "qwen35.attention.head_count": (GGUF_UINT32, 24),
+                "qwen35.attention.head_count_kv": (GGUF_UINT32, 4),
+                "qwen35.attention.key_length": (GGUF_UINT32, 256),
+                "qwen35.attention.value_length": (GGUF_UINT32, 256),
+                "qwen35.full_attention_interval": (GGUF_UINT32, 4),
+            },
+        )
+        with gguf_path.open("r+b") as f:
+            f.truncate(16 * 1024**3)
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = LlamaCppBackend().tune(m, gpu, gpu_mem_util=0.96)
+
+        assert result["limits"]["262144"] == 1
+
+    def test_tune_gemma4_caps_swa_cache_by_sliding_window(self, tmp_path, mocker):
+        mocker.patch.dict("sys.modules", {"gguf": None})
+        mocker.patch.object(LlamaCppBackend, "detect_tools", return_value={})
+        model_dir = tmp_path / "models" / "unsloth" / "gemma-4-26B-A4B-it-GGUF"
+        model_dir.mkdir(parents=True)
+        gguf_path = model_dir / "gemma-4-26B-A4B-it-UD-IQ4_XS.gguf"
+        _write_minimal_gguf(
+            gguf_path,
+            {
+                "general.architecture": (GGUF_STRING, "gemma4"),
+                "gemma4.block_count": (GGUF_UINT32, 30),
+                "gemma4.context_length": (GGUF_UINT32, 262144),
+                "gemma4.embedding_length": (GGUF_UINT32, 2816),
+                "gemma4.attention.head_count": (GGUF_UINT32, 16),
+                "gemma4.attention.head_count_kv": (GGUF_ARRAY, (GGUF_UINT32, [8, 8, 8, 8, 8, 2] * 5)),
+                "gemma4.attention.key_length": (GGUF_UINT32, 512),
+                "gemma4.attention.value_length": (GGUF_UINT32, 512),
+                "gemma4.attention.sliding_window": (GGUF_UINT32, 1024),
+                "gemma4.attention.sliding_window_pattern": (GGUF_ARRAY, (GGUF_UINT32, [1, 1, 1, 1, 1, 0] * 5)),
+                "gemma4.attention.key_length_swa": (GGUF_UINT32, 256),
+                "gemma4.attention.value_length_swa": (GGUF_UINT32, 256),
+            },
+        )
+        with gguf_path.open("r+b") as f:
+            f.truncate(12 * 1024**3)
+        from vserve.models import detect_model
+        m = detect_model(model_dir)
+
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = LlamaCppBackend().tune(m, gpu, gpu_mem_util=0.96)
+
+        assert result["limits"]["262144"] == 6
+
+    def test_llamacpp_memory_counts_recurrent_state_bytes(self):
+        metadata = {
+            "num_layers": 4,
+            "num_kv_heads": 2,
+            "key_length": 8,
+            "value_length": 8,
+            "full_attention_interval": 2,
+            "ssm_conv_kernel": 4,
+            "ssm_inner_size": 16,
+            "ssm_state_size": 8,
+            "ssm_group_count": 2,
+        }
+
+        total = LlamaCppBackend._llamacpp_kv_cache_bytes(metadata, context=128, parallel=3)
+
+        attention_bytes = 2 * (2 * (8 + 8) * 2 * 128 * 3)
+        recurrent_per_layer = ((4 - 1) * (16 + 2 * 2 * 8) + 8 * 16) * 4 * 3
+        assert total == attention_bytes + 2 * recurrent_per_layer
 
     def test_tune_full_offload_with_tiny_model(self, fake_gguf_model_dir, mocker):
         """Tiny model fully fits on GPU."""
