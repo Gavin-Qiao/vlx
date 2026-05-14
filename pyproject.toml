@@ -1,6 +1,6 @@
 [project]
 name = "vserve"
-version = "0.5.6"
+version = "0.5.7"
 description = "CLI for managing LLM inference on GPU workstations"
 readme = "README.md"
 license = "MIT"

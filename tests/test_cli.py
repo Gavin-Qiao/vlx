@@ -199,6 +199,103 @@ def test_ensure_scripted_limits_retunes_stale_cache(mocker, fake_model_dir):
     write_limits.assert_called_once()
 
 
+def test_ensure_scripted_limits_reuses_runtime_info(mocker, fake_model_dir):
+    from vserve.cli import _ensure_scripted_limits
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.runtime_info.side_effect = AssertionError("runtime_info should be reused")
+    backend.tune.return_value = {"backend": "vllm", "limits": {"8192": {"auto": 4}}}
+    gpu = mocker.Mock(name="GPU", vram_total_gb=48.0, driver="drv", cuda="13.0")
+    runtime_info = mocker.Mock()
+    mocker.patch("vserve.cli.read_limits", return_value=None)
+    build_fingerprint = mocker.patch("vserve.runtime.build_tuning_fingerprint", return_value={"fresh": True})
+    mocker.patch("vserve.config.write_limits")
+
+    _ensure_scripted_limits(
+        model,
+        backend,
+        gpu=gpu,
+        gpu_mem_util=0.9,
+        required=True,
+        runtime_info=runtime_info,
+    )
+
+    backend.runtime_info.assert_not_called()
+    assert build_fingerprint.call_args.kwargs["runtime_info"] is runtime_info
+
+
+def test_custom_vllm_config_reuses_runtime_info(mocker, fake_model_dir, tmp_path):
+    from vserve.cli import _custom_config_vllm
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.runtime_info.side_effect = AssertionError("runtime_info should be reused")
+    backend.detect_tools.return_value = {}
+    backend.build_config.return_value = {"model": str(model.path), "port": 8888}
+    runtime_info = mocker.Mock()
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=mocker.Mock(name="GPU", vram_total_gb=48.0, driver="drv", cuda="13.0"))
+    mocker.patch("vserve.gpu.resolve_gpu_memory_utilization", return_value=0.9)
+    mocker.patch("vserve.runtime.build_tuning_fingerprint", return_value={"fresh": True})
+    mocker.patch("vserve.config.limits_cache_matches", return_value=True)
+    mocker.patch("vserve.config.read_limits", return_value={
+        "backend": "vllm",
+        "limits": {"4096": {"auto": 2}},
+    })
+    mocker.patch("vserve.cli._pick", side_effect=[0, 0, 0])
+    mocker.patch("typer.prompt", return_value="1")
+    mocker.patch("typer.confirm", return_value=True)
+    mocker.patch("vserve.config.profile_path", return_value=tmp_path / "profile.yaml")
+    write_profile = mocker.patch("vserve.config.write_profile_yaml")
+
+    _custom_config_vllm(model, backend, runtime_info=runtime_info)
+
+    backend.runtime_info.assert_not_called()
+    write_profile.assert_called_once()
+
+
+def test_custom_vllm_config_does_not_validate_reasoning_when_tools_disabled(mocker, fake_model_dir, tmp_path):
+    from vserve.cli import _custom_config_vllm
+    from vserve.models import detect_model
+
+    model = detect_model(fake_model_dir)
+    backend = mocker.Mock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.runtime_info.side_effect = AssertionError("runtime_info should be reused")
+    backend.detect_tools.return_value = {}
+    backend.build_config.return_value = {"model": str(model.path), "port": 8888}
+    runtime_info = mocker.Mock()
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=mocker.Mock(name="GPU", vram_total_gb=48.0, driver="drv", cuda="13.0"))
+    mocker.patch("vserve.gpu.resolve_gpu_memory_utilization", return_value=0.9)
+    mocker.patch("vserve.runtime.build_tuning_fingerprint", return_value={"fresh": True})
+    mocker.patch("vserve.config.limits_cache_matches", return_value=True)
+    mocker.patch("vserve.config.read_limits", return_value={
+        "backend": "vllm",
+        "limits": {"4096": {"auto": 2}},
+        "tool_call_parser": "qwen3_coder",
+        "reasoning_parser": "qwen3",
+    })
+    mocker.patch("vserve.cli._pick", side_effect=[0, 0, 0])
+    mocker.patch("typer.prompt", return_value="1")
+    mocker.patch("typer.confirm", side_effect=[False, True])
+    mocker.patch("vserve.config.profile_path", return_value=tmp_path / "profile.yaml")
+    mocker.patch("vserve.config.write_profile_yaml")
+
+    _custom_config_vllm(model, backend, runtime_info=runtime_info)
+
+    choices = backend.build_config.call_args.args[1]
+    assert choices["tools"] is False
+    assert choices["tool_parser"] is None
+    assert choices["reasoning_parser"] is None
+
+
 def test_vllm_scripted_defaults_reject_requested_oom_context(fake_model_dir):
     from vserve.cli import _choose_vllm_scripted_defaults
     from vserve.models import detect_model
@@ -1371,7 +1468,7 @@ def test_doctor_strict_fails_missing_exact_vllm_env_file_even_without_timeout(mo
     )
 
 
-def test_doctor_strict_llamacpp_only_skips_vllm_required_failures(mocker, tmp_path):
+def test_doctor_strict_llamacpp_only_skips_vllm_required_failures(mocker, tmp_path, free_tcp_port):
     import json
 
     llama_root = tmp_path / "llama"
@@ -1390,7 +1487,7 @@ def test_doctor_strict_llamacpp_only_skips_vllm_required_failures(mocker, tmp_pa
         llamacpp_root=llama_root,
         llamacpp_service_user="llama-cpp",
         llamacpp_service_name="llama-cpp",
-        port=8888,
+        port=free_tcp_port,
         logs_dir=logs_dir,
     )
     fake_gpu = mocker.Mock(name="GPU", vram_total_gb=48)

@@ -271,6 +271,55 @@ class TestVllmBackend:
         assert cfg["kv-cache-memory-bytes"] == 12 * 1024**3
         assert cfg["enable-prefix-caching"] is True
 
+    def test_build_config_defaults_safe_batched_tokens_for_hybrid_models(self, tmp_path):
+        b = VllmBackend()
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "Qwen" / "Qwen3.6-35B-A3B-FP8"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(
+            """
+{
+  "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+  "model_type": "qwen3_5_moe",
+  "text_config": {
+    "model_type": "qwen3_5_moe_text",
+    "full_attention_interval": 4,
+    "layer_types": ["linear_attention", "linear_attention", "full_attention"]
+  }
+}
+""".strip()
+            + "\n",
+        )
+        m = ModelInfo(
+            path=model_dir,
+            provider="Qwen",
+            model_name="Qwen3.6-35B-A3B-FP8",
+            architecture="Qwen3_5MoeForConditionalGeneration",
+            model_type="qwen3_5_moe",
+            quant_method="fp8",
+            max_position_embeddings=262144,
+            is_moe=True,
+            model_size_gb=34.9,
+        )
+
+        cfg = b.build_config(
+            m,
+            {
+                "context": 262144,
+                "kv_dtype": "fp8",
+                "slots": 1,
+                "batched_tokens": None,
+                "gpu_mem_util": 0.95,
+                "port": 8888,
+                "tools": False,
+                "tool_parser": None,
+                "reasoning_parser": None,
+            },
+        )
+
+        assert cfg["max-num-batched-tokens"] == 4096
+
     def test_build_config_reasoning_without_tools(self, fake_model_dir):
         b = VllmBackend()
         b.available_reasoning_parsers = Mock(return_value={"qwen3"})  # type: ignore[method-assign]
@@ -370,6 +419,7 @@ class TestVllmBackend:
         assert b.available_tool_parsers() == {"hermes"}
         assert b.available_reasoning_parsers() == {"qwen3"}
         assert run.call_args.args[0][0] == str(runtime_python)
+        assert run.call_count == 1
 
     def test_parser_probe_supports_vllm_020_manager_paths(self, mocker, tmp_path):
         b = VllmBackend()

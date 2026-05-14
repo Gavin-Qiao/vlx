@@ -18,6 +18,10 @@ class VllmBackend:
     name = "vllm"
     display_name = "vLLM"
 
+    def __init__(self) -> None:
+        self._runtime_parser_registry_cache: dict[str, set[str] | None] | None = None
+        self._runtime_parser_registry_cache_loaded = False
+
     @property
     def service_name(self) -> str:
         from vserve.config import cfg
@@ -80,6 +84,9 @@ class VllmBackend:
         return registry.get("reasoning_parsers") if registry is not None else None
 
     def _runtime_parser_registry(self) -> dict[str, set[str] | None] | None:
+        if self._runtime_parser_registry_cache_loaded:
+            return self._runtime_parser_registry_cache
+
         from vserve.config import cfg
 
         script = r"""
@@ -149,17 +156,25 @@ print(json.dumps({
                 timeout=20,
             )
         except Exception:
+            self._runtime_parser_registry_cache = None
+            self._runtime_parser_registry_cache_loaded = True
             return None
         if result.returncode != 0:
+            self._runtime_parser_registry_cache = None
+            self._runtime_parser_registry_cache_loaded = True
             return None
         try:
             data = json.loads(result.stdout.strip() or "{}")
         except json.JSONDecodeError:
+            self._runtime_parser_registry_cache = None
+            self._runtime_parser_registry_cache_loaded = True
             return None
         out: dict[str, set[str] | None] = {}
         for key in ("tool_parsers", "reasoning_parsers"):
             value = data.get(key)
             out[key] = set(value) if isinstance(value, list) else None
+        self._runtime_parser_registry_cache = out
+        self._runtime_parser_registry_cache_loaded = True
         return out
 
     @staticmethod
@@ -216,6 +231,12 @@ print(json.dumps({
         if choices.get("trust_remote_code"):
             cfg["trust-remote-code"] = True
         bt = choices.get("batched_tokens")
+        min_bt = self._minimum_batched_tokens(model)
+        if min_bt is not None:
+            if bt is None:
+                bt = min_bt
+            elif isinstance(bt, int) and not isinstance(bt, bool):
+                bt = max(bt, min_bt)
         if bt is not None:
             cfg["max-num-batched-tokens"] = bt
         if choices.get("performance_mode") is not None:
@@ -241,6 +262,32 @@ print(json.dumps({
             cfg["reasoning-parser"] = rp
 
         return cfg
+
+    @staticmethod
+    def _minimum_batched_tokens(model: ModelInfo) -> int | None:
+        """Return vLLM scheduler floor for hybrid linear-attention/Mamba models."""
+        try:
+            data = json.loads((model.path / "config.json").read_text())
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        configs = [data]
+        text_config = data.get("text_config")
+        if isinstance(text_config, dict):
+            configs.append(text_config)
+        for config in configs:
+            layer_types = config.get("layer_types")
+            if isinstance(layer_types, list) and any("linear_attention" in str(item).lower() for item in layer_types):
+                return 4096
+            full_attention_interval = config.get("full_attention_interval")
+            if (
+                isinstance(full_attention_interval, int)
+                and not isinstance(full_attention_interval, bool)
+                and full_attention_interval > 0
+            ):
+                return 4096
+        return None
 
     def quant_flag(self, method: str | None) -> str:
         from vserve.models import quant_flag as _qf

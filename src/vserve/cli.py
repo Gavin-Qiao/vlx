@@ -135,22 +135,42 @@ def _record_backend_manifest(backend, cfg_path: pathlib.Path, *, label: str, sta
         pass
 
 
-def _check_backend_runtime_or_exit(backend, *, allow_unsupported_runtime: bool = False) -> None:
+def _check_backend_runtime_or_exit(backend, *, allow_unsupported_runtime: bool = False):
     if getattr(backend, "name", None) != "vllm":
-        return
-    compatibility_fn = getattr(backend, "compatibility", None)
-    if not callable(compatibility_fn):
-        return
+        return None
+    runtime_info = None
+    check = None
+    runtime_error: Exception | None = None
     try:
-        check = compatibility_fn()
+        runtime_info_fn = getattr(backend, "runtime_info", None)
+        if not callable(runtime_info_fn):
+            raise RuntimeError("runtime_info is unavailable")
+        runtime_info = runtime_info_fn()
+        from vserve.runtime import RuntimeInfo, check_vllm_compatibility
+        if not isinstance(runtime_info, RuntimeInfo):
+            raise RuntimeError("runtime_info did not return RuntimeInfo")
+        check = check_vllm_compatibility(runtime_info)
     except Exception as exc:
-        console.print(f"[red]Could not check {backend.display_name} runtime compatibility:[/red] {exc}")
-        console.print("  Use [cyan]vserve runtime check vllm[/cyan] for details.")
-        if not allow_unsupported_runtime:
-            raise typer.Exit(1) from None
-        return
+        runtime_info = None
+        runtime_error = exc
+        compatibility_fn = getattr(backend, "compatibility", None)
+        if callable(compatibility_fn):
+            try:
+                check = compatibility_fn()
+            except Exception as compat_exc:
+                runtime_error = compat_exc
+        if check is None:
+            assert runtime_error is not None
+            exc = runtime_error
+            console.print(f"[red]Could not check {backend.display_name} runtime compatibility:[/red] {exc}")
+            console.print("  Use [cyan]vserve runtime check vllm[/cyan] for details.")
+            if not allow_unsupported_runtime:
+                raise typer.Exit(1) from None
+            return runtime_info
+    if check is None:
+        return runtime_info
     if check.supported:
-        return
+        return runtime_info
     console.print(f"[red]Unsupported {backend.display_name} runtime.[/red]")
     console.print(f"  Supported: {check.range}")
     for error in check.errors:
@@ -158,6 +178,7 @@ def _check_backend_runtime_or_exit(backend, *, allow_unsupported_runtime: bool =
     console.print("  Repair: [cyan]vserve runtime upgrade vllm --stable[/cyan]")
     if not allow_unsupported_runtime:
         raise typer.Exit(1)
+    return runtime_info
 
 
 def _lock_or_exit(name: str, description: str) -> VserveLock:
@@ -2391,6 +2412,7 @@ def _custom_config(
     tools: bool = False,
     tool_parser: str | None = None,
     trust_remote_code: bool = False,
+    runtime_info=None,
 ) -> "pathlib.Path":
     """Guide user through parameter selection, delegate config building to backend."""
     if backend.name == "llamacpp":
@@ -2401,6 +2423,7 @@ def _custom_config(
         tools=tools,
         tool_parser=tool_parser,
         trust_remote_code=trust_remote_code,
+        runtime_info=runtime_info,
     )
 
 
@@ -2422,6 +2445,7 @@ def _scripted_config(
     pooling: str | None,
     save_profile: str | None,
     trust_remote_code: bool,
+    runtime_info=None,
 ) -> "pathlib.Path":
     """Build a launch config from CLI flags without prompting."""
     from vserve import config as config_module
@@ -2447,6 +2471,7 @@ def _scripted_config(
         gpu=gpu,
         gpu_mem_util=effective_gpu_util,
         required=need_tuned_defaults,
+        runtime_info=runtime_info,
     )
 
     if backend.name == "llamacpp":
@@ -2747,11 +2772,13 @@ def _vllm_kv_label(dtype: str) -> str:
 _VLLM_AUTOMATIC_KV_DTYPES = ("auto", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc")
 
 
-def _build_current_tuning_fingerprint(m: ModelInfo, backend, *, gpu, gpu_mem_util: float) -> dict:
+def _build_current_tuning_fingerprint(m: ModelInfo, backend, *, gpu, gpu_mem_util: float, runtime_info=None) -> dict:
     from vserve.runtime import build_tuning_fingerprint
 
-    runtime_info = None
-    runtime_info_fn = getattr(backend, "runtime_info", None)
+    if runtime_info is None:
+        runtime_info_fn = getattr(backend, "runtime_info", None)
+    else:
+        runtime_info_fn = None
     if callable(runtime_info_fn):
         try:
             runtime_info = runtime_info_fn()
@@ -2766,12 +2793,18 @@ def _build_current_tuning_fingerprint(m: ModelInfo, backend, *, gpu, gpu_mem_uti
     )
 
 
-def _ensure_scripted_limits(m: ModelInfo, backend, *, gpu, gpu_mem_util: float, required: bool) -> dict:
+def _ensure_scripted_limits(m: ModelInfo, backend, *, gpu, gpu_mem_util: float, required: bool, runtime_info=None) -> dict:
     """Return cached limits for non-interactive defaults, tuning once if needed."""
     from vserve import config as config_module
 
     lim_path = limits_path(m.provider, m.model_name)
-    fingerprint = _build_current_tuning_fingerprint(m, backend, gpu=gpu, gpu_mem_util=gpu_mem_util)
+    fingerprint = _build_current_tuning_fingerprint(
+        m,
+        backend,
+        gpu=gpu,
+        gpu_mem_util=gpu_mem_util,
+        runtime_info=runtime_info,
+    )
     lim = read_limits(lim_path)
     if isinstance(lim, dict) and config_module.limits_cache_matches(lim, backend=backend.name, fingerprint=fingerprint):
         return lim
@@ -3072,6 +3105,7 @@ def _custom_config_vllm(
     tools: bool = False,
     tool_parser: str | None = None,
     trust_remote_code: bool = False,
+    runtime_info=None,
 ) -> "pathlib.Path":
     """Interactive config wizard for vLLM models."""
     from vserve.config import cfg as _cfg, limits_cache_matches, read_limits, write_profile_yaml
@@ -3080,8 +3114,10 @@ def _custom_config_vllm(
 
     gpu = get_gpu_info()
     gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg())
-    runtime_info = None
-    runtime_info_fn = getattr(backend, "runtime_info", None)
+    if runtime_info is None:
+        runtime_info_fn = getattr(backend, "runtime_info", None)
+    else:
+        runtime_info_fn = None
     if callable(runtime_info_fn):
         try:
             runtime_info = runtime_info_fn()
@@ -3203,6 +3239,7 @@ def _custom_config_vllm(
             console.print("     Use --tool-parser <name> to enable")
 
     # Build config via backend
+    enable_tools = tools and bool(resolved_parser)
     choices = {
         "context": chosen_ctx,
         "kv_dtype": chosen_kv,
@@ -3210,9 +3247,9 @@ def _custom_config_vllm(
         "batched_tokens": chosen_bt,
         "gpu_mem_util": gpu_mem_util,
         "port": 8888,
-        "tools": tools and bool(resolved_parser),
-        "tool_parser": resolved_parser if tools else None,
-        "reasoning_parser": resolved_reasoning,
+        "tools": enable_tools,
+        "tool_parser": resolved_parser if enable_tools else None,
+        "reasoning_parser": resolved_reasoning if enable_tools else None,
         "trust_remote_code": trust_remote_code,
     }
     cfg = backend.build_config(m, choices)
@@ -3358,7 +3395,7 @@ def run(
         console.print(f"  {_backend_format_guidance(backend.name)}")
         raise typer.Exit(1)
 
-    _check_backend_runtime_or_exit(backend, allow_unsupported_runtime=allow_unsupported_runtime)
+    runtime_info = _check_backend_runtime_or_exit(backend, allow_unsupported_runtime=allow_unsupported_runtime)
 
     if tool_parser and not tools:
         tools = True
@@ -3395,6 +3432,7 @@ def run(
             pooling=pooling,
             save_profile=save_profile,
             trust_remote_code=trust_remote_code,
+            runtime_info=runtime_info,
         )
     else:
         if m is None:
@@ -3406,6 +3444,7 @@ def run(
             tools=tools,
             tool_parser=tool_parser,
             trust_remote_code=trust_remote_code,
+            runtime_info=runtime_info,
         )
     _launch_backend(
         backend,
